@@ -324,12 +324,11 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
     let vm_root = env_path("PLAYGROUND_LIMA_ROOT").unwrap_or_else(|| args.vm_root.clone());
 
     let pile_abs = absolute_pile_path(&config.pile_path)?;
-    if !pile_abs.starts_with(&repo_root) {
-        return Err(anyhow!(
-            "pile must live under repo root {} so the VM can see it",
-            repo_root.display()
-        ));
-    }
+    ensure_append_only(&pile_abs)?;
+    let pile_root = pile_abs
+        .parent()
+        .ok_or_else(|| anyhow!("pile path missing parent directory"))?
+        .to_path_buf();
 
     let template = env_path("PLAYGROUND_LIMA_TEMPLATE")
         .or_else(|| args.template.clone())
@@ -346,19 +345,22 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
     }
     fs::create_dir_all(&state_root).ok();
     fs::create_dir_all(&runtime_root).ok();
+    let workspace_root = state_root.join("workspaces").join(&instance);
+    fs::create_dir_all(&workspace_root).ok();
 
-    let relative = pile_abs
-        .strip_prefix(&repo_root)
-        .map_err(|_| anyhow!("pile not under repo root"))?;
-    let pile_vm = vm_root.join(relative);
+    let pile_name = pile_abs
+        .file_name()
+        .ok_or_else(|| anyhow!("pile path missing filename"))?;
+    let pile_vm = PathBuf::from("/pile").join(pile_name);
     write_lima_env(&runtime_root, &pile_vm, &vm_root, DEFAULT_WORKSPACE_BRANCH)?;
 
     render_lima_template(
         &template,
         &config_path,
         &playground_root,
-        &state_root,
         &runtime_root,
+        &pile_root,
+        &workspace_root,
         &vm_root,
     )?;
 
@@ -422,6 +424,9 @@ fn write_lima_env(
     contents.push_str("PLAYGROUND_WORKSPACE_BRANCH=");
     contents.push_str(workspace_branch);
     contents.push('\n');
+    contents.push_str("CARGO_TARGET_DIR=");
+    contents.push_str(&workspace_root.join("target").to_string_lossy());
+    contents.push('\n');
     contents.push_str("PLAYGROUND_WORKSPACE_BOOTSTRAP=1\n");
     fs::write(&env_path, contents)
         .with_context(|| format!("write Lima env {}", env_path.display()))?;
@@ -432,8 +437,9 @@ fn render_lima_template(
     template: &Path,
     out_path: &Path,
     playground_root: &Path,
-    state_root: &Path,
     runtime_root: &Path,
+    pile_root: &Path,
+    workspace_root: &Path,
     vm_root: &Path,
 ) -> Result<()> {
     let mut text = fs::read_to_string(template)
@@ -441,8 +447,9 @@ fn render_lima_template(
 
     let replacements = [
         ("__PLAYGROUND_ROOT__", playground_root),
-        ("__STATE_ROOT__", state_root),
         ("__RUNTIME_ROOT__", runtime_root),
+        ("__PILE_ROOT__", pile_root),
+        ("__WORKSPACE_ROOT__", workspace_root),
         ("__VM_ROOT__", vm_root),
     ];
 
@@ -452,6 +459,30 @@ fn render_lima_template(
 
     fs::write(out_path, text)
         .with_context(|| format!("write Lima config {}", out_path.display()))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_append_only(path: &Path) -> Result<()> {
+    if !path.exists() {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("create pile file {}", path.display()))?;
+    }
+    let status = Command::new("chflags")
+        .args(["uappnd", path.to_string_lossy().as_ref()])
+        .status()
+        .with_context(|| format!("set append-only on {}", path.display()))?;
+    if !status.success() {
+        return Err(anyhow!("chflags uappnd failed for {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_append_only(_path: &Path) -> Result<()> {
     Ok(())
 }
 

@@ -17,14 +17,17 @@ disk: "60GiB"
 
 mounts:
   - location: "__PLAYGROUND_ROOT__"
+    mountPoint: "/opt/playground"
+    writable: false
+  - location: "__PILE_ROOT__"
+    mountPoint: "/pile"
+    writable: true
+  - location: "__WORKSPACE_ROOT__"
     mountPoint: "__VM_ROOT__"
     writable: true
-  - location: "__STATE_ROOT__"
-    mountPoint: "__VM_ROOT__/state"
-    writable: true
   - location: "__RUNTIME_ROOT__"
-    mountPoint: "__VM_ROOT__/runtime"
-    writable: true
+    mountPoint: "/runtime"
+    writable: false
 
 provision:
   - mode: system
@@ -41,9 +44,9 @@ provision:
       [Service]
       User=lima
       Group=lima
-      WorkingDirectory=__VM_ROOT__
-      EnvironmentFile=__VM_ROOT__/runtime/playground.env
-      ExecStart=/bin/bash -lc 'source $HOME/.cargo/env >/dev/null 2>&1 || true; cargo run --manifest-path __VM_ROOT__/playground/Cargo.toml -- exec --pile "$PLAYGROUND_PILE"'
+      WorkingDirectory=/opt/playground
+      EnvironmentFile=/runtime/playground.env
+      ExecStart=/bin/bash -lc 'source $HOME/.cargo/env >/dev/null 2>&1 || true; cargo run --manifest-path /opt/playground/Cargo.toml -- exec --pile "$PLAYGROUND_PILE"'
       Restart=always
       RestartSec=2
 
