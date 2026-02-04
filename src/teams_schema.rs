@@ -145,122 +145,11 @@ pub mod teams {
             metadata::tag: tag_kind,
         };
 
-        tribles += entity! { ExclusiveId::force_ref(&chat) @
-            metadata::shortname: "teams.chat",
-            metadata::name: blobs.put::<LongString, _>(
-                "Reference to a Teams chat entity.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&chat_id) @
-            metadata::shortname: "teams.chat_id",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams chat identifier.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&message_id) @
-            metadata::shortname: "teams.message_id",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams message identifier.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&message_raw) @
-            metadata::shortname: "teams.message_raw",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams message payload.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&user_id) @
-            metadata::shortname: "teams.user_id",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams user id.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&delta_link) @
-            metadata::shortname: "teams.delta_link",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams delta cursor link.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&access_token) @
-            metadata::shortname: "teams.access_token",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams OAuth access token.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&refresh_token) @
-            metadata::shortname: "teams.refresh_token",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams OAuth refresh token.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&expires_at) @
-            metadata::shortname: "teams.expires_at",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams OAuth token expiry.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&token_type) @
-            metadata::shortname: "teams.token_type",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams OAuth token type.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&scope) @
-            metadata::shortname: "teams.scope",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams OAuth scopes.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&tenant) @
-            metadata::shortname: "teams.tenant",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams tenant id.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&client_id) @
-            metadata::shortname: "teams.client_id",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams client id.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&client_secret) @
-            metadata::shortname: "teams.client_secret",
-            metadata::name: blobs.put::<LongString, _>(
-                "Teams client secret.".to_string(),
-            )?,
-            metadata::tag: tag_attribute,
-        };
-
         Ok(tribles)
     }
 }
 
+#[allow(dead_code)]
 pub fn build_teams_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
 where
     B: BlobStore<Blake3>,
@@ -295,6 +184,7 @@ where
     Ok(metadata)
 }
 
+#[allow(dead_code)]
 fn describe_attribute<B, S>(
     blobs: &mut B,
     attribute: &Attribute<S>,

@@ -78,143 +78,11 @@ pub mod archive {
             )?,
         };
 
-        tribles += entity! { ExclusiveId::force_ref(&kind) @
-            metadata::shortname: "archive.kind",
-            metadata::description: blobs.put::<LongString, _>(
-                "Marker for archive entities.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&reply_to) @
-            metadata::shortname: "archive.reply_to",
-            metadata::description: blobs.put::<LongString, _>(
-                "Reference to a parent message.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&author) @
-            metadata::shortname: "archive.author",
-            metadata::description: blobs.put::<LongString, _>(
-                "Reference to the author entity.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&author_name) @
-            metadata::shortname: "archive.author_name",
-            metadata::description: blobs.put::<LongString, _>(
-                "Human-readable author name.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&author_role) @
-            metadata::shortname: "archive.author_role",
-            metadata::description: blobs.put::<LongString, _>(
-                "Author role (user/assistant/etc).".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&author_model) @
-            metadata::shortname: "archive.author_model",
-            metadata::description: blobs.put::<LongString, _>(
-                "Model identifier for assistant messages.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&author_provider) @
-            metadata::shortname: "archive.author_provider",
-            metadata::description: blobs.put::<LongString, _>(
-                "Provider identifier for assistant messages.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&content) @
-            metadata::shortname: "archive.content",
-            metadata::description: blobs.put::<LongString, _>(
-                "Message content.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&created_at) @
-            metadata::shortname: "archive.created_at",
-            metadata::description: blobs.put::<LongString, _>(
-                "Message creation time.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&content_type) @
-            metadata::shortname: "archive.content_type",
-            metadata::description: blobs.put::<LongString, _>(
-                "Content type (text/plain, image/png, etc).".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&attachment) @
-            metadata::shortname: "archive.attachment",
-            metadata::description: blobs.put::<LongString, _>(
-                "Reference to an attachment entity.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&attachment_source_id) @
-            metadata::shortname: "archive.attachment_source_id",
-            metadata::description: blobs.put::<LongString, _>(
-                "Source attachment identifier.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&attachment_source_pointer) @
-            metadata::shortname: "archive.attachment_source_pointer",
-            metadata::description: blobs.put::<LongString, _>(
-                "Source pointer or URL for the attachment.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&attachment_name) @
-            metadata::shortname: "archive.attachment_name",
-            metadata::description: blobs.put::<LongString, _>(
-                "Attachment filename.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&attachment_mime) @
-            metadata::shortname: "archive.attachment_mime",
-            metadata::description: blobs.put::<LongString, _>(
-                "Attachment MIME type.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&attachment_size_bytes) @
-            metadata::shortname: "archive.attachment_size_bytes",
-            metadata::description: blobs.put::<LongString, _>(
-                "Attachment size in bytes.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&attachment_width_px) @
-            metadata::shortname: "archive.attachment_width_px",
-            metadata::description: blobs.put::<LongString, _>(
-                "Attachment width in pixels.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&attachment_height_px) @
-            metadata::shortname: "archive.attachment_height_px",
-            metadata::description: blobs.put::<LongString, _>(
-                "Attachment height in pixels.".to_string(),
-            )?,
-        };
-
-        tribles += entity! { ExclusiveId::force_ref(&attachment_data) @
-            metadata::shortname: "archive.attachment_data",
-            metadata::description: blobs.put::<LongString, _>(
-                "Attachment bytes.".to_string(),
-            )?,
-        };
-
         Ok(tribles)
     }
 }
 
+#[allow(dead_code)]
 pub fn build_archive_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
 where
     B: BlobStore<Blake3>,
@@ -262,6 +130,7 @@ where
     Ok(metadata)
 }
 
+#[allow(dead_code)]
 fn describe_attribute<B, S>(
     blobs: &mut B,
     attribute: &Attribute<S>,
