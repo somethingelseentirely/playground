@@ -214,10 +214,10 @@ Suggested layout:
 
 Shared paths (example):
 
-- Host: `./state/workspaces/<workspace-id>`
+- Host: `./personas/<instance>/workspace`
 - Host: `./state/piles/<pile-id>`
-- VM: `/mnt/workspaces/<workspace-id>`
-- VM: `/mnt/piles/<pile-id>`
+- VM: `/workspace`
+- VM: `/pile`
 
 The executor only needs access to the pile plus a local workspace root. When
 using snapshots, the workspace contents live entirely inside the VM and can be

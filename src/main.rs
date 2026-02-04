@@ -342,7 +342,7 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
         fs::create_dir_all(parent).context("create Lima config directory")?;
     }
     fs::create_dir_all(&state_root).ok();
-    let workspace_root = state_root.join("workspaces").join(&instance);
+    let workspace_root = repo_root.join("personas").join(&instance).join("workspace");
     fs::create_dir_all(&workspace_root).ok();
 
     let pile_name = pile_abs
