@@ -17,20 +17,21 @@ use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
+mod branch_util;
 mod config;
+mod diagnostics;
 mod exec_worker;
 mod llm_worker;
-mod repo_util;
-mod branch_util;
 mod repo_ops;
-mod time_util;
+mod repo_util;
 mod schema;
+mod time_util;
 mod workspace_snapshot;
 
 use config::Config;
 use repo_util::{init_repo, load_text, push_workspace};
+use schema::{openai_responses, playground_cog, playground_exec};
 use time_util::{epoch_interval, interval_key, now_epoch};
-use schema::{playground_cog, playground_exec, openai_responses};
 use workspace_snapshot::DEFAULT_WORKSPACE_BRANCH;
 
 #[derive(Subcommand, Debug)]
@@ -43,6 +44,8 @@ enum CommandMode {
     Exec(WorkerArgs),
     #[command(about = "Run only the LLM worker (host)")]
     Llm(WorkerArgs),
+    #[command(about = "Open the diagnostics dashboard")]
+    Diagnostics(DiagnosticsArgs),
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -76,6 +79,18 @@ struct WorkerArgs {
     poll_ms: Option<u64>,
 }
 
+#[derive(Args, Debug, Clone)]
+#[command(about = "Diagnostics dashboard settings")]
+struct DiagnosticsArgs {
+    #[arg(long, default_value_t = false)]
+    headless: bool,
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
+    #[arg(long)]
+    scale: Option<f32>,
+    #[arg(long)]
+    headless_wait_ms: Option<u64>,
+}
 
 #[derive(Args, Debug, Clone)]
 #[command(about = "Lima VM settings for the exec worker")]
@@ -94,7 +109,11 @@ struct LimaExecArgs {
 #[derive(Args, Debug, Clone)]
 #[command(about = "Set a single config field in the pile")]
 struct ConfigSetArgs {
-    #[arg(value_enum, value_name = "FIELD", help = "Config field to set (see possible values below).")]
+    #[arg(
+        value_enum,
+        value_name = "FIELD",
+        help = "Config field to set (see possible values below)."
+    )]
     field: ConfigField,
     #[arg(
         value_name = "VALUE",
@@ -112,10 +131,12 @@ enum ConfigField {
     BranchId,
     Author,
     AuthorRole,
+    PersonaId,
     PollMs,
     LlmModel,
     LlmBaseUrl,
     LlmApiKey,
+    LlmReasoningEffort,
     LlmStream,
     ExecDefaultCwd,
     ExecSandboxProfile,
@@ -158,9 +179,13 @@ fn main() -> Result<()> {
             let config = Config::load(cli.pile.as_deref()).context("load config")?;
             run_llm_worker(config, args)
         }
-        CommandMode::Config { command } => {
-            handle_config(cli.pile.as_deref(), command)
+        CommandMode::Diagnostics(args) => {
+            let _ = args;
+            diagnostics::set_default_pile(cli.pile.clone());
+            diagnostics::diagnostics();
+            Ok(())
         }
+        CommandMode::Config { command } => handle_config(cli.pile.as_deref(), command),
     }
 }
 
@@ -226,28 +251,35 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
             config.seed_prompt = load_value_or_file(args.value.as_str(), "seed_prompt")?;
         }
         ConfigField::Branch => {
-            config.branch = args.value;
+            config.branch = load_value_or_file(args.value.as_str(), "branch")?;
         }
         ConfigField::BranchId => {
             config.branch_id = parse_optional_hex_id(Some(args.value.as_str()), "branch_id")?;
         }
         ConfigField::Author => {
-            config.author = args.value;
+            config.author = load_value_or_file(args.value.as_str(), "author")?;
         }
         ConfigField::AuthorRole => {
-            config.author_role = args.value;
+            config.author_role = load_value_or_file(args.value.as_str(), "author_role")?;
+        }
+        ConfigField::PersonaId => {
+            config.persona_id = parse_optional_hex_id(Some(args.value.as_str()), "persona_id")?;
         }
         ConfigField::PollMs => {
             config.poll_ms = parse_u64(args.value.as_str(), "poll_ms")?;
         }
         ConfigField::LlmModel => {
-            config.llm.model = args.value;
+            config.llm.model = load_value_or_file(args.value.as_str(), "llm_model")?;
         }
         ConfigField::LlmBaseUrl => {
-            config.llm.base_url = args.value;
+            config.llm.base_url = load_value_or_file(args.value.as_str(), "llm_base_url")?;
         }
         ConfigField::LlmApiKey => {
-            config.llm.api_key = parse_optional_string(args.value.as_str());
+            config.llm.api_key = load_optional_string_or_file(args.value.as_str(), "llm_api_key")?;
+        }
+        ConfigField::LlmReasoningEffort => {
+            config.llm.reasoning_effort =
+                load_optional_string_or_file(args.value.as_str(), "llm_reasoning_effort")?;
         }
         ConfigField::LlmStream => {
             config.llm.stream = parse_bool(args.value.as_str(), "llm_stream")?;
@@ -321,12 +353,7 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
         .strip_prefix(&repo_root)
         .map_err(|_| anyhow!("pile not under repo root"))?;
     let pile_vm = vm_root.join(relative);
-    write_lima_env(
-        &runtime_root,
-        &pile_vm,
-        &vm_root,
-        DEFAULT_WORKSPACE_BRANCH,
-    )?;
+    write_lima_env(&runtime_root, &pile_vm, &vm_root, DEFAULT_WORKSPACE_BRANCH)?;
 
     render_lima_template(
         &template,
@@ -468,9 +495,7 @@ fn env_flag(key: &str) -> bool {
         return false;
     };
     let trimmed = value.trim();
-    trimmed == "1"
-        || trimmed.eq_ignore_ascii_case("true")
-        || trimmed.eq_ignore_ascii_case("yes")
+    trimmed == "1" || trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("yes")
 }
 
 fn env_string(key: &str) -> Option<String> {
@@ -490,10 +515,19 @@ fn env_path(key: &str) -> Option<PathBuf> {
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     if let Some(path) = raw.strip_prefix('@') {
-        return fs::read_to_string(path)
-            .with_context(|| format!("read {label} from {}", path));
+        return fs::read_to_string(path).with_context(|| format!("read {label} from {}", path));
     }
     Ok(raw.to_string())
+}
+
+fn load_optional_string_or_file(raw: &str, label: &str) -> Result<Option<String>> {
+    let value = load_value_or_file(raw, label)?;
+    let trimmed = value.trim();
+    if is_nullish(trimmed) {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
 }
 
 fn parse_u64(raw: &str, label: &str) -> Result<u64> {
@@ -506,14 +540,6 @@ fn parse_bool(raw: &str, label: &str) -> Result<bool> {
         "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" => Ok(false),
         _ => Err(anyhow!("invalid {label} {raw} (expected true/false)")),
-    }
-}
-
-fn parse_optional_string(raw: &str) -> Option<String> {
-    if is_nullish(raw) {
-        None
-    } else {
-        Some(raw.to_string())
     }
 }
 
@@ -544,6 +570,13 @@ fn print_config(config: &Config, show_secrets: bool) {
     println!("author = \"{}\"", config.author);
     println!("author_role = \"{}\"", config.author_role);
     println!(
+        "persona_id = {}",
+        config
+            .persona_id
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_string())
+    );
+    println!(
         "system_prompt = \"{}\"",
         config.system_prompt.replace('\"', "\\\"")
     );
@@ -560,6 +593,15 @@ fn print_config(config: &Config, show_secrets: bool) {
         (Some(_), false) => println!("api_key = \"<redacted>\""),
         (None, _) => println!("api_key = null"),
     }
+    println!(
+        "reasoning_effort = {}",
+        config
+            .llm
+            .reasoning_effort
+            .as_ref()
+            .map(|value| format!("\"{}\"", value))
+            .unwrap_or_else(|| "null".to_string())
+    );
     println!("stream = {}", config.llm.stream);
 
     println!("\n[exec]");
@@ -677,13 +719,29 @@ fn ensure_llm_request(
         if list_thoughts_by_created(&catalog).is_empty()
             && collect_command_results(&catalog).is_empty()
         {
-            let prompt = compose_prompt(&config.system_prompt, &config.seed_prompt);
-            let request = create_thought_and_request(repo, branch_id, &prompt, None, config)?;
-            return Ok(request);
+            if !has_pending_command_request(&catalog) {
+                drop(ws);
+                let command = orient_bootstrap_command(config);
+                ensure_command_request(
+                    repo,
+                    branch_id,
+                    &command,
+                    None,
+                    config.exec.default_cwd.as_ref().and_then(|p| p.to_str()),
+                    config.exec.sandbox_profile,
+                )?;
+            }
+            sleep(Duration::from_millis(config.poll_ms));
+            continue;
         }
 
         sleep(Duration::from_millis(config.poll_ms));
     }
+}
+
+fn orient_bootstrap_command(config: &Config) -> String {
+    let _ = config;
+    "./faculties/orient.rs show".to_string()
 }
 
 fn create_thought_and_request(
@@ -1281,6 +1339,30 @@ fn collect_command_results(catalog: &TribleSet) -> Vec<CommandResultInfo> {
     }
 
     results.into_values().collect()
+}
+
+fn collect_command_requests(catalog: &TribleSet) -> Vec<Id> {
+    find!(
+        (request_id: Id),
+        pattern!(catalog, [{
+            ?request_id @ playground_exec::kind: playground_exec::kind_command_request
+        }])
+    )
+    .into_iter()
+    .map(|(request_id,)| request_id)
+    .collect()
+}
+
+fn has_pending_command_request(catalog: &TribleSet) -> bool {
+    let requests = collect_command_requests(catalog);
+    if requests.is_empty() {
+        return false;
+    }
+    let completed: HashSet<Id> = collect_command_results(catalog)
+        .into_iter()
+        .map(|result| result.about_request)
+        .collect();
+    requests.iter().any(|id| !completed.contains(id))
 }
 
 fn latest_command_result(catalog: &TribleSet, request_id: Id) -> Option<CommandResultInfo> {

@@ -134,7 +134,9 @@ where
     Ok(tribles)
 }
 
-pub fn build_playground_exec_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
+pub fn build_playground_exec_metadata<B>(
+    blobs: &mut B,
+) -> std::result::Result<TribleSet, B::PutError>
 where
     B: BlobStore<Blake3>,
 {
@@ -154,16 +156,34 @@ where
     }
 
     add_attribute!(playground_exec::kind, "playground_exec_kind");
-    add_attribute!(playground_exec::command_text, "playground_exec_command_text");
+    add_attribute!(
+        playground_exec::command_text,
+        "playground_exec_command_text"
+    );
     add_attribute!(playground_exec::cwd, "playground_exec_cwd");
     add_attribute!(playground_exec::stdin, "playground_exec_stdin");
     add_attribute!(playground_exec::stdin_text, "playground_exec_stdin_text");
     add_attribute!(playground_exec::timeout_ms, "playground_exec_timeout_ms");
-    add_attribute!(playground_exec::sandbox_profile, "playground_exec_sandbox_profile");
-    add_attribute!(playground_exec::requested_at, "playground_exec_requested_at");
-    add_attribute!(playground_exec::about_request, "playground_exec_about_request");
-    add_attribute!(playground_exec::about_message, "playground_exec_about_message");
-    add_attribute!(playground_exec::about_thought, "playground_exec_about_thought");
+    add_attribute!(
+        playground_exec::sandbox_profile,
+        "playground_exec_sandbox_profile"
+    );
+    add_attribute!(
+        playground_exec::requested_at,
+        "playground_exec_requested_at"
+    );
+    add_attribute!(
+        playground_exec::about_request,
+        "playground_exec_about_request"
+    );
+    add_attribute!(
+        playground_exec::about_message,
+        "playground_exec_about_message"
+    );
+    add_attribute!(
+        playground_exec::about_thought,
+        "playground_exec_about_thought"
+    );
     add_attribute!(playground_exec::worker, "playground_exec_worker");
     add_attribute!(playground_exec::started_at, "playground_exec_started_at");
     add_attribute!(playground_exec::attempt, "playground_exec_attempt");

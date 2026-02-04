@@ -1,15 +1,21 @@
 # Playground
 
-## Dashboard
+## Diagnostics
 
-Run the GORBIE dashboard example to observe a pile:
+Run the diagnostics dashboard to observe a pile:
 
 ```bash
-cargo run --manifest-path playground/Cargo.toml --example playground_dashboard
+cargo run --manifest-path playground/Cargo.toml -- diagnostics
 ```
 
 The dashboard defaults to `./self.pile` and branch `main`; change the path or branch in the UI if
 your VM writes elsewhere.
+
+Prefill the dashboard with a pile path:
+
+```bash
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/self.pile diagnostics
+```
 
 ## Running Playground
 

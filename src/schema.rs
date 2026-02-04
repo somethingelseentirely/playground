@@ -28,7 +28,9 @@ where
     metadata.union(openai_responses_schema::build_openai_responses_metadata(
         blobs,
     )?);
-    metadata.union(workspace_schema::build_playground_workspace_metadata(blobs)?);
+    metadata.union(workspace_schema::build_playground_workspace_metadata(
+        blobs,
+    )?);
     Ok(metadata)
 }
 #[path = "config_schema.rs"]

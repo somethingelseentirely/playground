@@ -11,18 +11,20 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use triblespace::core::blob::Bytes;
 use triblespace::core::blob::schemas::UnknownBlob;
-use triblespace::core::repo::{Repository, Workspace};
 use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
-use crate::config::Config;
 use crate::branch_util::ensure_branch_id;
-use crate::repo_util::{ensure_worker_shortname, init_repo, load_text, push_workspace, seed_metadata};
-use crate::workspace_snapshot::{DEFAULT_WORKSPACE_BRANCH, restore_snapshot};
-use crate::time_util::{epoch_interval, interval_key, now_epoch};
+use crate::config::Config;
+use crate::repo_util::{
+    ensure_worker_shortname, init_repo, load_text, push_workspace, seed_metadata,
+};
 use crate::schema::playground_exec;
+use crate::time_util::{epoch_interval, interval_key, now_epoch};
+use crate::workspace_snapshot::{DEFAULT_WORKSPACE_BRANCH, restore_snapshot};
 
 #[derive(Debug, Clone)]
 struct CommandRequest {
@@ -242,8 +244,7 @@ fn maybe_bootstrap_workspace(repo: &mut Repository<Pile>) -> Result<()> {
 }
 
 fn dir_is_empty(path: &Path) -> Result<bool> {
-    let mut entries = fs::read_dir(path)
-        .with_context(|| format!("read dir {}", path.display()))?;
+    let mut entries = fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))?;
     Ok(entries.next().is_none())
 }
 

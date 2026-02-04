@@ -15,9 +15,11 @@ use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, ShortStr
 use triblespace::prelude::*;
 
 use crate::config::Config;
-use crate::repo_util::{ensure_worker_shortname, init_repo, load_text, push_workspace, seed_metadata};
-use crate::time_util::{epoch_interval, interval_key, now_epoch};
+use crate::repo_util::{
+    ensure_worker_shortname, init_repo, load_text, push_workspace, seed_metadata,
+};
 use crate::schema::openai_responses;
+use crate::time_util::{epoch_interval, interval_key, now_epoch};
 
 #[derive(Debug, Clone)]
 struct LlmRequest {
@@ -116,7 +118,12 @@ pub(crate) fn run_llm_loop(
             .map(|value| String::from_value(&value))
             .unwrap_or_else(|| config.llm.model.clone());
 
-        let payload = build_payload(&model, &prompt, config.llm.stream);
+        let payload = build_payload(
+            &model,
+            &prompt,
+            config.llm.stream,
+            config.llm.reasoning_effort.as_deref(),
+        );
         let request_raw = serde_json::to_string(&payload).context("serialize request payload")?;
 
         let started_at = epoch_interval(now_epoch());
@@ -293,13 +300,22 @@ fn next_request(catalog: &TribleSet) -> Option<LlmRequest> {
     candidates.into_iter().next()
 }
 
-fn build_payload(model: &str, prompt: &str, stream: bool) -> JsonValue {
+fn build_payload(
+    model: &str,
+    prompt: &str,
+    stream: bool,
+    reasoning_effort: Option<&str>,
+) -> JsonValue {
+    let mut reasoning = serde_json::json!({
+        "summary": "detailed",
+    });
+    if let Some(effort) = reasoning_effort {
+        reasoning["effort"] = JsonValue::String(effort.to_string());
+    }
     serde_json::json!({
         "model": model,
         "input": [{"role": "user", "content": prompt}],
-        "reasoning": {
-            "summary": "detailed",
-        },
+        "reasoning": reasoning,
         "include": ["reasoning.encrypted_content"],
         "stream": stream,
     })

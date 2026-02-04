@@ -21,8 +21,7 @@ pub mod playground_workspace {
 
     /// Root id for describing the playground_workspace protocol.
     #[allow(non_upper_case_globals)]
-    pub const playground_workspace_metadata: Id =
-        id_hex!("A2FFA9482870C13D310D0E5F1C54137B");
+    pub const playground_workspace_metadata: Id = id_hex!("A2FFA9482870C13D310D0E5F1C54137B");
 
     /// Tag for workspace snapshot entities.
     #[allow(non_upper_case_globals)]

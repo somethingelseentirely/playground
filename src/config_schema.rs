@@ -16,10 +16,12 @@ pub mod playground_config {
         "4E2F9CA7A8456DED8C43A3BE741ADA58" as pub branch_id: GenId;
         "F0F90572249284CD57E48580369DEB6D" as pub author: Handle<Blake3, LongString>;
         "98A194178CFD7CBB915C1BC9EB561A7F" as pub author_role: Handle<Blake3, LongString>;
+        "D1DC11B303725409AB8A30C6B59DB2D7" as pub persona_id: GenId;
         "698519DFB681FABC3F06160ACAC9DA8E" as pub poll_ms: U256BE;
         "85BE7BDA465B3CB0F800F76EEF8FAC9B" as pub llm_model: Handle<Blake3, LongString>;
         "B216CFBBF85AA1350B142D510E26268B" as pub llm_base_url: Handle<Blake3, LongString>;
         "55F3FFD721AF7C1258E45BC91CDBF30F" as pub llm_api_key: Handle<Blake3, LongString>;
+        "BA4E05799CA2ACDCF3F9350FC8742F2F" as pub llm_reasoning_effort: Handle<Blake3, LongString>;
         "5F04F7A0EB4EBBE6161022B336F83513" as pub llm_stream: U256BE;
         "120F9C6BBB103FAFFB31A66E2ABC15E6" as pub exec_default_cwd: Handle<Blake3, LongString>;
         "D18A351B6E03A460E4F400D97D285F96" as pub exec_sandbox_profile: GenId;
@@ -124,19 +126,51 @@ where
     }
 
     add_attribute!(playground_config::kind, "playground_config_kind");
-    add_attribute!(playground_config::updated_at, "playground_config_updated_at");
-    add_attribute!(playground_config::system_prompt, "playground_config_system_prompt");
-    add_attribute!(playground_config::seed_prompt, "playground_config_seed_prompt");
+    add_attribute!(
+        playground_config::updated_at,
+        "playground_config_updated_at"
+    );
+    add_attribute!(
+        playground_config::system_prompt,
+        "playground_config_system_prompt"
+    );
+    add_attribute!(
+        playground_config::seed_prompt,
+        "playground_config_seed_prompt"
+    );
     add_attribute!(playground_config::branch, "playground_config_branch");
     add_attribute!(playground_config::branch_id, "playground_config_branch_id");
     add_attribute!(playground_config::author, "playground_config_author");
-    add_attribute!(playground_config::author_role, "playground_config_author_role");
+    add_attribute!(
+        playground_config::author_role,
+        "playground_config_author_role"
+    );
+    add_attribute!(
+        playground_config::persona_id,
+        "playground_config_persona_id"
+    );
     add_attribute!(playground_config::poll_ms, "playground_config_poll_ms");
     add_attribute!(playground_config::llm_model, "playground_config_llm_model");
-    add_attribute!(playground_config::llm_base_url, "playground_config_llm_base_url");
-    add_attribute!(playground_config::llm_api_key, "playground_config_llm_api_key");
-    add_attribute!(playground_config::llm_stream, "playground_config_llm_stream");
-    add_attribute!(playground_config::exec_default_cwd, "playground_config_exec_default_cwd");
+    add_attribute!(
+        playground_config::llm_base_url,
+        "playground_config_llm_base_url"
+    );
+    add_attribute!(
+        playground_config::llm_api_key,
+        "playground_config_llm_api_key"
+    );
+    add_attribute!(
+        playground_config::llm_reasoning_effort,
+        "playground_config_llm_reasoning_effort"
+    );
+    add_attribute!(
+        playground_config::llm_stream,
+        "playground_config_llm_stream"
+    );
+    add_attribute!(
+        playground_config::exec_default_cwd,
+        "playground_config_exec_default_cwd"
+    );
     add_attribute!(
         playground_config::exec_sandbox_profile,
         "playground_config_exec_sandbox_profile"

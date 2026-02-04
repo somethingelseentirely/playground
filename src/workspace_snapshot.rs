@@ -119,7 +119,8 @@ fn load_entry(
         .and_then(u256be_to_u64)
         .and_then(|value| u32::try_from(value).ok());
 
-    let bytes_handle = load_handle_attr::<FileBytes>(catalog, entry_id, playground_workspace::bytes);
+    let bytes_handle =
+        load_handle_attr::<FileBytes>(catalog, entry_id, playground_workspace::bytes);
     let bytes = match bytes_handle {
         Some(handle) => {
             let blob: Blob<FileBytes> = ws.get(handle).context("read workspace blob")?;
@@ -128,8 +129,7 @@ fn load_entry(
         None => None,
     };
 
-    let link_target =
-        load_string_attr(ws, catalog, entry_id, playground_workspace::link_target)?;
+    let link_target = load_string_attr(ws, catalog, entry_id, playground_workspace::link_target)?;
 
     let entry_kind = if kind == playground_workspace::kind_file {
         EntryKind::File
@@ -152,15 +152,13 @@ fn load_entry(
 
 fn restore_entries(target_root: &Path, entries: &[CapturedEntry], force: bool) -> Result<()> {
     if !target_root.exists() {
-        fs::create_dir_all(target_root).with_context(|| {
-            format!("create workspace root {}", target_root.display())
-        })?;
+        fs::create_dir_all(target_root)
+            .with_context(|| format!("create workspace root {}", target_root.display()))?;
     }
 
     for entry in entries {
         let rel = Path::new(entry.path.as_str());
-        if rel
-            .is_absolute()
+        if rel.is_absolute()
             || rel
                 .components()
                 .any(|c| std::matches!(c, Component::ParentDir))
@@ -180,9 +178,8 @@ fn restore_entries(target_root: &Path, entries: &[CapturedEntry], force: bool) -
                 let target_parent = target
                     .parent()
                     .ok_or_else(|| anyhow!("invalid snapshot path: {}", entry.path))?;
-                fs::create_dir_all(target_parent).with_context(|| {
-                    format!("create dir {}", target_parent.display())
-                })?;
+                fs::create_dir_all(target_parent)
+                    .with_context(|| format!("create dir {}", target_parent.display()))?;
                 if target.exists() {
                     if !force {
                         return Err(anyhow!("path exists: {}", target.display()));
@@ -199,9 +196,8 @@ fn restore_entries(target_root: &Path, entries: &[CapturedEntry], force: bool) -
                 let target_parent = target
                     .parent()
                     .ok_or_else(|| anyhow!("invalid snapshot path: {}", entry.path))?;
-                fs::create_dir_all(target_parent).with_context(|| {
-                    format!("create dir {}", target_parent.display())
-                })?;
+                fs::create_dir_all(target_parent)
+                    .with_context(|| format!("create dir {}", target_parent.display()))?;
                 if target.exists() && !force {
                     return Err(anyhow!("path exists: {}", target.display()));
                 }
@@ -328,11 +324,9 @@ fn create_symlink(_target: &Path, _link: &Path) -> Result<()> {
 
 fn remove_existing(path: &Path) -> Result<()> {
     if path.is_dir() {
-        fs::remove_dir_all(path)
-            .with_context(|| format!("remove dir {}", path.display()))?;
+        fs::remove_dir_all(path).with_context(|| format!("remove dir {}", path.display()))?;
     } else {
-        fs::remove_file(path)
-            .with_context(|| format!("remove file {}", path.display()))?;
+        fs::remove_file(path).with_context(|| format!("remove file {}", path.display()))?;
     }
     Ok(())
 }

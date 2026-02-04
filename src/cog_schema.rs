@@ -93,7 +93,9 @@ where
     Ok(tribles)
 }
 
-pub fn build_playground_cog_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
+pub fn build_playground_cog_metadata<B>(
+    blobs: &mut B,
+) -> std::result::Result<TribleSet, B::PutError>
 where
     B: BlobStore<Blake3>,
 {
@@ -112,7 +114,10 @@ where
     add_attribute!(playground_cog::kind, "playground_cog_kind");
     add_attribute!(playground_cog::prompt, "playground_cog_prompt");
     add_attribute!(playground_cog::created_at, "playground_cog_created_at");
-    add_attribute!(playground_cog::about_exec_result, "playground_cog_about_exec_result");
+    add_attribute!(
+        playground_cog::about_exec_result,
+        "playground_cog_about_exec_result"
+    );
 
     Ok(metadata)
 }

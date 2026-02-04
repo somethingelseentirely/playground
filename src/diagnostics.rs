@@ -1,14 +1,3 @@
-#!/usr/bin/env -S watchexec -r rust-script
-//! ```cargo
-//! [dependencies]
-//! GORBIE = { path = "../vendor/GORBIE", features = ["triblespace"] }
-//! ed25519-dalek = "2.1.1"
-//! eframe = { version = "0.33", features = ["persistence", "wgpu"] }
-//! hifitime = "4.2.3"
-//! rand_core = "0.9.5"
-//! triblespace = { version = "0.9.0", features = ["wasm"] }
-//! ```
-
 use ed25519_dalek::{SecretKey, SigningKey};
 use eframe::egui;
 use hifitime::Epoch;
@@ -16,6 +5,7 @@ use rand_core::{OsRng, TryRngCore};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::id::{ExclusiveId, Id};
@@ -36,17 +26,15 @@ use GORBIE::md;
 use GORBIE::notebook;
 use GORBIE::widgets::{Button, TextField};
 
-#[path = "../src/exec_schema.rs"]
-mod exec_schema;
-#[path = "../src/openai_responses_schema.rs"]
-mod openai_responses_schema;
+#[allow(dead_code)]
 #[path = "../vendor/schemas/archive_schema.rs"]
 mod archive_schema;
+#[allow(dead_code)]
 #[path = "../vendor/schemas/teams_schema.rs"]
 mod teams_schema;
 
-use exec_schema::playground_exec;
-use openai_responses_schema::openai_responses;
+use crate::schema::openai_responses;
+use crate::schema::playground_exec;
 use archive_schema::archive;
 use teams_schema::teams;
 
@@ -55,23 +43,29 @@ const EXEC_SCROLL_HEIGHT: f32 = 260.0;
 const SUMMARY_SCROLL_HEIGHT: f32 = 220.0;
 const LOCAL_MESSAGE_SCROLL_HEIGHT: f32 = 780.0;
 const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
+const RELATIONS_SCROLL_HEIGHT: f32 = 260.0;
 const TEAMS_SCROLL_HEIGHT: f32 = 520.0;
 const TEAMS_CHAT_LIST_WIDTH: f32 = 220.0;
 
+static DIAGNOSTICS_PILE_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+pub fn set_default_pile(path: Option<PathBuf>) {
+    let _ = DIAGNOSTICS_PILE_OVERRIDE.set(path);
+}
+
+fn diagnostics_default_pile() -> Option<PathBuf> {
+    DIAGNOSTICS_PILE_OVERRIDE
+        .get()
+        .and_then(|path| path.as_ref().cloned())
+}
+
 const LOCAL_KIND_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
 const LOCAL_KIND_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
-const LOCAL_KIND_PARTY_ID: Id = id_hex!("3AA2883528D3812067DFA1CD5DE5F8B8");
-const LOCAL_PARTY_AGENT_ID: Id = id_hex!("5EBC44A9FC4C8444AA01DFA7AC315AD5");
-const LOCAL_PARTY_USER_ID: Id = id_hex!("7A39EB8857D1912501DACDA4DB29077B");
+const RELATIONS_KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 
-const LOCAL_KIND_SPECS: [(Id, &str); 3] = [
+const LOCAL_KIND_SPECS: [(Id, &str); 2] = [
     (LOCAL_KIND_MESSAGE_ID, "local_message"),
     (LOCAL_KIND_READ_ID, "local_read"),
-    (LOCAL_KIND_PARTY_ID, "local_party"),
-];
-const LOCAL_PARTY_SPECS: [(Id, &str); 2] = [
-    (LOCAL_PARTY_AGENT_ID, "agent"),
-    (LOCAL_PARTY_USER_ID, "user"),
 ];
 
 mod local_messages {
@@ -91,22 +85,44 @@ mod local_messages {
     }
 }
 
+mod relations {
+    use triblespace::prelude::attributes;
+    use triblespace::prelude::valueschemas;
+
+    attributes! {
+        "8F162B593D390E1424394DBF6883A72C" as alias: valueschemas::ShortString;
+        "32B22FBA3EC2ADC3FFEB48483FE8961F" as affinity: valueschemas::ShortString;
+        "9B3329149D54CB9A8E8075E4AA862649" as teams_user_id: valueschemas::ShortString;
+        "B563A063474CBE62ED25A8D0E9A1853C" as email: valueschemas::ShortString;
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DashboardConfig {
     pile_path: String,
     exec_branches: String,
     local_message_branches: String,
+    relations_branches: String,
+    local_sender: String,
+    local_recipient: String,
+    local_reader: String,
     teams_branches: String,
 }
 
 impl Default for DashboardConfig {
     fn default() -> Self {
-        let repo_root = repo_root();
-        let default_pile = repo_root.join("self.pile");
+        let default_pile = diagnostics_default_pile().unwrap_or_else(|| {
+            let repo_root = repo_root();
+            repo_root.join("self.pile")
+        });
         Self {
             pile_path: default_pile.to_string_lossy().to_string(),
             exec_branches: "main".to_string(),
             local_message_branches: "local-messages".to_string(),
+            relations_branches: "relations".to_string(),
+            local_sender: "jp".to_string(),
+            local_recipient: "bulti".to_string(),
+            local_reader: "bulti".to_string(),
             teams_branches: "teams".to_string(),
         }
     }
@@ -159,7 +175,6 @@ struct BranchEntry {
 
 #[derive(Debug, Clone)]
 struct ExecRow {
-    id: Id,
     command: String,
     status: ExecStatus,
     requested_at: Option<i128>,
@@ -193,16 +208,13 @@ struct LocalMessageRow {
     from_id: Id,
     to_id: Id,
     body: String,
-    read_by_user: bool,
-    read_by_agent: bool,
+    read_by_reader: bool,
 }
 
 #[derive(Debug, Clone)]
 struct TeamsMessageRow {
-    id: Id,
     chat_id: Id,
     created_at: Option<i128>,
-    author_id: Id,
     author_name: Option<String>,
     content: String,
 }
@@ -222,6 +234,18 @@ struct ReasoningSummaryRow {
 }
 
 #[derive(Debug, Clone)]
+struct RelationRow {
+    id: Id,
+    label: Option<String>,
+    display_name: Option<String>,
+    affinity: Option<String>,
+    teams_user_id: Option<String>,
+    email: Option<String>,
+    note: Option<String>,
+    aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct DashboardSnapshot {
     pile_path: PathBuf,
     branches: Vec<BranchEntry>,
@@ -232,6 +256,12 @@ struct DashboardSnapshot {
     reasoning_summaries: Vec<ReasoningSummaryRow>,
     local_message_rows: Vec<LocalMessageRow>,
     local_message_error: Option<String>,
+    local_sender_id: Option<Id>,
+    local_recipient_id: Option<Id>,
+    local_reader_id: Option<Id>,
+    relations_people: Vec<RelationRow>,
+    relations_error: Option<String>,
+    relations_labels: HashMap<Id, String>,
     teams_messages: Vec<TeamsMessageRow>,
     teams_chats: Vec<TeamsChatRow>,
     teams_error: Option<String>,
@@ -245,32 +275,17 @@ struct BranchSnapshot {
     data: TribleSet,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalParty {
-    User,
-    Agent,
-}
-
-impl LocalParty {
-    fn id(self) -> Id {
-        match self {
-            LocalParty::User => LOCAL_PARTY_USER_ID,
-            LocalParty::Agent => LOCAL_PARTY_AGENT_ID,
-        }
-    }
-}
-
-#[notebook]
-fn main(nb: &mut NotebookCtx) {
+#[notebook(name = "Playground Diagnostics")]
+pub fn diagnostics(nb: &mut NotebookCtx) {
     let padding = DEFAULT_CARD_PADDING;
     nb.state(
-        "playground-dashboard",
+        "playground-diagnostics",
         DashboardState::default(),
         move |ui, state| {
             with_padding(ui, padding, |ui| {
                 md!(
                     ui,
-                    "# Playground VM Dashboard\n\
+                    "# Playground Diagnostics\n\
 _Live view of the agent pile, exec queue, and message activity._"
                 );
 
@@ -287,6 +302,22 @@ _Live view of the agent pile, exec queue, and message activity._"
                 ui.horizontal(|ui| {
                     ui.label("Local message branches");
                     ui.text_edit_singleline(&mut state.config.local_message_branches);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Relations branches");
+                    ui.text_edit_singleline(&mut state.config.relations_branches);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Local sender");
+                    ui.text_edit_singleline(&mut state.config.local_sender);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Local recipient");
+                    ui.text_edit_singleline(&mut state.config.local_recipient);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Local reader");
+                    ui.text_edit_singleline(&mut state.config.local_reader);
                 });
                 ui.horizontal(|ui| {
                     ui.label("Teams branches");
@@ -357,14 +388,25 @@ _Live view of the agent pile, exec queue, and message activity._"
                                 state,
                                 &snapshot.branches,
                                 &snapshot.local_message_rows,
+                                snapshot.local_reader_id,
                             );
                             render_local_messages(
                                 ui,
                                 snapshot.now_key,
                                 &snapshot.local_message_rows,
+                                snapshot.local_sender_id,
+                                snapshot.local_reader_id,
                             );
                         }
-                        render_local_composer(ui, state, &snapshot.branches);
+                        render_local_composer(ui, state, &snapshot.branches, &snapshot);
+
+                        ui.separator();
+                        ui.heading("Relations");
+                        if let Some(err) = &snapshot.relations_error {
+                            ui.colored_label(egui::Color32::RED, err);
+                        } else {
+                            render_relations(ui, &snapshot.relations_people);
+                        }
 
                         ui.separator();
                         ui.heading("Teams conversations");
@@ -439,30 +481,36 @@ fn load_snapshot(
 
     let exec_refs = parse_branch_list(&config.exec_branches);
     let local_refs = parse_branch_list(&config.local_message_branches);
+    let relations_refs = parse_branch_list(&config.relations_branches);
     let teams_refs = parse_branch_list(&config.teams_branches);
 
     let mut ensure_refs = Vec::new();
     ensure_refs.extend(exec_refs.iter().cloned());
     ensure_refs.extend(local_refs.iter().cloned());
+    ensure_refs.extend(relations_refs.iter().cloned());
     ensure_refs.extend(teams_refs.iter().cloned());
     ensure_named_branches(repo, &mut branches, &ensure_refs)?;
 
     let branch_lookup = BranchLookup::new(&branches);
     let exec_res = resolve_branch_ids(&branch_lookup, &exec_refs);
     let local_res = resolve_branch_ids(&branch_lookup, &local_refs);
+    let relations_res = resolve_branch_ids(&branch_lookup, &relations_refs);
     let teams_res = resolve_branch_ids(&branch_lookup, &teams_refs);
 
     let exec_error = exec_res.as_ref().err().cloned();
     let local_message_error = local_res.as_ref().err().cloned();
+    let relations_error = relations_res.as_ref().err().cloned();
     let teams_error = teams_res.as_ref().err().cloned();
 
     let exec_ids = exec_res.unwrap_or_default();
     let local_ids = local_res.unwrap_or_default();
+    let relations_ids = relations_res.unwrap_or_default();
     let teams_ids = teams_res.unwrap_or_default();
 
     let mut needed_ids: Vec<Id> = Vec::new();
     extend_unique(&mut needed_ids, &exec_ids);
     extend_unique(&mut needed_ids, &local_ids);
+    extend_unique(&mut needed_ids, &relations_ids);
     extend_unique(&mut needed_ids, &teams_ids);
 
     let mut branch_data: HashMap<Id, BranchSnapshot> = HashMap::new();
@@ -481,6 +529,7 @@ fn load_snapshot(
 
     let exec_data = union_branches(&branch_data, &exec_ids);
     let local_data = union_branches(&branch_data, &local_ids);
+    let relations_data = union_branches(&branch_data, &relations_ids);
     let teams_data = union_branches(&branch_data, &teams_ids);
 
     let mut reader_ws = if let Some(ws) = reader_ws {
@@ -502,6 +551,12 @@ fn load_snapshot(
             reasoning_summaries: Vec::new(),
             local_message_rows: Vec::new(),
             local_message_error,
+            local_sender_id: None,
+            local_recipient_id: None,
+            local_reader_id: None,
+            relations_people: Vec::new(),
+            relations_error,
+            relations_labels: HashMap::new(),
             teams_messages: Vec::new(),
             teams_chats: Vec::new(),
             teams_error,
@@ -513,13 +568,16 @@ fn load_snapshot(
     Ok(build_snapshot(
         exec_data,
         local_data,
+        relations_data,
         teams_data,
         pile_path,
         branches,
         branch_data,
         exec_error,
         local_message_error,
+        relations_error,
         teams_error,
+        config,
         &mut reader_ws,
     ))
 }
@@ -527,20 +585,28 @@ fn load_snapshot(
 fn build_snapshot(
     exec_data: TribleSet,
     local_data: TribleSet,
+    relations_data: TribleSet,
     teams_data: TribleSet,
     pile_path: PathBuf,
     branches: Vec<BranchEntry>,
     branch_data: HashMap<Id, BranchSnapshot>,
     exec_error: Option<String>,
     local_message_error: Option<String>,
+    relations_error: Option<String>,
     teams_error: Option<String>,
+    config: &DashboardConfig,
     ws: &mut Workspace<Pile>,
 ) -> DashboardSnapshot {
     let now_key = epoch_key(now_epoch());
+    let relations_people = collect_relations_people(&relations_data, ws);
+    let relations_labels = collect_relations_labels(&relations_people);
+    let local_sender_id = resolve_person_ref(&relations_people, &config.local_sender);
+    let local_recipient_id = resolve_person_ref(&relations_people, &config.local_recipient);
+    let local_reader_id = resolve_person_ref(&relations_people, &config.local_reader);
     let exec_rows = collect_exec_rows(&exec_data, ws);
     let exec_summary = summarize_exec(&exec_rows);
     let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
-    let local_message_rows = collect_local_messages(&local_data, ws);
+    let local_message_rows = collect_local_messages(&local_data, ws, local_reader_id);
     let (teams_messages, teams_chats) = collect_teams_messages(&teams_data, ws);
     let shortnames = collect_shortnames(&exec_data);
 
@@ -554,6 +620,12 @@ fn build_snapshot(
         reasoning_summaries,
         local_message_rows,
         local_message_error,
+        local_sender_id,
+        local_recipient_id,
+        local_reader_id,
+        relations_people,
+        relations_error,
+        relations_labels,
         teams_messages,
         teams_chats,
         teams_error,
@@ -752,7 +824,6 @@ fn collect_exec_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ExecRow>
         rows.insert(
             request_id,
             ExecRow {
-                id: request_id,
                 command: command_text,
                 status: ExecStatus::Pending,
                 requested_at: None,
@@ -812,7 +883,11 @@ fn collect_exec_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ExecRow>
     list
 }
 
-fn collect_local_messages(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<LocalMessageRow> {
+fn collect_local_messages(
+    data: &TribleSet,
+    ws: &mut Workspace<Pile>,
+    reader_id: Option<Id>,
+) -> Vec<LocalMessageRow> {
     let mut rows = Vec::new();
     for (message_id, from, to, body_handle, created_at) in find!(
         (
@@ -838,8 +913,7 @@ fn collect_local_messages(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Loc
             from_id: from,
             to_id: to,
             body,
-            read_by_user: false,
-            read_by_agent: false,
+            read_by_reader: false,
         });
     }
 
@@ -863,16 +937,159 @@ fn collect_local_messages(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Loc
         reads.entry(message_id).or_default().insert(reader_id);
     }
 
-    for row in &mut rows {
-        if let Some(readers) = reads.get(&row.id) {
-            row.read_by_user = readers.contains(&LOCAL_PARTY_USER_ID);
-            row.read_by_agent = readers.contains(&LOCAL_PARTY_AGENT_ID);
+    if let Some(reader_id) = reader_id {
+        for row in &mut rows {
+            if let Some(readers) = reads.get(&row.id) {
+                row.read_by_reader = readers.contains(&reader_id);
+            }
         }
     }
 
     rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
     rows.reverse();
     rows
+}
+
+fn collect_relations_people(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<RelationRow> {
+    let mut people: HashMap<Id, RelationRow> = HashMap::new();
+
+    for (person_id,) in find!(
+        (person_id: Id),
+        pattern!(data, [{ ?person_id @ metadata::tag: &RELATIONS_KIND_PERSON_ID }])
+    ) {
+        people.insert(
+            person_id,
+            RelationRow {
+                id: person_id,
+                label: None,
+                display_name: None,
+                affinity: None,
+                teams_user_id: None,
+                email: None,
+                note: None,
+                aliases: Vec::new(),
+            },
+        );
+    }
+
+    for (person_id, label) in find!(
+        (person_id: Id, label: String),
+        pattern!(data, [{ ?person_id @ metadata::shortname: ?label }])
+    ) {
+        if let Some(person) = people.get_mut(&person_id) {
+            person.label = Some(label);
+        }
+    }
+
+    for (person_id, handle) in find!(
+        (person_id: Id, handle: Value<Handle<Blake3, LongString>>),
+        pattern!(data, [{ ?person_id @ metadata::name: ?handle }])
+    ) {
+        if let Some(person) = people.get_mut(&person_id) {
+            if person.display_name.is_none() {
+                if let Some(value) = load_text(ws, handle) {
+                    person.display_name = Some(value);
+                }
+            }
+        }
+    }
+
+    for (person_id, handle) in find!(
+        (person_id: Id, handle: Value<Handle<Blake3, LongString>>),
+        pattern!(data, [{ ?person_id @ metadata::description: ?handle }])
+    ) {
+        if let Some(person) = people.get_mut(&person_id) {
+            if person.note.is_none() {
+                if let Some(value) = load_text(ws, handle) {
+                    person.note = Some(value);
+                }
+            }
+        }
+    }
+
+    for (person_id, value) in find!(
+        (person_id: Id, value: String),
+        pattern!(data, [{ ?person_id @ relations::affinity: ?value }])
+    ) {
+        if let Some(person) = people.get_mut(&person_id) {
+            if person.affinity.is_none() {
+                person.affinity = Some(value);
+            }
+        }
+    }
+
+    for (person_id, value) in find!(
+        (person_id: Id, value: String),
+        pattern!(data, [{ ?person_id @ relations::teams_user_id: ?value }])
+    ) {
+        if let Some(person) = people.get_mut(&person_id) {
+            if person.teams_user_id.is_none() {
+                person.teams_user_id = Some(value);
+            }
+        }
+    }
+
+    for (person_id, value) in find!(
+        (person_id: Id, value: String),
+        pattern!(data, [{ ?person_id @ relations::email: ?value }])
+    ) {
+        if let Some(person) = people.get_mut(&person_id) {
+            if person.email.is_none() {
+                person.email = Some(value);
+            }
+        }
+    }
+
+    for (person_id, value) in find!(
+        (person_id: Id, value: String),
+        pattern!(data, [{ ?person_id @ relations::alias: ?value }])
+    ) {
+        if let Some(person) = people.get_mut(&person_id) {
+            person.aliases.push(value);
+        }
+    }
+
+    let mut list: Vec<RelationRow> = people.into_values().collect();
+    list.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
+    list
+}
+
+fn collect_relations_labels(people: &[RelationRow]) -> HashMap<Id, String> {
+    let mut map = HashMap::new();
+    for person in people {
+        if let Some(label) = person.label.as_ref() {
+            map.insert(person.id, label.clone());
+        } else if let Some(name) = person.display_name.as_ref() {
+            map.insert(person.id, name.clone());
+        }
+    }
+    map
+}
+
+fn resolve_person_ref(people: &[RelationRow], raw: &str) -> Option<Id> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(id) = Id::from_hex(trimmed) {
+        return Some(id);
+    }
+    for person in people {
+        if let Some(label) = person.label.as_ref() {
+            if label == trimmed {
+                return Some(person.id);
+            }
+        }
+        if let Some(name) = person.display_name.as_ref() {
+            if name == trimmed {
+                return Some(person.id);
+            }
+        }
+        if person.aliases.iter().any(|alias| alias == trimmed) {
+            return Some(person.id);
+        }
+    }
+    None
 }
 
 fn collect_teams_messages(
@@ -900,7 +1117,7 @@ fn collect_teams_messages(
     }
 
     let mut messages = Vec::new();
-    for (message_id, chat_id, author_id, content_handle, created_at) in find!(
+    for (_message_id, chat_id, author_id, content_handle, created_at) in find!(
         (
             message_id: Id,
             chat_id: Id,
@@ -921,10 +1138,8 @@ fn collect_teams_messages(
         let created_key = interval_key(created_at);
         let author_name = author_names.get(&author_id).cloned();
         messages.push(TeamsMessageRow {
-            id: message_id,
             chat_id,
             created_at: Some(created_key),
-            author_id,
             author_name,
             content,
         });
@@ -945,7 +1160,9 @@ fn collect_teams_messages(
             message_count: 0,
         });
         entry.message_count += 1;
-        if entry.last_at.map_or(true, |current| row.created_at.unwrap_or(i128::MIN) > current) {
+        if entry.last_at.map_or(true, |current| {
+            row.created_at.unwrap_or(i128::MIN) > current
+        }) {
             entry.last_at = row.created_at;
         }
     }
@@ -1006,7 +1223,40 @@ fn collect_shortnames(data: &TribleSet) -> HashMap<Id, String> {
     map
 }
 
-fn render_local_composer(ui: &mut egui::Ui, state: &mut DashboardState, branches: &[BranchEntry]) {
+fn render_local_composer(
+    ui: &mut egui::Ui,
+    state: &mut DashboardState,
+    branches: &[BranchEntry],
+    snapshot: &DashboardSnapshot,
+) {
+    let sender_label = snapshot
+        .local_sender_id
+        .and_then(|id| snapshot.relations_labels.get(&id).cloned())
+        .unwrap_or_else(|| state.config.local_sender.clone());
+    let recipient_label = snapshot
+        .local_recipient_id
+        .and_then(|id| snapshot.relations_labels.get(&id).cloned())
+        .unwrap_or_else(|| state.config.local_recipient.clone());
+    ui.small(format!("From: {sender_label} → {recipient_label}"));
+    if snapshot.local_sender_id.is_none() {
+        ui.colored_label(
+            egui::Color32::RED,
+            format!(
+                "Unknown sender '{}' (check Relations branch).",
+                state.config.local_sender
+            ),
+        );
+    }
+    if snapshot.local_recipient_id.is_none() {
+        ui.colored_label(
+            egui::Color32::RED,
+            format!(
+                "Unknown recipient '{}' (check Relations branch).",
+                state.config.local_recipient
+            ),
+        );
+    }
+
     let response = ui.add_sized(
         [ui.available_width(), LOCAL_COMPOSE_HEIGHT],
         TextField::multiline(&mut state.local_draft),
@@ -1028,7 +1278,7 @@ fn render_local_composer(ui: &mut egui::Ui, state: &mut DashboardState, branches
 
     ui.horizontal(|ui| {
         if ui.add(Button::new("Send")).clicked() {
-            send_local_message_from_ui(state, branches);
+            send_local_message_from_ui(state, branches, snapshot);
         }
         if ui.add(Button::new("Clear")).clicked() {
             state.local_draft.clear();
@@ -1060,14 +1310,11 @@ fn render_teams_conversations(
             ui.set_min_width(TEAMS_CHAT_LIST_WIDTH);
             ui.label("Chats");
             egui::ScrollArea::vertical()
-                .id_source("teams_chat_list_scroll")
+                .id_salt("teams_chat_list_scroll")
                 .max_height(TEAMS_SCROLL_HEIGHT)
                 .show(ui, |ui| {
                     let all_selected = state.teams_selected_chat.is_none();
-                    if ui
-                        .selectable_label(all_selected, "All chats")
-                        .clicked()
-                    {
+                    if ui.selectable_label(all_selected, "All chats").clicked() {
                         state.teams_selected_chat = None;
                     }
                     ui.add_space(6.0);
@@ -1098,7 +1345,7 @@ fn render_teams_conversations(
             ui.label(title);
 
             egui::ScrollArea::vertical()
-                .id_source("teams_message_scroll")
+                .id_salt("teams_message_scroll")
                 .max_height(TEAMS_SCROLL_HEIGHT)
                 .show(ui, |ui| {
                     for row in messages {
@@ -1107,10 +1354,7 @@ fn render_teams_conversations(
                                 continue;
                             }
                         }
-                        let author = row
-                            .author_name
-                            .as_deref()
-                            .unwrap_or("<unknown>");
+                        let author = row.author_name.as_deref().unwrap_or("<unknown>");
                         let age = format_age(now_key, row.created_at);
                         let chat_label = chats
                             .iter()
@@ -1132,7 +1376,11 @@ fn render_teams_conversations(
     });
 }
 
-fn send_local_message_from_ui(state: &mut DashboardState, branches: &[BranchEntry]) {
+fn send_local_message_from_ui(
+    state: &mut DashboardState,
+    branches: &[BranchEntry],
+    snapshot: &DashboardSnapshot,
+) {
     state.local_send_error = None;
     state.local_send_notice = None;
     state.local_read_error = None;
@@ -1158,7 +1406,22 @@ fn send_local_message_from_ui(state: &mut DashboardState, branches: &[BranchEntr
         }
     };
 
-    match send_local_message(repo, branch_id, LocalParty::User, LocalParty::Agent, body) {
+    let Some(from_id) = snapshot.local_sender_id else {
+        state.local_send_error = Some(format!(
+            "Unknown sender '{}' (check Relations branch).",
+            state.config.local_sender
+        ));
+        return;
+    };
+    let Some(to_id) = snapshot.local_recipient_id else {
+        state.local_send_error = Some(format!(
+            "Unknown recipient '{}' (check Relations branch).",
+            state.config.local_recipient
+        ));
+        return;
+    };
+
+    match send_local_message(repo, branch_id, from_id, to_id, body) {
         Ok(()) => {
             state.local_draft.clear();
             state.local_send_notice = Some("Message sent.".to_string());
@@ -1183,8 +1446,8 @@ fn resolve_single_branch(lookup: &BranchLookup, refs: &[String]) -> Result<Id, S
 fn send_local_message(
     repo: &mut Repository<Pile>,
     branch_id: Id,
-    from: LocalParty,
-    to: LocalParty,
+    from: Id,
+    to: Id,
     body: &str,
 ) -> Result<(), String> {
     let mut ws = repo
@@ -1198,8 +1461,8 @@ fn send_local_message(
     let body_handle = ws.put::<LongString, _>(body.to_string());
     change += entity! { &message_id @
         metadata::tag: &LOCAL_KIND_MESSAGE_ID,
-        local_messages::from: from.id(),
-        local_messages::to: to.id(),
+        local_messages::from: from,
+        local_messages::to: to,
         local_messages::body: body_handle,
         local_messages::created_at: now_interval,
     };
@@ -1214,11 +1477,15 @@ fn auto_ack_local_messages(
     state: &mut DashboardState,
     branches: &[BranchEntry],
     rows: &[LocalMessageRow],
+    reader_id: Option<Id>,
 ) {
     state.local_read_error = None;
+    let Some(reader_id) = reader_id else {
+        return;
+    };
     let unread: Vec<Id> = rows
         .iter()
-        .filter(|row| row.to_id == LOCAL_PARTY_USER_ID && !row.read_by_user)
+        .filter(|row| row.to_id == reader_id && !row.read_by_reader)
         .map(|row| row.id)
         .collect();
     if unread.is_empty() {
@@ -1238,7 +1505,7 @@ fn auto_ack_local_messages(
         }
     };
 
-    if let Err(err) = ack_local_messages(repo, branch_id, &unread) {
+    if let Err(err) = ack_local_messages(repo, branch_id, &unread, reader_id) {
         state.local_read_error = Some(err);
     }
 }
@@ -1247,6 +1514,7 @@ fn ack_local_messages(
     repo: &mut Repository<Pile>,
     branch_id: Id,
     message_ids: &[Id],
+    reader_id: Id,
 ) -> Result<(), String> {
     if message_ids.is_empty() {
         return Ok(());
@@ -1263,7 +1531,7 @@ fn ack_local_messages(
         change += entity! { &read_id @
             metadata::tag: &LOCAL_KIND_READ_ID,
             local_messages::about_message: *message_id,
-            local_messages::reader: LOCAL_PARTY_USER_ID,
+            local_messages::reader: reader_id,
             local_messages::read_at: now_interval,
         };
     }
@@ -1296,33 +1564,6 @@ fn ensure_local_metadata(ws: &mut Workspace<Pile>) -> Result<TribleSet, String> 
         if !existing_kinds.contains(&id) {
             change += entity! { ExclusiveId::force_ref(&id) @ metadata::shortname: label };
             existing_kinds.insert(id);
-        }
-    }
-
-    let existing_parties: HashSet<Id> = find!(
-        (party: Id),
-        pattern!(&space, [{ ?party @ metadata::tag: &LOCAL_KIND_PARTY_ID }])
-    )
-    .into_iter()
-    .map(|(party,)| party)
-    .collect();
-
-    let party_named: HashSet<Id> = find!(
-        (party: Id),
-        pattern!(&space, [{ ?party @ metadata::shortname: _?name }])
-    )
-    .into_iter()
-    .map(|(party,)| party)
-    .collect();
-
-    for (id, label) in LOCAL_PARTY_SPECS {
-        if !existing_parties.contains(&id) {
-            change += entity! { ExclusiveId::force_ref(&id) @
-                metadata::tag: &LOCAL_KIND_PARTY_ID,
-                metadata::shortname: label,
-            };
-        } else if !party_named.contains(&id) {
-            change += entity! { ExclusiveId::force_ref(&id) @ metadata::shortname: label };
         }
     }
 
@@ -1531,7 +1772,7 @@ fn render_exec_rows(
     shortnames: &HashMap<Id, String>,
 ) {
     egui::ScrollArea::vertical()
-        .id_source("exec_rows_scroll")
+        .id_salt("exec_rows_scroll")
         .max_height(EXEC_SCROLL_HEIGHT)
         .show(ui, |ui| {
             egui::Grid::new("exec_rows")
@@ -1576,7 +1817,7 @@ fn render_exec_rows(
 
 fn render_reasoning_summaries(ui: &mut egui::Ui, now_key: i128, rows: &[ReasoningSummaryRow]) {
     egui::ScrollArea::vertical()
-        .id_source("reasoning_summary_scroll")
+        .id_salt("reasoning_summary_scroll")
         .max_height(SUMMARY_SCROLL_HEIGHT)
         .show(ui, |ui| {
             for row in rows {
@@ -1587,17 +1828,23 @@ fn render_reasoning_summaries(ui: &mut egui::Ui, now_key: i128, rows: &[Reasonin
         });
 }
 
-fn render_local_messages(ui: &mut egui::Ui, now_key: i128, rows: &[LocalMessageRow]) {
+fn render_local_messages(
+    ui: &mut egui::Ui,
+    now_key: i128,
+    rows: &[LocalMessageRow],
+    sender_id: Option<Id>,
+    reader_id: Option<Id>,
+) {
     egui::ScrollArea::vertical()
-        .id_source("local_messages_scroll")
+        .id_salt("local_messages_scroll")
         .min_scrolled_height(LOCAL_MESSAGE_SCROLL_HEIGHT)
         .max_height(LOCAL_MESSAGE_SCROLL_HEIGHT)
         .show(ui, |ui| {
             for row in rows {
-                let is_user = row.from_id == LOCAL_PARTY_USER_ID;
+                let is_sender = sender_id.map_or(false, |id| row.from_id == id);
                 let age = format_age(now_key, row.created_at);
-                let meta = if is_user {
-                    if row.read_by_agent {
+                let meta = if is_sender {
+                    if reader_id.is_some() && row.read_by_reader {
                         format!("{age} · read")
                     } else {
                         format!("{age} · sent")
@@ -1606,12 +1853,12 @@ fn render_local_messages(ui: &mut egui::Ui, now_key: i128, rows: &[LocalMessageR
                     age
                 };
 
-                let align = if is_user {
+                let align = if is_sender {
                     egui::Layout::right_to_left(egui::Align::TOP)
                 } else {
                     egui::Layout::left_to_right(egui::Align::TOP)
                 };
-                let bubble_color = if is_user {
+                let bubble_color = if is_sender {
                     egui::Color32::from_rgb(92, 120, 155)
                 } else {
                     egui::Color32::from_gray(70)
@@ -1630,6 +1877,41 @@ fn render_local_messages(ui: &mut egui::Ui, now_key: i128, rows: &[LocalMessageR
                     ui.small(meta);
                 });
                 ui.add_space(6.0);
+            }
+        });
+}
+
+fn render_relations(ui: &mut egui::Ui, people: &[RelationRow]) {
+    if people.is_empty() {
+        ui.label("No relations.");
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("relations_scroll")
+        .max_height(RELATIONS_SCROLL_HEIGHT)
+        .show(ui, |ui| {
+            for person in people {
+                let label = person.label.as_deref().unwrap_or("<unnamed>");
+                ui.label(format!("[{}] {}", id_prefix(person.id), label));
+                if let Some(name) = &person.display_name {
+                    ui.small(name);
+                }
+                if let Some(affinity) = &person.affinity {
+                    ui.small(format!("affinity: {affinity}"));
+                }
+                if let Some(teams) = &person.teams_user_id {
+                    ui.small(format!("teams: {teams}"));
+                }
+                if let Some(email) = &person.email {
+                    ui.small(format!("email: {email}"));
+                }
+                if !person.aliases.is_empty() {
+                    ui.small(format!("aliases: {}", person.aliases.join(", ")));
+                }
+                if let Some(note) = &person.note {
+                    ui.small(format!("note: {}", truncate_single_line(note, 120)));
+                }
+                ui.add_space(8.0);
             }
         });
 }

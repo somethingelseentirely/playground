@@ -38,6 +38,7 @@ pub struct Config {
     pub seed_prompt: String,
     pub author: String,
     pub author_role: String,
+    pub persona_id: Option<Id>,
     pub poll_ms: u64,
 }
 
@@ -46,6 +47,7 @@ pub struct LlmConfig {
     pub model: String,
     pub base_url: String,
     pub api_key: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub stream: bool,
 }
 
@@ -70,6 +72,7 @@ impl Default for LlmConfig {
             model: default_model(),
             base_url: default_base_url(),
             api_key: None,
+            reasoning_effort: None,
             stream: default_stream(),
         }
     }
@@ -109,6 +112,7 @@ fn default_config(pile_path: PathBuf) -> Config {
         seed_prompt: default_seed_prompt(),
         author: default_author(),
         author_role: default_author_role(),
+        persona_id: None,
         poll_ms: default_poll_ms(),
     }
 }
@@ -177,10 +181,13 @@ fn load_latest_config(
 
     let mut config = default_config(pile_path.to_path_buf());
 
-    if let Some(prompt) = load_string_attr(ws, catalog, config_id, playground_config::system_prompt)? {
+    if let Some(prompt) =
+        load_string_attr(ws, catalog, config_id, playground_config::system_prompt)?
+    {
         config.system_prompt = prompt;
     }
-    if let Some(prompt) = load_string_attr(ws, catalog, config_id, playground_config::seed_prompt)? {
+    if let Some(prompt) = load_string_attr(ws, catalog, config_id, playground_config::seed_prompt)?
+    {
         config.seed_prompt = prompt;
     }
     if let Some(branch) = load_string_attr(ws, catalog, config_id, playground_config::branch)? {
@@ -192,16 +199,29 @@ fn load_latest_config(
     if let Some(role) = load_string_attr(ws, catalog, config_id, playground_config::author_role)? {
         config.author_role = role;
     }
+    if let Some(id) = load_id_attr(catalog, config_id, playground_config::persona_id) {
+        config.persona_id = Some(id);
+    }
     if let Some(model) = load_string_attr(ws, catalog, config_id, playground_config::llm_model)? {
         config.llm.model = model;
     }
     if let Some(url) = load_string_attr(ws, catalog, config_id, playground_config::llm_base_url)? {
         config.llm.base_url = url;
     }
+    if let Some(effort) = load_string_attr(
+        ws,
+        catalog,
+        config_id,
+        playground_config::llm_reasoning_effort,
+    )? {
+        config.llm.reasoning_effort = Some(effort);
+    }
     if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::llm_api_key)? {
         config.llm.api_key = Some(key);
     }
-    if let Some(cwd) = load_string_attr(ws, catalog, config_id, playground_config::exec_default_cwd)? {
+    if let Some(cwd) =
+        load_string_attr(ws, catalog, config_id, playground_config::exec_default_cwd)?
+    {
         config.exec.default_cwd = Some(PathBuf::from(cwd));
     }
 
@@ -211,13 +231,13 @@ fn load_latest_config(
     if let Some(id) = load_id_attr(catalog, config_id, playground_config::exec_sandbox_profile) {
         config.exec.sandbox_profile = Some(id);
     }
-    if let Some(poll_ms) = load_u256_attr(catalog, config_id, playground_config::poll_ms)
-        .and_then(u256be_to_u64)
+    if let Some(poll_ms) =
+        load_u256_attr(catalog, config_id, playground_config::poll_ms).and_then(u256be_to_u64)
     {
         config.poll_ms = poll_ms;
     }
-    if let Some(stream) = load_u256_attr(catalog, config_id, playground_config::llm_stream)
-        .and_then(u256be_to_u64)
+    if let Some(stream) =
+        load_u256_attr(catalog, config_id, playground_config::llm_stream).and_then(u256be_to_u64)
     {
         config.llm.stream = stream != 0;
     }
@@ -257,9 +277,16 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     if let Some(id) = config.branch_id {
         change += entity! { &config_id @ playground_config::branch_id: id };
     }
+    if let Some(id) = config.persona_id {
+        change += entity! { &config_id @ playground_config::persona_id: id };
+    }
     if let Some(key) = config.llm.api_key.as_ref() {
         let handle = ws.put::<LongString, _>(key.clone());
         change += entity! { &config_id @ playground_config::llm_api_key: handle };
+    }
+    if let Some(effort) = config.llm.reasoning_effort.as_ref() {
+        let handle = ws.put::<LongString, _>(effort.clone());
+        change += entity! { &config_id @ playground_config::llm_reasoning_effort: handle };
     }
     if let Some(cwd) = config.exec.default_cwd.as_ref() {
         let handle = ws.put::<LongString, _>(cwd.to_string_lossy().to_string());
@@ -307,7 +334,11 @@ fn load_id_attr(catalog: &TribleSet, config_id: Id, attr: Attribute<GenId>) -> O
     .find_map(|(entity, value)| (entity == config_id).then_some(Id::from_value(&value)))
 }
 
-fn load_u256_attr(catalog: &TribleSet, config_id: Id, attr: Attribute<U256BE>) -> Option<Value<U256BE>> {
+fn load_u256_attr(
+    catalog: &TribleSet,
+    config_id: Id,
+    attr: Attribute<U256BE>,
+) -> Option<Value<U256BE>> {
     find!(
         (entity: Id, value: Value<U256BE>),
         pattern!(catalog, [{ ?entity @ attr: ?value }])

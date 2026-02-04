@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Repository;
+use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::*;
 
 pub(crate) fn ensure_branch_id(repo: &mut Repository<Pile>, name: &str) -> Result<Id> {
