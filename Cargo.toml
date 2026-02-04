@@ -10,7 +10,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 eframe = { version = "0.33", features = ["persistence", "wgpu"] }
-GORBIE = { path = "vendor/GORBIE", features = ["triblespace"] }
+GORBIE = { version = "0.5.2", features = ["triblespace"] }
 hifitime = "4"
 rand = "0.8"
 rand_core = "0.9.5"

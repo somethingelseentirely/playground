@@ -25,12 +25,6 @@ mounts:
   - location: "__RUNTIME_ROOT__"
     mountPoint: "__VM_ROOT__/runtime"
     writable: true
-  - location: "__GORBIE_ROOT__"
-    mountPoint: "__VM_ROOT__/vendor/GORBIE"
-    writable: false
-  - location: "__SCHEMAS_ROOT__"
-    mountPoint: "__VM_ROOT__/vendor/schemas"
-    writable: false
 
 provision:
   - mode: system

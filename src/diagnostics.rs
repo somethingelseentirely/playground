@@ -26,17 +26,10 @@ use GORBIE::md;
 use GORBIE::notebook;
 use GORBIE::widgets::{Button, TextField};
 
-#[allow(dead_code)]
-#[path = "../vendor/schemas/archive_schema.rs"]
-mod archive_schema;
-#[allow(dead_code)]
-#[path = "../vendor/schemas/teams_schema.rs"]
-mod teams_schema;
-
+use crate::archive_schema::archive;
 use crate::schema::openai_responses;
 use crate::schema::playground_exec;
-use archive_schema::archive;
-use teams_schema::teams;
+use crate::teams_schema::teams;
 
 type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 const EXEC_SCROLL_HEIGHT: f32 = 260.0;

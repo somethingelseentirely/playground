@@ -17,6 +17,7 @@ use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
+mod archive_schema;
 mod branch_util;
 mod config;
 mod diagnostics;
@@ -25,6 +26,7 @@ mod llm_worker;
 mod repo_ops;
 mod repo_util;
 mod schema;
+mod teams_schema;
 mod time_util;
 mod workspace_snapshot;
 
@@ -319,8 +321,6 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
     let playground_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let state_root = repo_root.join("state");
     let runtime_root = repo_root.join("runtime");
-    let gorbie_root = repo_root.join("GORBIE");
-    let schemas_root = repo_root.join("schemas");
 
     let instance = env_string("PLAYGROUND_LIMA_INSTANCE").unwrap_or_else(|| args.instance.clone());
     let vm_root = env_path("PLAYGROUND_LIMA_ROOT").unwrap_or_else(|| args.vm_root.clone());
@@ -361,8 +361,6 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
         &playground_root,
         &state_root,
         &runtime_root,
-        &gorbie_root,
-        &schemas_root,
         &vm_root,
     )?;
 
@@ -438,8 +436,6 @@ fn render_lima_template(
     playground_root: &Path,
     state_root: &Path,
     runtime_root: &Path,
-    gorbie_root: &Path,
-    schemas_root: &Path,
     vm_root: &Path,
 ) -> Result<()> {
     let mut text = fs::read_to_string(template)
@@ -449,8 +445,6 @@ fn render_lima_template(
         ("__PLAYGROUND_ROOT__", playground_root),
         ("__STATE_ROOT__", state_root),
         ("__RUNTIME_ROOT__", runtime_root),
-        ("__GORBIE_ROOT__", gorbie_root),
-        ("__SCHEMAS_ROOT__", schemas_root),
         ("__VM_ROOT__", vm_root),
     ];
 
