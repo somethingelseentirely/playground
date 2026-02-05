@@ -215,7 +215,7 @@ Suggested layout:
 Shared paths (example):
 
 - Host: `./personas/<instance>/workspace`
-- Host: `./state/piles/<pile-id>`
+- Host: `./personas/<instance>/pile/self.pile`
 - VM: `/workspace`
 - VM: `/pile`
 

@@ -163,28 +163,42 @@ fn main() -> Result<()> {
     };
     match command {
         CommandMode::Run(args) => {
-            let config = Config::load(cli.pile.as_deref()).context("load config")?;
+            let instance = resolve_instance_name(args.lima.instance.as_str());
+            let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
+            let config = Config::load(Some(pile_path.as_path())).context("load config")?;
             run_with_exec(config, args)
         }
         CommandMode::Core => {
-            let config = Config::load(cli.pile.as_deref()).context("load config")?;
+            let instance = default_instance_name();
+            let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
+            let config = Config::load(Some(pile_path.as_path())).context("load config")?;
             run_loop(config)
         }
         CommandMode::Exec(args) => {
-            let config = Config::load(cli.pile.as_deref()).context("load config")?;
+            let instance = default_instance_name();
+            let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
+            let config = Config::load(Some(pile_path.as_path())).context("load config")?;
             run_exec_worker(config, args)
         }
         CommandMode::Llm(args) => {
-            let config = Config::load(cli.pile.as_deref()).context("load config")?;
+            let instance = default_instance_name();
+            let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
+            let config = Config::load(Some(pile_path.as_path())).context("load config")?;
             run_llm_worker(config, args)
         }
         CommandMode::Diagnostics(args) => {
             let _ = args;
-            diagnostics::set_default_pile(cli.pile.clone());
+            let instance = default_instance_name();
+            let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
+            diagnostics::set_default_pile(Some(pile_path));
             diagnostics::diagnostics();
             Ok(())
         }
-        CommandMode::Config { command } => handle_config(cli.pile.as_deref(), command),
+        CommandMode::Config { command } => {
+            let instance = default_instance_name();
+            let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
+            handle_config(Some(pile_path.as_path()), command)
+        }
     }
 }
 
@@ -316,7 +330,6 @@ fn parse_worker_id(raw: Option<String>) -> Result<Id> {
 fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
     let repo_root = repo_root();
     let playground_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let state_root = repo_root.join("state");
 
     let instance = env_string("PLAYGROUND_LIMA_INSTANCE").unwrap_or_else(|| args.instance.clone());
     let vm_root = env_path("PLAYGROUND_LIMA_ROOT").unwrap_or_else(|| args.vm_root.clone());
@@ -341,8 +354,9 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).context("create Lima config directory")?;
     }
-    fs::create_dir_all(&state_root).ok();
-    let workspace_root = repo_root.join("personas").join(&instance).join("workspace");
+    let persona_root = repo_root.join("personas").join(&instance);
+    fs::create_dir_all(&persona_root).ok();
+    let workspace_root = persona_root.join("workspace");
     fs::create_dir_all(&workspace_root).ok();
 
     let pile_name = pile_abs
@@ -472,6 +486,28 @@ fn absolute_pile_path(path: &Path) -> Result<PathBuf> {
         .file_name()
         .ok_or_else(|| anyhow!("pile path missing filename"))?;
     Ok(parent_abs.join(file))
+}
+
+fn default_instance_name() -> String {
+    env_string("PLAYGROUND_INSTANCE")
+        .or_else(|| env_string("PLAYGROUND_LIMA_INSTANCE"))
+        .unwrap_or_else(|| "playground".to_string())
+}
+
+fn resolve_instance_name(default: &str) -> String {
+    env_string("PLAYGROUND_LIMA_INSTANCE").unwrap_or_else(|| default.to_string())
+}
+
+fn default_pile_path(instance: &str) -> PathBuf {
+    repo_root()
+        .join("personas")
+        .join(instance)
+        .join("pile")
+        .join("self.pile")
+}
+
+fn resolve_pile_path(explicit: Option<PathBuf>, instance: &str) -> PathBuf {
+    explicit.unwrap_or_else(|| default_pile_path(instance))
 }
 
 fn repo_root() -> PathBuf {
