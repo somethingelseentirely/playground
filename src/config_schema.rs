@@ -125,55 +125,31 @@ where
         };
     }
 
-    add_attribute!(playground_config::kind, "playground_config_kind");
-    add_attribute!(
-        playground_config::updated_at,
-        "playground_config_updated_at"
-    );
-    add_attribute!(
-        playground_config::system_prompt,
-        "playground_config_system_prompt"
-    );
-    add_attribute!(
-        playground_config::seed_prompt,
-        "playground_config_seed_prompt"
-    );
-    add_attribute!(playground_config::branch, "playground_config_branch");
-    add_attribute!(playground_config::branch_id, "playground_config_branch_id");
-    add_attribute!(playground_config::author, "playground_config_author");
-    add_attribute!(
-        playground_config::author_role,
-        "playground_config_author_role"
-    );
-    add_attribute!(
-        playground_config::persona_id,
-        "playground_config_persona_id"
-    );
-    add_attribute!(playground_config::poll_ms, "playground_config_poll_ms");
-    add_attribute!(playground_config::llm_model, "playground_config_llm_model");
-    add_attribute!(
-        playground_config::llm_base_url,
-        "playground_config_llm_base_url"
-    );
-    add_attribute!(
-        playground_config::llm_api_key,
-        "playground_config_llm_api_key"
-    );
+    add_attribute!(playground_config::kind, "config_kind");
+    add_attribute!(playground_config::updated_at, "config_updated_at");
+    add_attribute!(playground_config::system_prompt, "config_system_prompt");
+    add_attribute!(playground_config::seed_prompt, "config_seed_prompt");
+    add_attribute!(playground_config::branch, "config_branch");
+    add_attribute!(playground_config::branch_id, "config_branch_id");
+    add_attribute!(playground_config::author, "config_author");
+    add_attribute!(playground_config::author_role, "config_author_role");
+    add_attribute!(playground_config::persona_id, "config_persona_id");
+    add_attribute!(playground_config::poll_ms, "config_poll_ms");
+    add_attribute!(playground_config::llm_model, "config_llm_model");
+    add_attribute!(playground_config::llm_base_url, "config_llm_base_url");
+    add_attribute!(playground_config::llm_api_key, "config_llm_api_key");
     add_attribute!(
         playground_config::llm_reasoning_effort,
-        "playground_config_llm_reasoning_effort"
+        "config_llm_reasoning_effort"
     );
-    add_attribute!(
-        playground_config::llm_stream,
-        "playground_config_llm_stream"
-    );
+    add_attribute!(playground_config::llm_stream, "config_llm_stream");
     add_attribute!(
         playground_config::exec_default_cwd,
-        "playground_config_exec_default_cwd"
+        "config_exec_default_cwd"
     );
     add_attribute!(
         playground_config::exec_sandbox_profile,
-        "playground_config_exec_sandbox_profile"
+        "config_exec_sandbox_profile"
     );
 
     Ok(metadata)
