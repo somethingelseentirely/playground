@@ -380,19 +380,6 @@ _Live view of the agent pile, exec queue, and message activity._"
                 ui.label(format!("Pile: {}", snapshot.pile_path.display()));
             });
             if !snapshot.branches.is_empty() {
-                let has_branch_warnings = snapshot.branches.iter().any(|branch| {
-                    branch
-                        .name
-                        .as_deref()
-                        .map_or(false, |name| name.starts_with('<'))
-                });
-                if has_branch_warnings {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        "Some branches have unreadable names. \
-Run: `cargo run --manifest-path trible/Cargo.toml -- pile migrate <pile> run`",
-                    );
-                }
                 ui.label("Branches:");
                 for branch in &snapshot.branches {
                     let label = branch.name.as_deref().unwrap_or("<unnamed>").to_string();
@@ -773,11 +760,19 @@ fn list_branches(pile: &mut Pile<Blake3>) -> Result<Vec<BranchEntry>, String> {
                             .get::<View<str>, _>(handle)
                             .ok()
                             .map(|view| view.as_ref().to_string())
-                            .or_else(|| Some("<unnamed>".to_string())),
+                            .or_else(|| {
+                                Some(format!(
+                                    "<name blob missing ({})>",
+                                    longstring_handle_prefix(handle)
+                                ))
+                            }),
                         _ => Some("<unnamed>".to_string()),
                     }
                 }
-                Err(_) => Some("<unnamed>".to_string()),
+                Err(_) => Some(format!(
+                    "<metadata blob missing ({})>",
+                    archive_handle_prefix(meta_handle)
+                )),
             },
         };
         branches.push(BranchEntry {
@@ -2231,6 +2226,24 @@ fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
 
 fn id_prefix(id: Id) -> String {
     let raw: [u8; 16] = id.into();
+    let mut out = String::with_capacity(8);
+    for byte in raw.iter().take(4) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn longstring_handle_prefix(handle: Value<Handle<Blake3, LongString>>) -> String {
+    let raw = handle.raw;
+    let mut out = String::with_capacity(8);
+    for byte in raw.iter().take(4) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn archive_handle_prefix(handle: Value<Handle<Blake3, SimpleArchive>>) -> String {
+    let raw = handle.raw;
     let mut out = String::with_capacity(8);
     for byte in raw.iter().take(4) {
         out.push_str(&format!("{byte:02x}"));
