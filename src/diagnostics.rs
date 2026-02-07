@@ -390,12 +390,7 @@ _Live view of the agent pile, exec queue, and message activity._"
                 ui.colored_label(egui::Color32::RED, err);
             } else {
                 render_exec_summary(ui, &snapshot.exec_summary);
-                render_exec_rows(
-                    ui,
-                    snapshot.now_key,
-                    &snapshot.exec_rows,
-                    &snapshot.labels,
-                );
+                render_exec_rows(ui, snapshot.now_key, &snapshot.exec_rows, &snapshot.labels);
             }
         });
     });
@@ -1172,7 +1167,9 @@ fn collect_relations_labels(people: &[RelationRow]) -> HashMap<Id, String> {
     for person in people {
         if let Some(label) = person.label.as_ref() {
             map.insert(person.id, label.clone());
-        } else if let (Some(first), Some(last)) = (person.first_name.as_ref(), person.last_name.as_ref()) {
+        } else if let (Some(first), Some(last)) =
+            (person.first_name.as_ref(), person.last_name.as_ref())
+        {
             map.insert(person.id, format!("{first} {last}"));
         } else if let Some(first) = person.first_name.as_ref() {
             map.insert(person.id, first.clone());
@@ -2200,10 +2197,7 @@ fn handle_prefix(handle: Value<Handle<Blake3, LongString>>) -> String {
 }
 
 fn format_id(labels: &HashMap<Id, String>, id: Id) -> String {
-    labels
-        .get(&id)
-        .cloned()
-        .unwrap_or_else(|| id_prefix(id))
+    labels.get(&id).cloned().unwrap_or_else(|| id_prefix(id))
 }
 
 fn repo_root() -> PathBuf {
