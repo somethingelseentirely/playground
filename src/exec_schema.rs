@@ -212,7 +212,7 @@ where
 
     let attribute_id = metadata::Metadata::id(attribute);
     tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::name: (blobs.put(name.to_owned())?),
+        metadata::name: blobs.put(name.to_owned())?,
         metadata::tag: playground_exec::tag_attribute,
     };
     Ok(tribles)
