@@ -163,6 +163,7 @@ struct DashboardState {
     repo_open_path: Option<PathBuf>,
     signing_key: SigningKey,
     snapshot: Option<Result<DashboardSnapshot, String>>,
+    show_extra_branches: bool,
     local_draft: String,
     local_send_error: Option<String>,
     local_send_notice: Option<String>,
@@ -187,6 +188,7 @@ impl Default for DashboardState {
             repo_open_path: None,
             signing_key: random_signing_key(),
             snapshot: None,
+            show_extra_branches: false,
             local_draft: String::new(),
             local_send_error: None,
             local_send_notice: None,
@@ -364,20 +366,64 @@ _Live view of the agent pile, exec queue, and message activity._"
     );
 
     nb.view(move |ui| {
-        let state = dashboard.read(ui);
+        let mut state = dashboard.read_mut(ui);
         with_padding(ui, padding, |ui| {
             ui.heading("Overview");
-            let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                return;
+            let (pile_path, branches) = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                (snapshot.pile_path.clone(), snapshot.branches.clone())
             };
+
             ui.horizontal(|ui| {
-                ui.label(format!("Pile: {}", snapshot.pile_path.display()));
+                ui.label(format!("Pile: {}", pile_path.display()));
             });
-            if !snapshot.branches.is_empty() {
-                ui.label("Branches:");
-                for branch in &snapshot.branches {
-                    let label = branch.name.as_deref().unwrap_or("<unnamed>").to_string();
-                    ui.label(format!("- {label} ({})", id_prefix(branch.id)));
+
+            if branches.is_empty() {
+                return;
+            }
+
+            let mut primary: Vec<BranchEntry> = Vec::new();
+            let mut extra: Vec<BranchEntry> = Vec::new();
+            for branch in branches {
+                let label = branch.name.as_deref().unwrap_or("<unnamed>");
+                if label.contains("--orphan-") || label.starts_with('<') {
+                    extra.push(branch);
+                } else {
+                    primary.push(branch);
+                }
+            }
+
+            ui.label(format!(
+                "Branches: {} primary, {} extra",
+                primary.len(),
+                extra.len()
+            ));
+
+            ui.label("Primary:");
+            for branch in &primary {
+                let label = branch.name.as_deref().unwrap_or("<unnamed>");
+                ui.label(format!("- {label} ({})", id_prefix(branch.id)));
+            }
+
+            if !extra.is_empty() {
+                let button_label = if state.show_extra_branches {
+                    "Hide extra branches"
+                } else {
+                    "Show extra branches"
+                };
+                if ui.add(Button::new(button_label)).clicked() {
+                    state.show_extra_branches = !state.show_extra_branches;
+                }
+
+                if state.show_extra_branches {
+                    ui.add_space(8.0);
+                    ui.label("Extra:");
+                    for branch in &extra {
+                        let label = branch.name.as_deref().unwrap_or("<unnamed>");
+                        ui.label(format!("- {label} ({})", id_prefix(branch.id)));
+                    }
                 }
             }
         });
@@ -1435,23 +1481,10 @@ fn render_local_composer(
     });
 
     ui.small(format!("{me_label} → {peer_label}"));
-    if snapshot.local_me_id.is_none() {
-        ui.colored_label(
-            egui::Color32::RED,
-            format!(
-                "Unknown me '{}' (check Relations branch).",
-                state.config.local_me
-            ),
-        );
-    }
-    if snapshot.local_peer_id.is_none() {
-        ui.colored_label(
-            egui::Color32::RED,
-            format!(
-                "Unknown peer '{}' (check Relations branch).",
-                state.config.local_peer
-            ),
-        );
+    let me_known = snapshot.local_me_id.is_some();
+    let peer_known = snapshot.local_peer_id.is_some();
+    if !(me_known && peer_known) {
+        ui.small("Select Me and Peer from Relations to enable sending.");
     }
 
     let response = ui.add_sized(
@@ -1474,7 +1507,8 @@ fn render_local_composer(
     }
 
     ui.horizontal(|ui| {
-        if ui.add(Button::new("Send")).clicked() {
+        let can_send = me_known && peer_known && !state.local_draft.trim().is_empty();
+        if ui.add_enabled(can_send, Button::new("Send")).clicked() {
             send_local_message_from_ui(state, branches, snapshot);
         }
         if ui.add(Button::new("Clear")).clicked() {
