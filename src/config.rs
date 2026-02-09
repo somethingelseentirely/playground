@@ -248,9 +248,11 @@ fn load_latest_config(
     if let Some(id) = load_id_attr(catalog, config_id, playground_config::exec_branch_id) {
         config.exec_branch_id = Some(id);
     }
-    if let Some(id) =
-        load_id_attr(catalog, config_id, playground_config::local_messages_branch_id)
-    {
+    if let Some(id) = load_id_attr(
+        catalog,
+        config_id,
+        playground_config::local_messages_branch_id,
+    ) {
         config.local_messages_branch_id = Some(id);
     }
     if let Some(id) = load_id_attr(catalog, config_id, playground_config::relations_branch_id) {

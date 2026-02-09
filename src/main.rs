@@ -281,10 +281,8 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
                 parse_optional_hex_id(Some(args.value.as_str()), "exec_branch_id")?;
         }
         ConfigField::LocalMessagesBranchId => {
-            config.local_messages_branch_id = parse_optional_hex_id(
-                Some(args.value.as_str()),
-                "local_messages_branch_id",
-            )?;
+            config.local_messages_branch_id =
+                parse_optional_hex_id(Some(args.value.as_str()), "local_messages_branch_id")?;
         }
         ConfigField::RelationsBranchId => {
             config.relations_branch_id =

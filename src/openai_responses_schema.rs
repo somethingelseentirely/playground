@@ -155,7 +155,10 @@ where
     metadata.union(describe_attribute(blobs, &openai_responses::finished_at)?);
     metadata.union(describe_attribute(blobs, &openai_responses::output_text)?);
     metadata.union(describe_attribute(blobs, &openai_responses::response_raw)?);
-    metadata.union(describe_attribute(blobs, &openai_responses::response_json_root)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &openai_responses::response_json_root,
+    )?);
     metadata.union(describe_attribute(blobs, &openai_responses::error)?);
 
     Ok(metadata)

@@ -108,7 +108,10 @@ where
     metadata.union(describe_attribute(blobs, &playground_cog::kind)?);
     metadata.union(describe_attribute(blobs, &playground_cog::prompt)?);
     metadata.union(describe_attribute(blobs, &playground_cog::created_at)?);
-    metadata.union(describe_attribute(blobs, &playground_cog::about_exec_result)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &playground_cog::about_exec_result,
+    )?);
 
     Ok(metadata)
 }

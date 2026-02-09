@@ -5,8 +5,8 @@ use rand_core::{OsRng, TryRngCore};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
@@ -24,8 +24,8 @@ use triblespace::prelude::{
     Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, ToValue, TryFromValue, View,
 };
 
-use GORBIE::NotebookCtx;
 use GORBIE::NotebookConfig;
+use GORBIE::NotebookCtx;
 use GORBIE::cards::{DEFAULT_CARD_PADDING, with_padding};
 use GORBIE::md;
 use GORBIE::widgets::{Button, TextField};
@@ -204,6 +204,7 @@ struct DashboardState {
     local_read_error: Option<String>,
     config_reveal_secrets: bool,
     config_last_applied_id: Option<Id>,
+    compass_expanded_goal: Option<Id>,
     teams_selected_chat: Option<Id>,
     workspace_selected_snapshot: Option<Id>,
 }
@@ -232,6 +233,7 @@ impl Default for DashboardState {
             local_read_error: None,
             config_reveal_secrets: false,
             config_last_applied_id: None,
+            compass_expanded_goal: None,
             teams_selected_chat: None,
             workspace_selected_snapshot: None,
         }
@@ -325,6 +327,12 @@ impl CompassTaskRow {
 }
 
 #[derive(Debug, Clone)]
+struct CompassNoteRow {
+    at: String,
+    body: String,
+}
+
+#[derive(Debug, Clone)]
 struct RelationRow {
     id: Id,
     label: Option<String>,
@@ -375,6 +383,7 @@ struct DashboardSnapshot {
     agent_config_error: Option<String>,
     reasoning_summaries: Vec<ReasoningSummaryRow>,
     compass_rows: Vec<(CompassTaskRow, usize)>,
+    compass_notes: HashMap<Id, Vec<CompassNoteRow>>,
     compass_error: Option<String>,
     local_message_rows: Vec<LocalMessageRow>,
     local_message_error: Option<String>,
@@ -447,11 +456,8 @@ _Live view of the agent pile, exec queue, and message activity._"
                 if repo_open_result.is_ok() {
                     if let Some(repo) = state.repo.as_mut() {
                         picker_branches = list_branches(repo.storage_mut()).unwrap_or_default();
-                        picker_branches.sort_by(|a, b| {
-                            a.name
-                                .cmp(&b.name)
-                                .then_with(|| a.id.cmp(&b.id))
-                        });
+                        picker_branches
+                            .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
                     }
                 }
                 ui.horizontal(|ui| {
@@ -620,26 +626,29 @@ _Live view of the agent pile, exec queue, and message activity._"
     });
 
     nb.view(move |ui| {
-        let state = dashboard.read(ui);
-        with_padding(ui, padding, |ui| {
-            ui.heading("Compass");
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                snapshot.clone()
+        let mut state = dashboard.read_mut(ui);
+        ui.heading("Compass");
+        let snapshot = {
+            let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                return;
             };
-            if let Some(err) = &snapshot.compass_error {
-                ui.colored_label(egui::Color32::RED, err);
-                return;
-            }
+            snapshot.clone()
+        };
+        if let Some(err) = &snapshot.compass_error {
+            ui.colored_label(egui::Color32::RED, err);
+            return;
+        }
 
-            if snapshot.compass_rows.is_empty() {
-                ui.label("No goals yet.");
-                return;
-            }
-            render_compass_swimlanes(ui, &snapshot.compass_rows);
-        });
+        if snapshot.compass_rows.is_empty() {
+            ui.label("No goals yet.");
+            return;
+        }
+        render_compass_swimlanes(
+            ui,
+            &mut state.compass_expanded_goal,
+            &snapshot.compass_rows,
+            &snapshot.compass_notes,
+        );
     });
 
     nb.view(move |ui| {
@@ -987,6 +996,7 @@ fn load_snapshot(
             agent_config_error,
             reasoning_summaries: Vec::new(),
             compass_rows: Vec::new(),
+            compass_notes: HashMap::new(),
             compass_error,
             local_message_rows: Vec::new(),
             local_message_error,
@@ -1062,13 +1072,13 @@ fn build_snapshot(
     let exec_summary = summarize_exec(&exec_rows);
     let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
     let compass_rows = collect_compass_rows(&compass_data, ws);
+    let compass_notes = collect_compass_notes(&compass_data, ws);
     let local_message_rows = collect_local_messages(&local_data, ws, local_me_id, local_peer_id);
     let (teams_messages, teams_chats) = collect_teams_messages(&teams_data, ws);
     let workspace_snapshots = collect_workspace_snapshots(&workspace_data, ws);
     let workspace_latest_id = workspace_snapshots.first().map(|row| row.id);
     let workspace_preview_id = workspace_selected_snapshot.or(workspace_latest_id);
-    let workspace_entries =
-        collect_workspace_entries(&workspace_data, ws, workspace_preview_id);
+    let workspace_entries = collect_workspace_entries(&workspace_data, ws, workspace_preview_id);
     let labels = collect_labels(&exec_data, ws);
 
     DashboardSnapshot {
@@ -1082,6 +1092,7 @@ fn build_snapshot(
         agent_config_error,
         reasoning_summaries,
         compass_rows,
+        compass_notes,
         compass_error,
         local_message_rows,
         local_message_error,
@@ -1321,24 +1332,23 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         load_optional_id_attr(data, config_id, playground_config::local_messages_branch_id);
     let relations_branch_id =
         load_optional_id_attr(data, config_id, playground_config::relations_branch_id);
-    let teams_branch_id = load_optional_id_attr(data, config_id, playground_config::teams_branch_id);
+    let teams_branch_id =
+        load_optional_id_attr(data, config_id, playground_config::teams_branch_id);
     let workspace_branch_id =
         load_optional_id_attr(data, config_id, playground_config::workspace_branch_id);
     let author = load_optional_string_attr(data, ws, config_id, playground_config::author);
-    let author_role = load_optional_string_attr(data, ws, config_id, playground_config::author_role);
+    let author_role =
+        load_optional_string_attr(data, ws, config_id, playground_config::author_role);
     let poll_ms = load_optional_u64_attr(data, config_id, playground_config::poll_ms);
     let llm_model = load_optional_string_attr(data, ws, config_id, playground_config::llm_model);
     let llm_base_url =
         load_optional_string_attr(data, ws, config_id, playground_config::llm_base_url);
-    let llm_reasoning_effort = load_optional_string_attr(
-        data,
-        ws,
-        config_id,
-        playground_config::llm_reasoning_effort,
-    );
+    let llm_reasoning_effort =
+        load_optional_string_attr(data, ws, config_id, playground_config::llm_reasoning_effort);
     let llm_stream = load_optional_u64_attr(data, config_id, playground_config::llm_stream)
         .map(|value| value != 0);
-    let llm_api_key = load_optional_string_attr(data, ws, config_id, playground_config::llm_api_key);
+    let llm_api_key =
+        load_optional_string_attr(data, ws, config_id, playground_config::llm_api_key);
     let exec_default_cwd =
         load_optional_string_attr(data, ws, config_id, playground_config::exec_default_cwd);
     let exec_sandbox_profile =
@@ -1377,9 +1387,7 @@ fn load_optional_id_attr(data: &TribleSet, entity_id: Id, attr: Attribute<GenId>
         pattern!(data, [{ ?entity @ attr: ?value }])
     )
     .into_iter()
-    .find_map(|(entity, value)| {
-        (entity == entity_id).then_some(Id::try_from_value(&value).ok())?
-    })
+    .find_map(|(entity, value)| (entity == entity_id).then_some(Id::try_from_value(&value).ok())?)
 }
 
 fn load_optional_u64_attr(data: &TribleSet, entity_id: Id, attr: Attribute<U256BE>) -> Option<u64> {
@@ -1817,7 +1825,10 @@ fn collect_teams_messages(
     (messages, chat_list)
 }
 
-fn collect_workspace_snapshots(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<WorkspaceSnapshotRow> {
+fn collect_workspace_snapshots(
+    data: &TribleSet,
+    ws: &mut Workspace<Pile>,
+) -> Vec<WorkspaceSnapshotRow> {
     let mut rows = Vec::new();
 
     for (snapshot_id, created_at) in find!(
@@ -2005,7 +2016,10 @@ fn collect_reasoning_summaries(
     rows
 }
 
-fn collect_compass_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<(CompassTaskRow, usize)> {
+fn collect_compass_rows(
+    data: &TribleSet,
+    ws: &mut Workspace<Pile>,
+) -> Vec<(CompassTaskRow, usize)> {
     let mut tasks: HashMap<Id, CompassTaskRow> = HashMap::new();
 
     for (task_id, title_handle, created_at) in find!(
@@ -2109,6 +2123,36 @@ fn collect_compass_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<(Comp
     }
 
     order_compass_rows(tasks.into_values().collect())
+}
+
+fn collect_compass_notes(
+    data: &TribleSet,
+    ws: &mut Workspace<Pile>,
+) -> HashMap<Id, Vec<CompassNoteRow>> {
+    let mut map: HashMap<Id, Vec<CompassNoteRow>> = HashMap::new();
+
+    for (task_id, note_handle, at) in find!(
+        (task_id: Id, note_handle: Value<Handle<Blake3, LongString>>, at: String),
+        pattern!(&data, [{
+            _?event @
+            metadata::tag: &COMPASS_KIND_NOTE_ID,
+            compass::task: ?task_id,
+            compass::note: ?note_handle,
+            compass::at: ?at,
+        }])
+    ) {
+        let body = load_text(ws, note_handle).unwrap_or_else(|| "<missing>".to_string());
+        map.entry(task_id)
+            .or_default()
+            .push(CompassNoteRow { at, body });
+    }
+
+    for notes in map.values_mut() {
+        // ISO-like timestamps sort lexicographically.
+        notes.sort_by(|a, b| b.at.cmp(&a.at));
+    }
+
+    map
 }
 
 fn order_compass_rows(rows: Vec<CompassTaskRow>) -> Vec<(CompassTaskRow, usize)> {
@@ -2868,7 +2912,10 @@ fn render_agent_config(
     };
 
     let updated = format_age(now_key, config.updated_at);
-    ui.label(format!("Latest config: {} (updated {updated})", id_prefix(config.id)));
+    ui.label(format!(
+        "Latest config: {} (updated {updated})",
+        id_prefix(config.id)
+    ));
     ui.add_space(8.0);
 
     egui::Grid::new("agent_config_grid")
@@ -3129,7 +3176,12 @@ fn render_reasoning_summaries(ui: &mut egui::Ui, now_key: i128, rows: &[Reasonin
         });
 }
 
-fn render_compass_swimlanes(ui: &mut egui::Ui, rows: &[(CompassTaskRow, usize)]) {
+fn render_compass_swimlanes(
+    ui: &mut egui::Ui,
+    expanded_goal: &mut Option<Id>,
+    rows: &[(CompassTaskRow, usize)],
+    notes: &HashMap<Id, Vec<CompassNoteRow>>,
+) {
     if rows.is_empty() {
         ui.label("No goals yet.");
         return;
@@ -3158,7 +3210,7 @@ fn render_compass_swimlanes(ui: &mut egui::Ui, rows: &[(CompassTaskRow, usize)])
 
         for status in statuses {
             let count = counts.get(status.as_str()).copied().unwrap_or(0);
-            render_compass_swimlane(ui, rows, &status, count);
+            render_compass_swimlane(ui, expanded_goal, notes, rows, &status, count);
         }
     };
 
@@ -3176,13 +3228,13 @@ fn render_compass_swimlanes(ui: &mut egui::Ui, rows: &[(CompassTaskRow, usize)])
 
 fn render_compass_swimlane(
     ui: &mut egui::Ui,
+    expanded_goal: &mut Option<Id>,
+    notes: &HashMap<Id, Vec<CompassNoteRow>>,
     rows: &[(CompassTaskRow, usize)],
     status: &str,
     count: usize,
 ) {
     egui::Frame::NONE
-        .fill(lane_fill(status))
-        .corner_radius(egui::CornerRadius::same(0))
         .inner_margin(egui::Margin {
             left: 12,
             right: 12,
@@ -3190,11 +3242,13 @@ fn render_compass_swimlane(
             bottom: 10,
         })
         .show(ui, |ui| {
+            // Fill the full card width; otherwise Frames can shrink to content.
+            ui.set_min_width(ui.available_width());
             ui.label(
                 egui::RichText::new(format!("{} ({count})", status.to_uppercase()))
                     .monospace()
                     .strong()
-                    .color(egui::Color32::WHITE),
+                    .color(status_color(status)),
             );
             ui.add_space(6.0);
 
@@ -3207,30 +3261,54 @@ fn render_compass_swimlane(
                 if row.status != status {
                     continue;
                 }
-                render_compass_swimlane_row(ui, row, *depth);
+                render_compass_swimlane_row(ui, expanded_goal, notes, row, *depth);
                 ui.add_space(6.0);
             }
         });
 }
 
-fn lane_fill(status: &str) -> egui::Color32 {
+fn status_color(status: &str) -> egui::Color32 {
     match status {
-        "todo" => egui::Color32::from_rgb(95, 95, 95),
-        "doing" => egui::Color32::from_rgb(65, 110, 170),
+        // Status colors: ready (green), caution (yellow), danger (red), ice (blue).
+        "todo" => egui::Color32::from_rgb(70, 150, 95),
+        "doing" => egui::Color32::from_rgb(200, 170, 60),
         "blocked" => egui::Color32::from_rgb(170, 70, 70),
-        "done" => egui::Color32::from_rgb(70, 150, 95),
+        "done" => egui::Color32::from_rgb(65, 110, 170),
         _ => egui::Color32::from_rgb(95, 95, 95),
     }
 }
 
-fn render_compass_swimlane_row(ui: &mut egui::Ui, row: &CompassTaskRow, depth: usize) {
-    let mut meta_parts: Vec<String> = Vec::new();
-    if row.note_count > 0 {
-        let suffix = if row.note_count == 1 { "" } else { "s" };
-        meta_parts.push(format!("{} note{suffix}", row.note_count));
+fn render_compass_swimlane_row(
+    ui: &mut egui::Ui,
+    expanded_goal: &mut Option<Id>,
+    notes: &HashMap<Id, Vec<CompassNoteRow>>,
+    row: &CompassTaskRow,
+    depth: usize,
+) {
+    fn draw_status_bar(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
+        // Draw inside the border so the thin outline stays crisp.
+        let inset = 1.0;
+        let bar_height = 4.0;
+        let min = egui::pos2(rect.left() + inset, rect.top() + inset);
+        let max = egui::pos2(rect.right() - inset, rect.top() + inset + bar_height);
+        ui.painter()
+            .rect_filled(egui::Rect::from_min_max(min, max), 0.0, color);
     }
+
+    // Show hierarchy via left-side lines (outside the goal box). Deeper goals
+    // shift right a bit so the box "shrinks" from the left.
+    const DEP_LINE_STEP: f32 = 6.0;
+    const DEP_LINE_BASE: f32 = 8.0;
+    let dep_lines = depth.min(3);
+    let dep_indent = if dep_lines == 0 {
+        0.0
+    } else {
+        (dep_lines as f32 * DEP_LINE_STEP) + DEP_LINE_BASE
+    };
+
+    let mut right_parts: Vec<String> = Vec::new();
     if !row.tags.is_empty() {
-        meta_parts.push(
+        right_parts.push(
             row.tags
                 .iter()
                 .map(|tag| format!("#{tag}"))
@@ -3238,46 +3316,147 @@ fn render_compass_swimlane_row(ui: &mut egui::Ui, row: &CompassTaskRow, depth: u
                 .join(" "),
         );
     }
-    if let Some(parent) = row.parent {
-        meta_parts.push(format!("child of {}", id_prefix(parent)));
+    if row.note_count > 0 {
+        right_parts.push(format!("{}n", row.note_count));
     }
-    let meta = meta_parts.join(" · ");
+    if let Some(parent) = row.parent {
+        right_parts.push(format!("^{}", id_prefix(parent)));
+    }
+    right_parts.push(format!("[{}]", row.id_prefix));
+    let right_text = right_parts.join(" · ");
 
-    let inner = egui::Frame::NONE
-        .fill(egui::Color32::from_gray(65))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin {
-            // Keep content aligned while reserving a small left gutter for dependency lines.
-            left: 28,
-            right: 10,
-            top: 6,
-            bottom: 6,
-        })
-        .show(ui, |ui| {
-            let title = format!("[{}] {}", row.id_prefix, row.title);
-            ui.add(
-                egui::Label::new(egui::RichText::new(title).monospace())
-                    .wrap_mode(egui::TextWrapMode::Wrap),
-            );
-
-            if !meta.is_empty() {
-                ui.small(meta);
+    let is_expanded = *expanded_goal == Some(row.id);
+    let outline = ui.visuals().widgets.noninteractive.bg_stroke;
+    let bar_color = status_color(&row.status);
+    let inner = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            if dep_indent > 0.0 {
+                ui.add_space(dep_indent);
             }
-        });
+
+            egui::Frame::NONE
+                .fill(egui::Color32::TRANSPARENT)
+                .stroke(outline)
+                .corner_radius(egui::CornerRadius::same(0))
+                .inner_margin(egui::Margin {
+                    left: 10,
+                    right: 10,
+                    top: 6,
+                    bottom: 6,
+                })
+                .show(ui, |ui| {
+                    // Fill the full remaining width so cards don't shrink to just their text.
+                    let available_width = ui.available_width();
+                    ui.set_min_width(available_width);
+
+                    let title = row.title.clone();
+                    ui.horizontal(|ui| {
+                        let right_width = if right_text.is_empty() {
+                            0.0
+                        } else {
+                            let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                            ui.fonts_mut(|fonts| {
+                                fonts
+                                    .layout_no_wrap(
+                                        right_text.clone(),
+                                        font_id,
+                                        egui::Color32::WHITE,
+                                    )
+                                    .size()
+                                    .x
+                            })
+                        };
+                        let gap = 12.0;
+                        let title_width = (ui.available_width() - right_width - gap).max(40.0);
+                        ui.add_sized(
+                            [title_width, 0.0],
+                            egui::Label::new(egui::RichText::new(title).monospace())
+                                .halign(egui::Align::LEFT)
+                                .wrap_mode(egui::TextWrapMode::Truncate),
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 0.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if !right_text.is_empty() {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&right_text).monospace(),
+                                        )
+                                        .halign(egui::Align::RIGHT)
+                                        .wrap_mode(egui::TextWrapMode::Truncate),
+                                    );
+                                }
+                            },
+                        );
+                    });
+                })
+        })
+        .inner;
+
+    draw_status_bar(ui, inner.response.rect, bar_color);
+
+    // Make the whole row clickable to toggle note display.
+    let click_id = ui.make_persistent_id(("compass_goal", row.id));
+    let response = ui.interact(inner.response.rect, click_id, egui::Sense::click());
+    if response.clicked() {
+        if *expanded_goal == Some(row.id) {
+            *expanded_goal = None;
+        } else {
+            *expanded_goal = Some(row.id);
+        }
+    }
 
     if depth == 0 {
-        return;
+        // still allow expansion
     }
 
-    // Draw a small "dependency gutter" without indenting content.
+    if is_expanded {
+        let task_notes = notes.get(&row.id).map(Vec::as_slice).unwrap_or(&[]);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            if dep_indent > 0.0 {
+                ui.add_space(dep_indent);
+            }
+            egui::Frame::NONE
+                .fill(egui::Color32::TRANSPARENT)
+                .stroke(outline)
+                .corner_radius(egui::CornerRadius::same(0))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    let available_width = ui.available_width();
+                    ui.set_min_width(available_width);
+                    ui.set_max_width(available_width);
+
+                    // Frame::show inherits the current layout; force a vertical stack for notes.
+                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        if task_notes.is_empty() {
+                            ui.small("(no notes)");
+                            return;
+                        }
+                        for note in task_notes {
+                            ui.small(&note.at);
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&note.body))
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                            );
+                            ui.add_space(6.0);
+                        }
+                    });
+                });
+        });
+        ui.add_space(6.0);
+    }
+
+    // Draw a small "dependency gutter" to the left of the goal box.
     let rect = inner.response.rect;
     let painter = ui.painter();
     let stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(130));
-    let bars = depth.min(3);
-    for idx in 0..bars {
-        let x = rect.left() + 10.0 + (idx as f32 * 4.0);
-        let y1 = rect.top() + 4.0;
-        let y2 = rect.bottom() - 4.0;
+    for idx in 0..dep_lines {
+        let x = rect.left() - dep_indent + 4.0 + (idx as f32 * DEP_LINE_STEP);
+        let y1 = rect.top() + 0.5;
+        let y2 = rect.bottom() - 0.5;
         painter.line_segment([egui::pos2(x, y1), egui::pos2(x, y2)], stroke);
     }
 }
@@ -3390,7 +3569,10 @@ fn render_workspace(
 
     ui.label("Snapshots:");
     if ui
-        .selectable_label(state.workspace_selected_snapshot.is_none(), "Follow latest snapshot")
+        .selectable_label(
+            state.workspace_selected_snapshot.is_none(),
+            "Follow latest snapshot",
+        )
         .clicked()
     {
         state.workspace_selected_snapshot = None;
@@ -3434,16 +3616,12 @@ fn render_workspace(
                     id_prefix(row.id)
                 ));
             } else {
-                ui.label(format!(
-                    "Entries for {}:",
-                    id_prefix(snapshot_id)
-                ));
+                ui.label(format!("Entries for {}:", id_prefix(snapshot_id)));
                 ui.small("Selected snapshot is not in the list (older than limit).");
             }
 
             let tree = build_workspace_tree(entries);
             render_workspace_tree(ui, "", &tree, true);
-
         }
     }
 }
@@ -3483,7 +3661,11 @@ fn build_workspace_tree(entries: &[WorkspaceEntryRow]) -> WorkspaceTreeNode {
     let mut root = WorkspaceTreeNode::default();
 
     for entry in entries {
-        let parts: Vec<&str> = entry.path.split('/').filter(|part| !part.is_empty()).collect();
+        let parts: Vec<&str> = entry
+            .path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
         if parts.is_empty() {
             continue;
         }

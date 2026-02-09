@@ -52,8 +52,12 @@ pub fn restore_snapshot(
         return Ok(None);
     };
 
-    let root_path =
-        load_string_attr(&mut ws, &catalog, snapshot_id, playground_workspace::root_path)?;
+    let root_path = load_string_attr(
+        &mut ws,
+        &catalog,
+        snapshot_id,
+        playground_workspace::root_path,
+    )?;
     let restore_root = resolve_restore_root(target_root, root_path.as_deref())?;
     let entries = collect_snapshot_entries(&mut ws, &catalog, snapshot_id)?;
     restore_entries(&restore_root, &entries, force)?;

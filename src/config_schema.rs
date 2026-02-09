@@ -125,10 +125,16 @@ where
 
     metadata.union(describe_attribute(blobs, &playground_config::kind)?);
     metadata.union(describe_attribute(blobs, &playground_config::updated_at)?);
-    metadata.union(describe_attribute(blobs, &playground_config::system_prompt)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &playground_config::system_prompt,
+    )?);
     metadata.union(describe_attribute(blobs, &playground_config::branch)?);
     metadata.union(describe_attribute(blobs, &playground_config::branch_id)?);
-    metadata.union(describe_attribute(blobs, &playground_config::exec_branch_id)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &playground_config::exec_branch_id,
+    )?);
     metadata.union(describe_attribute(
         blobs,
         &playground_config::local_messages_branch_id,
@@ -137,7 +143,10 @@ where
         blobs,
         &playground_config::relations_branch_id,
     )?);
-    metadata.union(describe_attribute(blobs, &playground_config::teams_branch_id)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &playground_config::teams_branch_id,
+    )?);
     metadata.union(describe_attribute(
         blobs,
         &playground_config::workspace_branch_id,
@@ -154,7 +163,10 @@ where
         &playground_config::llm_reasoning_effort,
     )?);
     metadata.union(describe_attribute(blobs, &playground_config::llm_stream)?);
-    metadata.union(describe_attribute(blobs, &playground_config::exec_default_cwd)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &playground_config::exec_default_cwd,
+    )?);
     metadata.union(describe_attribute(
         blobs,
         &playground_config::exec_sandbox_profile,

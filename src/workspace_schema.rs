@@ -147,14 +147,20 @@ where
     metadata.union(<FileBytes as metadata::ConstMetadata>::describe(blobs)?);
 
     metadata.union(describe_attribute(blobs, &playground_workspace::kind)?);
-    metadata.union(describe_attribute(blobs, &playground_workspace::created_at)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &playground_workspace::created_at,
+    )?);
     metadata.union(describe_attribute(blobs, &playground_workspace::root_path)?);
     metadata.union(describe_attribute(blobs, &playground_workspace::label)?);
     metadata.union(describe_attribute(blobs, &playground_workspace::entry)?);
     metadata.union(describe_attribute(blobs, &playground_workspace::path)?);
     metadata.union(describe_attribute(blobs, &playground_workspace::mode)?);
     metadata.union(describe_attribute(blobs, &playground_workspace::bytes)?);
-    metadata.union(describe_attribute(blobs, &playground_workspace::link_target)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &playground_workspace::link_target,
+    )?);
 
     Ok(metadata)
 }

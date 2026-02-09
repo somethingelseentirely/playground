@@ -155,7 +155,10 @@ where
     metadata.union(describe_attribute(blobs, &playground_exec::stdin)?);
     metadata.union(describe_attribute(blobs, &playground_exec::stdin_text)?);
     metadata.union(describe_attribute(blobs, &playground_exec::timeout_ms)?);
-    metadata.union(describe_attribute(blobs, &playground_exec::sandbox_profile)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &playground_exec::sandbox_profile,
+    )?);
     metadata.union(describe_attribute(blobs, &playground_exec::requested_at)?);
     metadata.union(describe_attribute(blobs, &playground_exec::about_request)?);
     metadata.union(describe_attribute(blobs, &playground_exec::about_message)?);
