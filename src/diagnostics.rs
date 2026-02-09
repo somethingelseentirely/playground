@@ -87,8 +87,6 @@ const EXEC_SCROLL_HEIGHT: f32 = 260.0;
 const SUMMARY_SCROLL_HEIGHT: f32 = 220.0;
 const LOCAL_MESSAGE_SCROLL_HEIGHT: f32 = 780.0;
 const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
-const COMPASS_SCROLL_HEIGHT: f32 = 520.0;
-const COMPASS_COLUMN_WIDTH: f32 = 280.0;
 const RELATIONS_SCROLL_HEIGHT: f32 = 260.0;
 const TEAMS_SCROLL_HEIGHT: f32 = 520.0;
 const TEAMS_CHAT_LIST_WIDTH: f32 = 220.0;
@@ -329,12 +327,6 @@ impl CompassTaskRow {
 }
 
 #[derive(Debug, Clone)]
-struct CompassColumn {
-    status: String,
-    rows: Vec<(CompassTaskRow, usize)>,
-}
-
-#[derive(Debug, Clone)]
 struct RelationRow {
     id: Id,
     label: Option<String>,
@@ -384,7 +376,7 @@ struct DashboardSnapshot {
     agent_config: Option<AgentConfigRow>,
     agent_config_error: Option<String>,
     reasoning_summaries: Vec<ReasoningSummaryRow>,
-    compass_columns: Vec<CompassColumn>,
+    compass_rows: Vec<(CompassTaskRow, usize)>,
     compass_error: Option<String>,
     local_message_rows: Vec<LocalMessageRow>,
     local_message_error: Option<String>,
@@ -648,11 +640,11 @@ _Live view of the agent pile, exec queue, and message activity._"
                 ui.checkbox(&mut state.compass_show_done, "Show done");
             });
 
-            if snapshot.compass_columns.is_empty() {
+            if snapshot.compass_rows.is_empty() {
                 ui.label("No goals yet.");
                 return;
             }
-            render_compass_board(ui, &snapshot.compass_columns, state.compass_show_done);
+            render_compass_tree(ui, &snapshot.compass_rows, state.compass_show_done);
         });
     });
 
@@ -1000,7 +992,7 @@ fn load_snapshot(
             agent_config: None,
             agent_config_error,
             reasoning_summaries: Vec::new(),
-            compass_columns: Vec::new(),
+            compass_rows: Vec::new(),
             compass_error,
             local_message_rows: Vec::new(),
             local_message_error,
@@ -1075,7 +1067,7 @@ fn build_snapshot(
     let exec_rows = collect_exec_rows(&exec_data, ws);
     let exec_summary = summarize_exec(&exec_rows);
     let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
-    let compass_columns = collect_compass_columns(&compass_data, ws);
+    let compass_rows = collect_compass_rows(&compass_data, ws);
     let local_message_rows = collect_local_messages(&local_data, ws, local_me_id, local_peer_id);
     let (teams_messages, teams_chats) = collect_teams_messages(&teams_data, ws);
     let workspace_snapshots = collect_workspace_snapshots(&workspace_data, ws);
@@ -1095,7 +1087,7 @@ fn build_snapshot(
         agent_config,
         agent_config_error,
         reasoning_summaries,
-        compass_columns,
+        compass_rows,
         compass_error,
         local_message_rows,
         local_message_error,
@@ -2019,7 +2011,7 @@ fn collect_reasoning_summaries(
     rows
 }
 
-fn collect_compass_columns(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<CompassColumn> {
+fn collect_compass_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<(CompassTaskRow, usize)> {
     let mut tasks: HashMap<Id, CompassTaskRow> = HashMap::new();
 
     for (task_id, title_handle, created_at) in find!(
@@ -2122,34 +2114,7 @@ fn collect_compass_columns(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Co
         task.tags.dedup();
     }
 
-    let mut columns: HashMap<String, Vec<CompassTaskRow>> = HashMap::new();
-    for task in tasks.values() {
-        columns.entry(task.status.clone()).or_default().push(task.clone());
-    }
-
-    let mut ordered_statuses = Vec::new();
-    for status in COMPASS_DEFAULT_STATUSES {
-        if columns.contains_key(status) {
-            ordered_statuses.push(status.to_string());
-        }
-    }
-    let mut extras: Vec<String> = columns
-        .keys()
-        .filter(|status| !COMPASS_DEFAULT_STATUSES.contains(&status.as_str()))
-        .cloned()
-        .collect();
-    extras.sort();
-    ordered_statuses.extend(extras);
-
-    let mut out = Vec::new();
-    for status in ordered_statuses {
-        let rows = columns.remove(&status).unwrap_or_default();
-        out.push(CompassColumn {
-            status,
-            rows: order_compass_rows(rows),
-        });
-    }
-    out
+    order_compass_rows(tasks.into_values().collect())
 }
 
 fn order_compass_rows(rows: Vec<CompassTaskRow>) -> Vec<(CompassTaskRow, usize)> {
@@ -3170,53 +3135,84 @@ fn render_reasoning_summaries(ui: &mut egui::Ui, now_key: i128, rows: &[Reasonin
         });
 }
 
-fn render_compass_board(ui: &mut egui::Ui, columns: &[CompassColumn], show_done: bool) {
-    egui::ScrollArea::horizontal()
-        .id_salt("compass_board_scroll")
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for column in columns {
-                    if !show_done && column.status == "done" {
-                        continue;
-                    }
-                    render_compass_column(ui, column);
-                    ui.add_space(12.0);
+fn render_compass_tree(
+    ui: &mut egui::Ui,
+    rows: &[(CompassTaskRow, usize)],
+    show_done: bool,
+) {
+    if rows.is_empty() {
+        ui.label("No goals yet.");
+        return;
+    }
+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for (row, _) in rows {
+        if !show_done && row.status == "done" {
+            continue;
+        }
+        *counts.entry(row.status.as_str()).or_insert(0) += 1;
+    }
+
+    if !counts.is_empty() {
+        let mut parts = Vec::new();
+        for status in COMPASS_DEFAULT_STATUSES {
+            if let Some(count) = counts.get(status).copied() {
+                parts.push(format!("{}: {count}", status.to_uppercase()));
+            }
+        }
+        let mut extras: Vec<(&str, usize)> = counts
+            .iter()
+            .filter_map(|(status, count)| {
+                if COMPASS_DEFAULT_STATUSES.contains(status) {
+                    None
+                } else {
+                    Some((*status, *count))
                 }
-            });
-        });
-}
+            })
+            .collect();
+        extras.sort_by(|a, b| a.0.cmp(b.0));
+        for (status, count) in extras {
+            parts.push(format!("{}: {count}", status.to_uppercase()));
+        }
+        ui.small(parts.join(" · "));
+        ui.add_space(6.0);
+    }
 
-fn render_compass_column(ui: &mut egui::Ui, column: &CompassColumn) {
-    egui::Frame::NONE
-        .fill(egui::Color32::from_gray(65))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_min_width(COMPASS_COLUMN_WIDTH);
-            ui.set_max_width(COMPASS_COLUMN_WIDTH);
-
-            ui.label(format!(
-                "{} ({})",
-                column.status.to_uppercase(),
-                column.rows.len()
-            ));
+    // Remap indentation when hiding done rows so visible children do not get
+    // stranded at deep indentation levels.
+    let mut ancestor_visibility: Vec<bool> = Vec::new();
+    for (row, depth) in rows {
+        while ancestor_visibility.len() > *depth {
+            ancestor_visibility.pop();
+        }
+        let visible = show_done || row.status != "done";
+        let visible_depth = ancestor_visibility.iter().filter(|v| **v).count();
+        if visible {
+            render_compass_tree_row(ui, row, visible_depth);
             ui.add_space(6.0);
-
-            egui::ScrollArea::vertical()
-                .id_salt(("compass_column_scroll", &column.status))
-                .max_height(COMPASS_SCROLL_HEIGHT)
-                .show(ui, |ui| {
-                    for (row, depth) in &column.rows {
-                        render_compass_task(ui, row, *depth);
-                        ui.add_space(6.0);
-                    }
-                });
-        });
+        }
+        ancestor_visibility.push(visible);
+    }
 }
 
-fn render_compass_task(ui: &mut egui::Ui, row: &CompassTaskRow, depth: usize) {
+fn status_color(status: &str) -> egui::Color32 {
+    match status {
+        "todo" => egui::Color32::from_rgb(170, 170, 170),
+        "doing" => egui::Color32::from_rgb(120, 170, 255),
+        "blocked" => egui::Color32::from_rgb(255, 140, 140),
+        "done" => egui::Color32::from_rgb(140, 220, 140),
+        _ => egui::Color32::from_rgb(210, 210, 210),
+    }
+}
+
+fn render_compass_tree_row(ui: &mut egui::Ui, row: &CompassTaskRow, depth: usize) {
     let indent = depth as f32 * 14.0;
+
     let mut meta_parts: Vec<String> = Vec::new();
+    if row.note_count > 0 {
+        let suffix = if row.note_count == 1 { "" } else { "s" };
+        meta_parts.push(format!("{} note{suffix}", row.note_count));
+    }
     if !row.tags.is_empty() {
         meta_parts.push(
             row.tags
@@ -3226,16 +3222,12 @@ fn render_compass_task(ui: &mut egui::Ui, row: &CompassTaskRow, depth: usize) {
                 .join(" "),
         );
     }
-    if row.note_count > 0 {
-        let suffix = if row.note_count == 1 { "" } else { "s" };
-        meta_parts.push(format!("{} note{suffix}", row.note_count));
-    }
     let meta = meta_parts.join(" · ");
 
     ui.horizontal(|ui| {
         ui.add_space(indent);
         egui::Frame::NONE
-            .fill(egui::Color32::from_gray(70))
+            .fill(egui::Color32::from_gray(65))
             .corner_radius(egui::CornerRadius::same(6))
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {
@@ -3244,9 +3236,13 @@ fn render_compass_task(ui: &mut egui::Ui, row: &CompassTaskRow, depth: usize) {
                     egui::Label::new(egui::RichText::new(title).monospace())
                         .wrap_mode(egui::TextWrapMode::Wrap),
                 );
-                if !meta.is_empty() {
-                    ui.small(meta);
-                }
+
+                ui.horizontal(|ui| {
+                    ui.colored_label(status_color(&row.status), row.status.to_uppercase());
+                    if !meta.is_empty() {
+                        ui.small(meta);
+                    }
+                });
             });
     });
 }
