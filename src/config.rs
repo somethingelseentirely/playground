@@ -19,7 +19,6 @@ const DEFAULT_MODEL: &str = "gpt-oss:120b";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1/responses";
 const DEFAULT_STREAM: bool = false;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a terminal-based agent. Respond with exactly one shell command per turn. You can include an optional leading comment block for context. Faculties are executable helper scripts in ./faculties; run them with no arguments to see usage and prefer them over ad-hoc commands when applicable.";
-const DEFAULT_SEED_PROMPT: &str = "Begin.";
 const DEFAULT_BRANCH: &str = "main";
 const DEFAULT_AUTHOR: &str = "agent";
 const DEFAULT_AUTHOR_ROLE: &str = "user";
@@ -35,7 +34,6 @@ pub struct Config {
     pub system_prompt: String,
     pub branch_id: Option<Id>,
     pub branch: String,
-    pub seed_prompt: String,
     pub author: String,
     pub author_role: String,
     pub persona_id: Option<Id>,
@@ -109,7 +107,6 @@ fn default_config(pile_path: PathBuf) -> Config {
         system_prompt: default_system_prompt(),
         branch_id: None,
         branch: default_branch(),
-        seed_prompt: default_seed_prompt(),
         author: default_author(),
         author_role: default_author_role(),
         persona_id: None,
@@ -186,10 +183,6 @@ fn load_latest_config(
     {
         config.system_prompt = prompt;
     }
-    if let Some(prompt) = load_string_attr(ws, catalog, config_id, playground_config::seed_prompt)?
-    {
-        config.seed_prompt = prompt;
-    }
     if let Some(branch) = load_string_attr(ws, catalog, config_id, playground_config::branch)? {
         config.branch = branch;
     }
@@ -250,7 +243,6 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let config_id = ufoid();
 
     let system_prompt = ws.put(config.system_prompt.clone());
-    let seed_prompt = ws.put(config.seed_prompt.clone());
     let branch = ws.put(config.branch.clone());
     let author = ws.put(config.author.clone());
     let author_role = ws.put(config.author_role.clone());
@@ -264,7 +256,6 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         playground_config::kind: playground_config::kind_config,
         playground_config::updated_at: now,
         playground_config::system_prompt: system_prompt,
-        playground_config::seed_prompt: seed_prompt,
         playground_config::branch: branch,
         playground_config::author: author,
         playground_config::author_role: author_role,
@@ -374,10 +365,6 @@ fn default_stream() -> bool {
 
 fn default_branch() -> String {
     DEFAULT_BRANCH.to_string()
-}
-
-fn default_seed_prompt() -> String {
-    DEFAULT_SEED_PROMPT.to_string()
 }
 
 fn default_author() -> String {

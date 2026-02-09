@@ -11,7 +11,6 @@ pub mod playground_config {
         "79F990573A9DCC91EF08A5F8CBA7AA25" as pub kind: GenId;
         "DDF83FEC915816ACAE7F3FEBB57E5137" as pub updated_at: NsTAIInterval;
         "950B556A74F71AC7CB008AB23FBB6544" as pub system_prompt: Handle<Blake3, LongString>;
-        "DE84D8C836025EA26AC050A27544A332" as pub seed_prompt: Handle<Blake3, LongString>;
         "35E36AE7B60AD946661BD63B3CD64672" as pub branch: Handle<Blake3, LongString>;
         "4E2F9CA7A8456DED8C43A3BE741ADA58" as pub branch_id: GenId;
         "F0F90572249284CD57E48580369DEB6D" as pub author: Handle<Blake3, LongString>;
@@ -128,7 +127,6 @@ where
     add_attribute!(playground_config::kind, "config_kind");
     add_attribute!(playground_config::updated_at, "config_updated_at");
     add_attribute!(playground_config::system_prompt, "config_system_prompt");
-    add_attribute!(playground_config::seed_prompt, "config_seed_prompt");
     add_attribute!(playground_config::branch, "config_branch");
     add_attribute!(playground_config::branch_id, "config_branch_id");
     add_attribute!(playground_config::author, "config_author");

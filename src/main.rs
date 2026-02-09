@@ -125,7 +125,6 @@ struct ConfigSetArgs {
 #[value(rename_all = "kebab-case")]
 enum ConfigField {
     SystemPrompt,
-    SeedPrompt,
     Branch,
     BranchId,
     Author,
@@ -265,9 +264,6 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
     match args.field {
         ConfigField::SystemPrompt => {
             config.system_prompt = load_value_or_file(args.value.as_str(), "system_prompt")?;
-        }
-        ConfigField::SeedPrompt => {
-            config.seed_prompt = load_value_or_file(args.value.as_str(), "seed_prompt")?;
         }
         ConfigField::Branch => {
             config.branch = load_value_or_file(args.value.as_str(), "branch")?;
@@ -614,10 +610,6 @@ fn print_config(config: &Config, show_secrets: bool) {
     println!(
         "system_prompt = \"{}\"",
         config.system_prompt.replace('\"', "\\\"")
-    );
-    println!(
-        "seed_prompt = \"{}\"",
-        config.seed_prompt.replace('\"', "\\\"")
     );
 
     println!("\n[llm]");

@@ -309,7 +309,6 @@ struct AgentConfigRow {
     llm_api_key: Option<String>,
     exec_default_cwd: Option<String>,
     exec_sandbox_profile: Option<Id>,
-    seed_prompt: Option<String>,
     system_prompt: Option<String>,
 }
 
@@ -1205,7 +1204,6 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         load_optional_string_attr(data, ws, config_id, playground_config::exec_default_cwd);
     let exec_sandbox_profile =
         load_optional_id_attr(data, config_id, playground_config::exec_sandbox_profile);
-    let seed_prompt = load_optional_string_attr(data, ws, config_id, playground_config::seed_prompt);
     let system_prompt =
         load_optional_string_attr(data, ws, config_id, playground_config::system_prompt);
 
@@ -1225,7 +1223,6 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_api_key,
         exec_default_cwd,
         exec_sandbox_profile,
-        seed_prompt,
         system_prompt,
     })
 }
@@ -2658,18 +2655,6 @@ fn render_agent_config(
             );
             ui.end_row();
         });
-
-    if let Some(seed) = config.seed_prompt.as_deref() {
-        ui.add_space(8.0);
-        egui::CollapsingHeader::new(egui::RichText::new("Seed prompt").monospace())
-            .id_salt("agent_config_seed_prompt")
-            .show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(seed).monospace())
-                        .wrap_mode(egui::TextWrapMode::Wrap),
-                );
-            });
-    }
 
     if let Some(prompt) = config.system_prompt.as_deref() {
         ui.add_space(8.0);
