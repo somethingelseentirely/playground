@@ -127,6 +127,11 @@ enum ConfigField {
     SystemPrompt,
     Branch,
     BranchId,
+    ExecBranchId,
+    LocalMessagesBranchId,
+    RelationsBranchId,
+    TeamsBranchId,
+    WorkspaceBranchId,
     Author,
     AuthorRole,
     PersonaId,
@@ -270,6 +275,28 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
         }
         ConfigField::BranchId => {
             config.branch_id = parse_optional_hex_id(Some(args.value.as_str()), "branch_id")?;
+        }
+        ConfigField::ExecBranchId => {
+            config.exec_branch_id =
+                parse_optional_hex_id(Some(args.value.as_str()), "exec_branch_id")?;
+        }
+        ConfigField::LocalMessagesBranchId => {
+            config.local_messages_branch_id = parse_optional_hex_id(
+                Some(args.value.as_str()),
+                "local_messages_branch_id",
+            )?;
+        }
+        ConfigField::RelationsBranchId => {
+            config.relations_branch_id =
+                parse_optional_hex_id(Some(args.value.as_str()), "relations_branch_id")?;
+        }
+        ConfigField::TeamsBranchId => {
+            config.teams_branch_id =
+                parse_optional_hex_id(Some(args.value.as_str()), "teams_branch_id")?;
+        }
+        ConfigField::WorkspaceBranchId => {
+            config.workspace_branch_id =
+                parse_optional_hex_id(Some(args.value.as_str()), "workspace_branch_id")?;
         }
         ConfigField::Author => {
             config.author = load_value_or_file(args.value.as_str(), "author")?;
@@ -610,6 +637,43 @@ fn print_config(config: &Config, show_secrets: bool) {
     println!(
         "system_prompt = \"{}\"",
         config.system_prompt.replace('\"', "\\\"")
+    );
+
+    println!("\n[branches]");
+    println!(
+        "exec_branch_id = {}",
+        config
+            .exec_branch_id
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_string())
+    );
+    println!(
+        "local_messages_branch_id = {}",
+        config
+            .local_messages_branch_id
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_string())
+    );
+    println!(
+        "relations_branch_id = {}",
+        config
+            .relations_branch_id
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_string())
+    );
+    println!(
+        "teams_branch_id = {}",
+        config
+            .teams_branch_id
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_string())
+    );
+    println!(
+        "workspace_branch_id = {}",
+        config
+            .workspace_branch_id
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_string())
     );
 
     println!("\n[llm]");

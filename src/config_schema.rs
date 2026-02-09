@@ -13,6 +13,11 @@ pub mod playground_config {
         "950B556A74F71AC7CB008AB23FBB6544" as pub system_prompt: Handle<Blake3, LongString>;
         "35E36AE7B60AD946661BD63B3CD64672" as pub branch: Handle<Blake3, LongString>;
         "4E2F9CA7A8456DED8C43A3BE741ADA58" as pub branch_id: GenId;
+        "C188E12ABBDD83D283A23DBAD4B784AF" as pub exec_branch_id: GenId;
+        "2ED6FF7EAB93CB5608555AE4B9664CF8" as pub local_messages_branch_id: GenId;
+        "D35F4F02E29825FBC790E324EFCD1B34" as pub relations_branch_id: GenId;
+        "22A0E76B8044311563369298306906E3" as pub teams_branch_id: GenId;
+        "20D37D92C2AEF5C98899C4C35AA1E35E" as pub workspace_branch_id: GenId;
         "F0F90572249284CD57E48580369DEB6D" as pub author: Handle<Blake3, LongString>;
         "98A194178CFD7CBB915C1BC9EB561A7F" as pub author_role: Handle<Blake3, LongString>;
         "D1DC11B303725409AB8A30C6B59DB2D7" as pub persona_id: GenId;
@@ -129,6 +134,26 @@ where
     add_attribute!(playground_config::system_prompt, "config_system_prompt");
     add_attribute!(playground_config::branch, "config_branch");
     add_attribute!(playground_config::branch_id, "config_branch_id");
+    add_attribute!(
+        playground_config::exec_branch_id,
+        "config_exec_branch_id"
+    );
+    add_attribute!(
+        playground_config::local_messages_branch_id,
+        "config_local_messages_branch_id"
+    );
+    add_attribute!(
+        playground_config::relations_branch_id,
+        "config_relations_branch_id"
+    );
+    add_attribute!(
+        playground_config::teams_branch_id,
+        "config_teams_branch_id"
+    );
+    add_attribute!(
+        playground_config::workspace_branch_id,
+        "config_workspace_branch_id"
+    );
     add_attribute!(playground_config::author, "config_author");
     add_attribute!(playground_config::author_role, "config_author_role");
     add_attribute!(playground_config::persona_id, "config_persona_id");

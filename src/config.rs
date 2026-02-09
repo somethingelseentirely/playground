@@ -20,6 +20,11 @@ const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1/responses";
 const DEFAULT_STREAM: bool = false;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a terminal-based agent. Respond with exactly one shell command per turn. You can include an optional leading comment block for context. Faculties are executable helper scripts in ./faculties; run them with no arguments to see usage and prefer them over ad-hoc commands when applicable.";
 const DEFAULT_BRANCH: &str = "main";
+const DEFAULT_EXEC_BRANCH: &str = "main";
+const DEFAULT_LOCAL_MESSAGES_BRANCH: &str = "local-messages";
+const DEFAULT_RELATIONS_BRANCH: &str = "relations";
+const DEFAULT_TEAMS_BRANCH: &str = "teams";
+const DEFAULT_WORKSPACE_BRANCH: &str = "workspace";
 const DEFAULT_AUTHOR: &str = "agent";
 const DEFAULT_AUTHOR_ROLE: &str = "user";
 const DEFAULT_POLL_MS: u64 = 1;
@@ -34,6 +39,11 @@ pub struct Config {
     pub system_prompt: String,
     pub branch_id: Option<Id>,
     pub branch: String,
+    pub exec_branch_id: Option<Id>,
+    pub local_messages_branch_id: Option<Id>,
+    pub relations_branch_id: Option<Id>,
+    pub teams_branch_id: Option<Id>,
+    pub workspace_branch_id: Option<Id>,
     pub author: String,
     pub author_role: String,
     pub persona_id: Option<Id>,
@@ -107,6 +117,11 @@ fn default_config(pile_path: PathBuf) -> Config {
         system_prompt: default_system_prompt(),
         branch_id: None,
         branch: default_branch(),
+        exec_branch_id: None,
+        local_messages_branch_id: None,
+        relations_branch_id: None,
+        teams_branch_id: None,
+        workspace_branch_id: None,
         author: default_author(),
         author_role: default_author_role(),
         persona_id: None,
@@ -124,7 +139,16 @@ fn load_from_pile(pile_path: &Path) -> Result<Config> {
     let config = if let Some(config) = load_latest_config(&mut ws, &catalog, pile_path)? {
         config
     } else {
-        let config = default_config(pile_path.to_path_buf());
+        let mut config = default_config(pile_path.to_path_buf());
+        // Make the default config fully concrete (ids instead of names).
+        config.branch_id = Some(ensure_branch_id(&mut repo, config.branch.as_str())?);
+        config.exec_branch_id = Some(ensure_branch_id(&mut repo, DEFAULT_EXEC_BRANCH)?);
+        config.local_messages_branch_id =
+            Some(ensure_branch_id(&mut repo, DEFAULT_LOCAL_MESSAGES_BRANCH)?);
+        config.relations_branch_id = Some(ensure_branch_id(&mut repo, DEFAULT_RELATIONS_BRANCH)?);
+        config.teams_branch_id = Some(ensure_branch_id(&mut repo, DEFAULT_TEAMS_BRANCH)?);
+        config.workspace_branch_id = Some(ensure_branch_id(&mut repo, DEFAULT_WORKSPACE_BRANCH)?);
+
         store_config(&mut ws, &config).context("store default config")?;
         push_workspace(&mut repo, &mut ws).context("push default config")?;
         config
@@ -221,6 +245,23 @@ fn load_latest_config(
     if let Some(id) = load_id_attr(catalog, config_id, playground_config::branch_id) {
         config.branch_id = Some(id);
     }
+    if let Some(id) = load_id_attr(catalog, config_id, playground_config::exec_branch_id) {
+        config.exec_branch_id = Some(id);
+    }
+    if let Some(id) =
+        load_id_attr(catalog, config_id, playground_config::local_messages_branch_id)
+    {
+        config.local_messages_branch_id = Some(id);
+    }
+    if let Some(id) = load_id_attr(catalog, config_id, playground_config::relations_branch_id) {
+        config.relations_branch_id = Some(id);
+    }
+    if let Some(id) = load_id_attr(catalog, config_id, playground_config::teams_branch_id) {
+        config.teams_branch_id = Some(id);
+    }
+    if let Some(id) = load_id_attr(catalog, config_id, playground_config::workspace_branch_id) {
+        config.workspace_branch_id = Some(id);
+    }
     if let Some(id) = load_id_attr(catalog, config_id, playground_config::exec_sandbox_profile) {
         config.exec.sandbox_profile = Some(id);
     }
@@ -267,6 +308,21 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
 
     if let Some(id) = config.branch_id {
         change += entity! { &config_id @ playground_config::branch_id: id };
+    }
+    if let Some(id) = config.exec_branch_id {
+        change += entity! { &config_id @ playground_config::exec_branch_id: id };
+    }
+    if let Some(id) = config.local_messages_branch_id {
+        change += entity! { &config_id @ playground_config::local_messages_branch_id: id };
+    }
+    if let Some(id) = config.relations_branch_id {
+        change += entity! { &config_id @ playground_config::relations_branch_id: id };
+    }
+    if let Some(id) = config.teams_branch_id {
+        change += entity! { &config_id @ playground_config::teams_branch_id: id };
+    }
+    if let Some(id) = config.workspace_branch_id {
+        change += entity! { &config_id @ playground_config::workspace_branch_id: id };
     }
     if let Some(id) = config.persona_id {
         change += entity! { &config_id @ playground_config::persona_id: id };
