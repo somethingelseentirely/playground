@@ -341,7 +341,6 @@ _Live view of the agent pile, exec queue, and message activity._"
                 }
                 ui.horizontal(|ui| {
                     ui.label("Exec branches");
-                    ui.text_edit_singleline(&mut state.config.exec_branches);
                     render_branch_picker(
                         ui,
                         "exec_branch_picker",
@@ -351,7 +350,6 @@ _Live view of the agent pile, exec queue, and message activity._"
                 });
                 ui.horizontal(|ui| {
                     ui.label("Local message branches");
-                    ui.text_edit_singleline(&mut state.config.local_message_branches);
                     render_branch_picker(
                         ui,
                         "local_message_branch_picker",
@@ -361,7 +359,6 @@ _Live view of the agent pile, exec queue, and message activity._"
                 });
                 ui.horizontal(|ui| {
                     ui.label("Relations branches");
-                    ui.text_edit_singleline(&mut state.config.relations_branches);
                     render_branch_picker(
                         ui,
                         "relations_branch_picker",
@@ -371,7 +368,6 @@ _Live view of the agent pile, exec queue, and message activity._"
                 });
                 ui.horizontal(|ui| {
                     ui.label("Teams branches");
-                    ui.text_edit_singleline(&mut state.config.teams_branches);
                     render_branch_picker(
                         ui,
                         "teams_branch_picker",
@@ -1628,17 +1624,39 @@ fn render_branch_picker(
         format!("{} branches", selected_ids.len())
     };
 
+    let mut selected: HashSet<Id> = selected_ids.iter().copied().collect();
+    let mut changed = false;
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(selected_text)
         .show_ui(ui, |ui| {
+            if ui.button("Clear").clicked() {
+                selected.clear();
+                changed = true;
+            }
+            ui.separator();
             for branch in branches {
                 let display = branch_display(branch);
-                let is_selected = selected_ids.contains(&branch.id);
-                if ui.selectable_label(is_selected, display).clicked() {
-                    *raw = branch_ref(branch, &name_counts);
+                let mut is_selected = selected.contains(&branch.id);
+                if ui.checkbox(&mut is_selected, display).changed() {
+                    changed = true;
+                    if is_selected {
+                        selected.insert(branch.id);
+                    } else {
+                        selected.remove(&branch.id);
+                    }
                 }
             }
         });
+
+    if changed {
+        let mut parts = Vec::new();
+        for branch in branches {
+            if selected.contains(&branch.id) {
+                parts.push(branch_ref(branch, &name_counts));
+            }
+        }
+        *raw = parts.join(",");
+    }
 }
 
 fn branch_display(branch: &BranchEntry) -> String {
