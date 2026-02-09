@@ -19,8 +19,10 @@ use triblespace::core::value::Value;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::schemas::time::NsTAIInterval;
 use triblespace::macros::{entity, find, id_hex, pattern};
-use triblespace::prelude::valueschemas::U256BE;
-use triblespace::prelude::{Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, ToValue, View};
+use triblespace::prelude::valueschemas::{GenId, U256BE};
+use triblespace::prelude::{
+    Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, ToValue, TryFromValue, View,
+};
 
 use GORBIE::NotebookCtx;
 use GORBIE::NotebookConfig;
@@ -29,6 +31,7 @@ use GORBIE::md;
 use GORBIE::widgets::{Button, TextField};
 
 use crate::schema::openai_responses;
+use crate::schema::playground_config;
 use crate::schema::playground_exec;
 use crate::schema::playground_workspace;
 
@@ -133,6 +136,7 @@ mod relations {
 #[derive(Clone, Debug)]
 struct DashboardConfig {
     pile_path: String,
+    config_branches: String,
     exec_branches: String,
     local_message_branches: String,
     relations_branches: String,
@@ -150,6 +154,7 @@ impl Default for DashboardConfig {
         });
         Self {
             pile_path: default_pile.to_string_lossy().to_string(),
+            config_branches: "config".to_string(),
             exec_branches: "main".to_string(),
             local_message_branches: "local-messages".to_string(),
             relations_branches: "relations".to_string(),
@@ -172,6 +177,7 @@ struct DashboardState {
     local_send_error: Option<String>,
     local_send_notice: Option<String>,
     local_read_error: Option<String>,
+    config_reveal_secrets: bool,
     teams_selected_chat: Option<Id>,
     workspace_selected_snapshot: Option<Id>,
 }
@@ -198,6 +204,7 @@ impl Default for DashboardState {
             local_send_error: None,
             local_send_notice: None,
             local_read_error: None,
+            config_reveal_secrets: false,
             teams_selected_chat: None,
             workspace_selected_snapshot: None,
         }
@@ -286,6 +293,27 @@ struct RelationRow {
 }
 
 #[derive(Debug, Clone)]
+struct AgentConfigRow {
+    id: Id,
+    updated_at: Option<i128>,
+    persona_id: Option<Id>,
+    branch: Option<String>,
+    branch_id: Option<Id>,
+    author: Option<String>,
+    author_role: Option<String>,
+    poll_ms: Option<u64>,
+    llm_model: Option<String>,
+    llm_base_url: Option<String>,
+    llm_reasoning_effort: Option<String>,
+    llm_stream: Option<bool>,
+    llm_api_key: Option<String>,
+    exec_default_cwd: Option<String>,
+    exec_sandbox_profile: Option<Id>,
+    seed_prompt: Option<String>,
+    system_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct DashboardSnapshot {
     pile_path: PathBuf,
     branches: Vec<BranchEntry>,
@@ -293,6 +321,8 @@ struct DashboardSnapshot {
     exec_rows: Vec<ExecRow>,
     exec_summary: ExecSummary,
     exec_error: Option<String>,
+    agent_config: Option<AgentConfigRow>,
+    agent_config_error: Option<String>,
     reasoning_summaries: Vec<ReasoningSummaryRow>,
     local_message_rows: Vec<LocalMessageRow>,
     local_message_error: Option<String>,
@@ -372,6 +402,15 @@ _Live view of the agent pile, exec queue, and message activity._"
                         });
                     }
                 }
+                ui.horizontal(|ui| {
+                    ui.label("Config branches");
+                    render_branch_picker(
+                        ui,
+                        "config_branch_picker",
+                        &picker_branches,
+                        &mut state.config.config_branches,
+                    );
+                });
                 ui.horizontal(|ui| {
                     ui.label("Exec branches");
                     render_branch_picker(
@@ -492,6 +531,29 @@ _Live view of the agent pile, exec queue, and message activity._"
                         ui.label(format!("- {label} ({})", id_prefix(branch.id)));
                     }
                 }
+            }
+        });
+    });
+
+    nb.view(move |ui| {
+        let mut state = dashboard.read_mut(ui);
+        with_padding(ui, padding, |ui| {
+            ui.heading("Agent config");
+            let snapshot = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                snapshot.clone()
+            };
+            if let Some(err) = &snapshot.agent_config_error {
+                ui.colored_label(egui::Color32::RED, err);
+            } else {
+                render_agent_config(
+                    ui,
+                    &mut state,
+                    snapshot.now_key,
+                    snapshot.agent_config.as_ref(),
+                );
             }
         });
     });
@@ -717,6 +779,7 @@ fn load_snapshot(
         .map(|snapshot| snapshot.branch_data.clone())
         .unwrap_or_default();
 
+    let config_refs = parse_branch_list(&config.config_branches);
     let exec_refs = parse_branch_list(&config.exec_branches);
     let local_refs = parse_branch_list(&config.local_message_branches);
     let relations_refs = parse_branch_list(&config.relations_branches);
@@ -724,6 +787,7 @@ fn load_snapshot(
     let workspace_refs = parse_branch_list(&config.workspace_branches);
 
     let mut ensure_refs = Vec::new();
+    ensure_refs.extend(config_refs.iter().cloned());
     ensure_refs.extend(exec_refs.iter().cloned());
     ensure_refs.extend(local_refs.iter().cloned());
     ensure_refs.extend(relations_refs.iter().cloned());
@@ -732,18 +796,21 @@ fn load_snapshot(
     ensure_named_branches(repo, &mut branches, &ensure_refs)?;
 
     let branch_lookup = BranchLookup::new(&branches);
+    let config_res = resolve_branch_ids(&branch_lookup, &config_refs);
     let exec_res = resolve_branch_ids(&branch_lookup, &exec_refs);
     let local_res = resolve_branch_ids(&branch_lookup, &local_refs);
     let relations_res = resolve_branch_ids(&branch_lookup, &relations_refs);
     let teams_res = resolve_branch_ids(&branch_lookup, &teams_refs);
     let workspace_res = resolve_branch_ids(&branch_lookup, &workspace_refs);
 
+    let agent_config_error = config_res.as_ref().err().cloned();
     let exec_error = exec_res.as_ref().err().cloned();
     let local_message_error = local_res.as_ref().err().cloned();
     let relations_error = relations_res.as_ref().err().cloned();
     let teams_error = teams_res.as_ref().err().cloned();
     let workspace_error = workspace_res.as_ref().err().cloned();
 
+    let config_ids = config_res.unwrap_or_default();
     let exec_ids = exec_res.unwrap_or_default();
     let local_ids = local_res.unwrap_or_default();
     let relations_ids = relations_res.unwrap_or_default();
@@ -751,6 +818,7 @@ fn load_snapshot(
     let workspace_ids = workspace_res.unwrap_or_default();
 
     let mut needed_ids: Vec<Id> = Vec::new();
+    extend_unique(&mut needed_ids, &config_ids);
     extend_unique(&mut needed_ids, &exec_ids);
     extend_unique(&mut needed_ids, &local_ids);
     extend_unique(&mut needed_ids, &relations_ids);
@@ -771,6 +839,7 @@ fn load_snapshot(
         branch_data.insert(*branch_id, snapshot);
     }
 
+    let config_data = union_branches(&branch_data, &config_ids);
     let exec_data = union_branches(&branch_data, &exec_ids);
     let local_data = union_branches(&branch_data, &local_ids);
     let relations_data = union_branches(&branch_data, &relations_ids);
@@ -793,6 +862,8 @@ fn load_snapshot(
                 failed: 0,
             },
             exec_error,
+            agent_config: None,
+            agent_config_error,
             reasoning_summaries: Vec::new(),
             local_message_rows: Vec::new(),
             local_message_error,
@@ -813,6 +884,7 @@ fn load_snapshot(
     };
 
     Ok(build_snapshot(
+        config_data,
         exec_data,
         local_data,
         relations_data,
@@ -821,6 +893,7 @@ fn load_snapshot(
         pile_path,
         branches,
         branch_data,
+        agent_config_error,
         exec_error,
         local_message_error,
         relations_error,
@@ -833,6 +906,7 @@ fn load_snapshot(
 }
 
 fn build_snapshot(
+    config_data: TribleSet,
     exec_data: TribleSet,
     local_data: TribleSet,
     relations_data: TribleSet,
@@ -841,6 +915,7 @@ fn build_snapshot(
     pile_path: PathBuf,
     branches: Vec<BranchEntry>,
     branch_data: HashMap<Id, BranchSnapshot>,
+    agent_config_error: Option<String>,
     exec_error: Option<String>,
     local_message_error: Option<String>,
     relations_error: Option<String>,
@@ -855,6 +930,7 @@ fn build_snapshot(
     let relations_labels = collect_relations_labels(&relations_people);
     let local_me_id = resolve_person_ref(&relations_people, &config.local_me);
     let local_peer_id = resolve_person_ref(&relations_people, &config.local_peer);
+    let agent_config = collect_agent_config(&config_data, ws);
     let exec_rows = collect_exec_rows(&exec_data, ws);
     let exec_summary = summarize_exec(&exec_rows);
     let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
@@ -874,6 +950,8 @@ fn build_snapshot(
         exec_rows,
         exec_summary,
         exec_error,
+        agent_config,
+        agent_config_error,
         reasoning_summaries,
         local_message_rows,
         local_message_error,
@@ -1083,6 +1161,94 @@ fn union_branches(branch_data: &HashMap<Id, BranchSnapshot>, ids: &[Id]) -> Trib
         }
     }
     union
+}
+
+fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<AgentConfigRow> {
+    let mut latest: Option<(Id, i128)> = None;
+    for (config_id, updated_at) in find!(
+        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        pattern!(data, [{
+            ?config_id @
+            playground_config::kind: playground_config::kind_config,
+            playground_config::updated_at: ?updated_at,
+        }])
+    ) {
+        let key = interval_key(updated_at);
+        if latest.map_or(true, |(_, current)| key > current) {
+            latest = Some((config_id, key));
+        }
+    }
+
+    let Some((config_id, updated_key)) = latest else {
+        return None;
+    };
+
+    let persona_id = load_optional_id_attr(data, config_id, playground_config::persona_id);
+    let branch = load_optional_string_attr(data, ws, config_id, playground_config::branch);
+    let branch_id = load_optional_id_attr(data, config_id, playground_config::branch_id);
+    let author = load_optional_string_attr(data, ws, config_id, playground_config::author);
+    let author_role = load_optional_string_attr(data, ws, config_id, playground_config::author_role);
+    let poll_ms = load_optional_u64_attr(data, config_id, playground_config::poll_ms);
+    let llm_model = load_optional_string_attr(data, ws, config_id, playground_config::llm_model);
+    let llm_base_url =
+        load_optional_string_attr(data, ws, config_id, playground_config::llm_base_url);
+    let llm_reasoning_effort = load_optional_string_attr(
+        data,
+        ws,
+        config_id,
+        playground_config::llm_reasoning_effort,
+    );
+    let llm_stream = load_optional_u64_attr(data, config_id, playground_config::llm_stream)
+        .map(|value| value != 0);
+    let llm_api_key = load_optional_string_attr(data, ws, config_id, playground_config::llm_api_key);
+    let exec_default_cwd =
+        load_optional_string_attr(data, ws, config_id, playground_config::exec_default_cwd);
+    let exec_sandbox_profile =
+        load_optional_id_attr(data, config_id, playground_config::exec_sandbox_profile);
+    let seed_prompt = load_optional_string_attr(data, ws, config_id, playground_config::seed_prompt);
+    let system_prompt =
+        load_optional_string_attr(data, ws, config_id, playground_config::system_prompt);
+
+    Some(AgentConfigRow {
+        id: config_id,
+        updated_at: Some(updated_key),
+        persona_id,
+        branch,
+        branch_id,
+        author,
+        author_role,
+        poll_ms,
+        llm_model,
+        llm_base_url,
+        llm_reasoning_effort,
+        llm_stream,
+        llm_api_key,
+        exec_default_cwd,
+        exec_sandbox_profile,
+        seed_prompt,
+        system_prompt,
+    })
+}
+
+fn load_optional_id_attr(data: &TribleSet, entity_id: Id, attr: Attribute<GenId>) -> Option<Id> {
+    find!(
+        (entity: Id, value: Value<GenId>),
+        pattern!(data, [{ ?entity @ attr: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| {
+        (entity == entity_id).then_some(Id::try_from_value(&value).ok())?
+    })
+}
+
+fn load_optional_u64_attr(data: &TribleSet, entity_id: Id, attr: Attribute<U256BE>) -> Option<u64> {
+    find!(
+        (entity: Id, value: Value<U256BE>),
+        pattern!(data, [{ ?entity @ attr: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == entity_id).then_some(value))
+    .and_then(u256be_to_u64)
 }
 
 fn collect_exec_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ExecRow> {
@@ -2371,6 +2537,171 @@ fn summarize_exec(rows: &[ExecRow]) -> ExecSummary {
         }
     }
     summary
+}
+
+fn render_agent_config(
+    ui: &mut egui::Ui,
+    state: &mut DashboardState,
+    now_key: i128,
+    config: Option<&AgentConfigRow>,
+) {
+    let Some(config) = config else {
+        ui.label("No config entries.");
+        return;
+    };
+
+    let updated = format_age(now_key, config.updated_at);
+    ui.label(format!("Latest config: {} (updated {updated})", id_prefix(config.id)));
+    ui.add_space(8.0);
+
+    egui::Grid::new("agent_config_grid")
+        .striped(true)
+        .spacing(egui::Vec2::new(12.0, 6.0))
+        .show(ui, |ui| {
+            ui.label("config_id");
+            ui.monospace(format!("{:x}", config.id));
+            ui.end_row();
+
+            ui.label("persona_id");
+            ui.monospace(
+                config
+                    .persona_id
+                    .map(|id| format!("{id:x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("branch");
+            ui.label(config.branch.as_deref().unwrap_or("-"));
+            ui.end_row();
+
+            ui.label("branch_id");
+            ui.monospace(
+                config
+                    .branch_id
+                    .map(|id| format!("{id:x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("author");
+            ui.label(config.author.as_deref().unwrap_or("-"));
+            ui.end_row();
+
+            ui.label("author_role");
+            ui.label(config.author_role.as_deref().unwrap_or("-"));
+            ui.end_row();
+
+            ui.label("poll_ms");
+            ui.monospace(
+                config
+                    .poll_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("llm.model");
+            ui.label(config.llm_model.as_deref().unwrap_or("-"));
+            ui.end_row();
+
+            ui.label("llm.base_url");
+            ui.label(config.llm_base_url.as_deref().unwrap_or("-"));
+            ui.end_row();
+
+            ui.label("llm.reasoning_effort");
+            ui.label(config.llm_reasoning_effort.as_deref().unwrap_or("-"));
+            ui.end_row();
+
+            ui.label("llm.stream");
+            ui.monospace(
+                config
+                    .llm_stream
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("llm.api_key");
+            ui.horizontal(|ui| {
+                let Some(key) = config.llm_api_key.as_deref() else {
+                    ui.label("-");
+                    return;
+                };
+                if state.config_reveal_secrets {
+                    ui.monospace(key);
+                } else {
+                    ui.monospace(mask_secret(key));
+                }
+                let button = if state.config_reveal_secrets {
+                    "Hide"
+                } else {
+                    "Reveal"
+                };
+                if ui.add(Button::new(button)).clicked() {
+                    state.config_reveal_secrets = !state.config_reveal_secrets;
+                    ui.ctx().request_repaint();
+                }
+            });
+            ui.end_row();
+
+            ui.label("exec.default_cwd");
+            ui.label(config.exec_default_cwd.as_deref().unwrap_or("-"));
+            ui.end_row();
+
+            ui.label("exec.sandbox_profile");
+            ui.monospace(
+                config
+                    .exec_sandbox_profile
+                    .map(|id| format!("{id:x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+        });
+
+    if let Some(seed) = config.seed_prompt.as_deref() {
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new(egui::RichText::new("Seed prompt").monospace())
+            .id_salt("agent_config_seed_prompt")
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(seed).monospace())
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+            });
+    }
+
+    if let Some(prompt) = config.system_prompt.as_deref() {
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new(egui::RichText::new("System prompt").monospace())
+            .id_salt("agent_config_system_prompt")
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(prompt).monospace())
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+            });
+    }
+}
+
+fn mask_secret(secret: &str) -> String {
+    let len = secret.chars().count();
+    if len == 0 {
+        return "<empty>".to_string();
+    }
+    if len <= 8 {
+        return "*".repeat(len);
+    }
+    let prefix: String = secret.chars().take(4).collect();
+    let suffix: String = secret
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}…{suffix}")
 }
 
 fn render_exec_summary(ui: &mut egui::Ui, summary: &ExecSummary) {
