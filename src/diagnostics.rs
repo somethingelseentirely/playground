@@ -327,32 +327,61 @@ _Live view of the agent pile, exec queue, and message activity._"
                     ui.label("Pile");
                     ui.text_edit_singleline(&mut state.config.pile_path);
                 });
+                let mut picker_branches = Vec::new();
+                let repo_open_result = ensure_repo_open(state);
+                if repo_open_result.is_ok() {
+                    if let Some(repo) = state.repo.as_mut() {
+                        picker_branches = list_branches(repo.storage_mut()).unwrap_or_default();
+                        picker_branches.sort_by(|a, b| {
+                            a.name
+                                .cmp(&b.name)
+                                .then_with(|| a.id.cmp(&b.id))
+                        });
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.label("Exec branches");
                     ui.text_edit_singleline(&mut state.config.exec_branches);
+                    render_branch_picker(
+                        ui,
+                        "exec_branch_picker",
+                        &picker_branches,
+                        &mut state.config.exec_branches,
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Local message branches");
                     ui.text_edit_singleline(&mut state.config.local_message_branches);
+                    render_branch_picker(
+                        ui,
+                        "local_message_branch_picker",
+                        &picker_branches,
+                        &mut state.config.local_message_branches,
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Relations branches");
                     ui.text_edit_singleline(&mut state.config.relations_branches);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Local me");
-                    ui.text_edit_singleline(&mut state.config.local_me);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Local peer");
-                    ui.text_edit_singleline(&mut state.config.local_peer);
+                    render_branch_picker(
+                        ui,
+                        "relations_branch_picker",
+                        &picker_branches,
+                        &mut state.config.relations_branches,
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Teams branches");
                     ui.text_edit_singleline(&mut state.config.teams_branches);
+                    render_branch_picker(
+                        ui,
+                        "teams_branch_picker",
+                        &picker_branches,
+                        &mut state.config.teams_branches,
+                    );
                 });
-                if let Err(err) = ensure_repo_open(state) {
-                    state.snapshot = Some(Err(err));
+
+                if let Err(err) = repo_open_result {
+                    state.snapshot = Some(Err(err.to_string()));
                 } else {
                     refresh_snapshot(state);
                 }
@@ -1558,6 +1587,72 @@ fn render_person_picker(
                 }
             }
         });
+}
+
+fn render_branch_picker(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    branches: &[BranchEntry],
+    raw: &mut String,
+) {
+    if branches.is_empty() {
+        return;
+    }
+
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for branch in branches {
+        if let Some(name) = branch.name.as_ref() {
+            *name_counts.entry(name.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let refs = parse_branch_list(raw);
+    let lookup = BranchLookup::new(branches);
+    let selected_ids = resolve_branch_ids(&lookup, &refs).unwrap_or_default();
+
+    let selected_text = if selected_ids.is_empty() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            "Pick...".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else if selected_ids.len() == 1 {
+        let id = selected_ids[0];
+        branches
+            .iter()
+            .find(|branch| branch.id == id)
+            .map(branch_display)
+            .unwrap_or_else(|| format!("{} ({})", "<branch>", id_prefix(id)))
+    } else {
+        format!("{} branches", selected_ids.len())
+    };
+
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            for branch in branches {
+                let display = branch_display(branch);
+                let is_selected = selected_ids.contains(&branch.id);
+                if ui.selectable_label(is_selected, display).clicked() {
+                    *raw = branch_ref(branch, &name_counts);
+                }
+            }
+        });
+}
+
+fn branch_display(branch: &BranchEntry) -> String {
+    let name = branch.name.as_deref().unwrap_or("<unnamed>");
+    format!("{name} ({})", id_prefix(branch.id))
+}
+
+fn branch_ref(branch: &BranchEntry, name_counts: &HashMap<String, usize>) -> String {
+    if let Some(name) = branch.name.as_ref() {
+        if !name.starts_with('<') && name_counts.get(name).copied().unwrap_or(0) == 1 {
+            return name.clone();
+        }
+    }
+    format!("{:x}", branch.id)
 }
 
 fn render_teams_conversations(
