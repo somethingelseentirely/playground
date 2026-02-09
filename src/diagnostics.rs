@@ -69,9 +69,8 @@ const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
 const RELATIONS_SCROLL_HEIGHT: f32 = 260.0;
 const TEAMS_SCROLL_HEIGHT: f32 = 520.0;
 const TEAMS_CHAT_LIST_WIDTH: f32 = 220.0;
-const WORKSPACE_SCROLL_HEIGHT: f32 = 420.0;
 const WORKSPACE_SNAPSHOT_LIMIT: usize = 10;
-const WORKSPACE_ENTRY_PREVIEW_LIMIT: usize = 200;
+const WORKSPACE_ENTRY_PREVIEW_LIMIT: usize = 80;
 
 static DIAGNOSTICS_PILE_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 static DIAGNOSTICS_HEADLESS: AtomicBool = AtomicBool::new(false);
@@ -175,6 +174,7 @@ struct DashboardState {
     local_send_notice: Option<String>,
     local_read_error: Option<String>,
     teams_selected_chat: Option<Id>,
+    workspace_selected_snapshot: Option<Id>,
 }
 
 impl Drop for DashboardState {
@@ -200,6 +200,7 @@ impl Default for DashboardState {
             local_send_notice: None,
             local_read_error: None,
             teams_selected_chat: None,
+            workspace_selected_snapshot: None,
         }
     }
 }
@@ -598,16 +599,25 @@ _Live view of the agent pile, exec queue, and message activity._"
     });
 
     nb.view(move |ui| {
-        let state = dashboard.read(ui);
+        let mut state = dashboard.read_mut(ui);
         with_padding(ui, padding, |ui| {
             ui.heading("Workspace");
-            let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                return;
+            let snapshot = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                snapshot.clone()
             };
             if let Some(err) = &snapshot.workspace_error {
                 ui.colored_label(egui::Color32::RED, err);
             }
-            render_workspace(ui, snapshot.now_key, &snapshot.workspace_snapshots, &snapshot.workspace_entries);
+            render_workspace(
+                ui,
+                &mut state,
+                snapshot.now_key,
+                &snapshot.workspace_snapshots,
+                &snapshot.workspace_entries,
+            );
         });
     });
 }
@@ -682,6 +692,7 @@ fn refresh_snapshot(state: &mut DashboardState) {
         .and_then(|result| result.as_ref().ok())
         .cloned();
     let config = state.config.clone();
+    let workspace_selected = state.workspace_selected_snapshot;
     let repo = match state.repo.as_mut() {
         Some(repo) => repo,
         None => {
@@ -689,7 +700,7 @@ fn refresh_snapshot(state: &mut DashboardState) {
             return;
         }
     };
-    let result = load_snapshot(repo, &config, previous);
+    let result = load_snapshot(repo, &config, previous, workspace_selected);
     state.snapshot = Some(result);
 }
 
@@ -697,6 +708,7 @@ fn load_snapshot(
     repo: &mut Repository<Pile>,
     config: &DashboardConfig,
     previous: Option<DashboardSnapshot>,
+    workspace_selected_snapshot: Option<Id>,
 ) -> Result<DashboardSnapshot, String> {
     let pile_path = PathBuf::from(&config.pile_path);
     let mut branches = list_branches(repo.storage_mut())?;
@@ -817,6 +829,7 @@ fn load_snapshot(
         workspace_error,
         config,
         &mut reader_ws,
+        workspace_selected_snapshot,
     ))
 }
 
@@ -836,6 +849,7 @@ fn build_snapshot(
     workspace_error: Option<String>,
     config: &DashboardConfig,
     ws: &mut Workspace<Pile>,
+    workspace_selected_snapshot: Option<Id>,
 ) -> DashboardSnapshot {
     let now_key = epoch_key(now_epoch());
     let relations_people = collect_relations_people(&relations_data, ws);
@@ -849,8 +863,9 @@ fn build_snapshot(
     let (teams_messages, teams_chats) = collect_teams_messages(&teams_data, ws);
     let workspace_snapshots = collect_workspace_snapshots(&workspace_data, ws);
     let workspace_latest_id = workspace_snapshots.first().map(|row| row.id);
+    let workspace_preview_id = workspace_selected_snapshot.or(workspace_latest_id);
     let workspace_entries =
-        collect_workspace_entries_preview(&workspace_data, ws, workspace_latest_id);
+        collect_workspace_entries_preview(&workspace_data, ws, workspace_preview_id);
     let labels = collect_labels(&exec_data, ws);
 
     DashboardSnapshot {
@@ -2528,6 +2543,7 @@ fn render_relations(ui: &mut egui::Ui, people: &[RelationRow]) {
 
 fn render_workspace(
     ui: &mut egui::Ui,
+    state: &mut DashboardState,
     now_key: i128,
     snapshots: &[WorkspaceSnapshotRow],
     entries: &[WorkspaceEntryRow],
@@ -2538,38 +2554,58 @@ fn render_workspace(
     }
 
     ui.label("Snapshots:");
-    egui::ScrollArea::vertical()
-        .id_salt("workspace_snapshots_scroll")
-        .max_height(180.0)
-        .show(ui, |ui| {
-            egui::Grid::new("workspace_snapshots_grid")
-                .striped(true)
-                .spacing(egui::Vec2::new(12.0, 6.0))
-                .show(ui, |ui| {
-                    ui.label("Age");
-                    ui.label("Id");
-                    ui.label("Label");
-                    ui.label("Root");
-                    ui.label("Entries");
-                    ui.end_row();
+    if ui
+        .selectable_label(state.workspace_selected_snapshot.is_none(), "Follow latest snapshot")
+        .clicked()
+    {
+        state.workspace_selected_snapshot = None;
+        ui.ctx().request_repaint();
+    }
 
-                    for row in snapshots {
-                        ui.label(format_age(now_key, row.created_at));
-                        ui.monospace(id_prefix(row.id));
-                        ui.label(row.label.as_deref().unwrap_or("-"));
-                        ui.label(row.root_path.as_deref().unwrap_or("."));
-                        ui.label(row.entry_count.to_string());
-                        ui.end_row();
-                    }
-                });
-        });
+    for row in snapshots {
+        let age = format_age(now_key, row.created_at);
+        let label = row.label.as_deref().unwrap_or("-");
+        let root = row.root_path.as_deref().unwrap_or(".");
+        let text = format!(
+            "{age}  {}  {label}  {root}  ({})",
+            id_prefix(row.id),
+            row.entry_count
+        );
+        if ui
+            .selectable_label(state.workspace_selected_snapshot == Some(row.id), text)
+            .clicked()
+        {
+            state.workspace_selected_snapshot = Some(row.id);
+            ui.ctx().request_repaint();
+        }
+    }
 
+    let latest_id = snapshots.first().map(|row| row.id);
+    let effective_id = state.workspace_selected_snapshot.or(latest_id);
     ui.add_space(8.0);
-    ui.label("Latest snapshot entries (preview):");
-    egui::ScrollArea::vertical()
-        .id_salt("workspace_entries_scroll")
-        .max_height(WORKSPACE_SCROLL_HEIGHT)
-        .show(ui, |ui| {
+
+    match effective_id {
+        None => {
+            ui.label("No snapshot selected.");
+        }
+        Some(snapshot_id) => {
+            let selected_row = snapshots.iter().find(|row| row.id == snapshot_id);
+            if let Some(row) = selected_row {
+                let age = format_age(now_key, row.created_at);
+                let label = row.label.as_deref().unwrap_or("-");
+                let root = row.root_path.as_deref().unwrap_or(".");
+                ui.label(format!(
+                    "Entries (preview) for {age} {}  {label}  {root}:",
+                    id_prefix(row.id)
+                ));
+            } else {
+                ui.label(format!(
+                    "Entries (preview) for {}:",
+                    id_prefix(snapshot_id)
+                ));
+                ui.small("Selected snapshot is not in the list (older than limit).");
+            }
+
             for entry in entries {
                 let kind = workspace_kind_tag(entry.kind);
                 if let Some(target) = entry.link_target.as_deref() {
@@ -2582,7 +2618,14 @@ fn render_workspace(
                     ui.monospace(format!("{kind} {}", entry.path));
                 }
             }
-        });
+
+            if let Some(row) = selected_row {
+                if row.entry_count > entries.len() {
+                    ui.small(format!("... and {} more", row.entry_count - entries.len()));
+                }
+            }
+        }
+    }
 }
 
 fn workspace_kind_tag(kind: WorkspaceEntryKind) -> &'static str {
