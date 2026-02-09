@@ -70,7 +70,6 @@ const RELATIONS_SCROLL_HEIGHT: f32 = 260.0;
 const TEAMS_SCROLL_HEIGHT: f32 = 520.0;
 const TEAMS_CHAT_LIST_WIDTH: f32 = 220.0;
 const WORKSPACE_SNAPSHOT_LIMIT: usize = 10;
-const WORKSPACE_ENTRY_PREVIEW_LIMIT: usize = 80;
 
 static DIAGNOSTICS_PILE_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 static DIAGNOSTICS_HEADLESS: AtomicBool = AtomicBool::new(false);
@@ -865,7 +864,7 @@ fn build_snapshot(
     let workspace_latest_id = workspace_snapshots.first().map(|row| row.id);
     let workspace_preview_id = workspace_selected_snapshot.or(workspace_latest_id);
     let workspace_entries =
-        collect_workspace_entries_preview(&workspace_data, ws, workspace_preview_id);
+        collect_workspace_entries(&workspace_data, ws, workspace_preview_id);
     let labels = collect_labels(&exec_data, ws);
 
     DashboardSnapshot {
@@ -1543,7 +1542,7 @@ fn collect_workspace_snapshots(data: &TribleSet, ws: &mut Workspace<Pile>) -> Ve
     rows
 }
 
-fn collect_workspace_entries_preview(
+fn collect_workspace_entries(
     data: &TribleSet,
     ws: &mut Workspace<Pile>,
     snapshot_id: Option<Id>,
@@ -1628,7 +1627,6 @@ fn collect_workspace_entries_preview(
     }
 
     rows.sort_by(|a, b| a.path.cmp(&b.path));
-    rows.truncate(WORKSPACE_ENTRY_PREVIEW_LIMIT);
     rows
 }
 
@@ -2595,12 +2593,12 @@ fn render_workspace(
                 let label = row.label.as_deref().unwrap_or("-");
                 let root = row.root_path.as_deref().unwrap_or(".");
                 ui.label(format!(
-                    "Entries (preview) for {age} {}  {label}  {root}:",
+                    "Entries for {age} {}  {label}  {root}:",
                     id_prefix(row.id)
                 ));
             } else {
                 ui.label(format!(
-                    "Entries (preview) for {}:",
+                    "Entries for {}:",
                     id_prefix(snapshot_id)
                 ));
                 ui.small("Selected snapshot is not in the list (older than limit).");
@@ -2619,11 +2617,6 @@ fn render_workspace(
                 }
             }
 
-            if let Some(row) = selected_row {
-                if row.entry_count > entries.len() {
-                    ui.small(format!("... and {} more", row.entry_count - entries.len()));
-                }
-            }
         }
     }
 }
