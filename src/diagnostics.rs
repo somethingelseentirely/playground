@@ -178,6 +178,7 @@ struct DashboardState {
     local_send_notice: Option<String>,
     local_read_error: Option<String>,
     config_reveal_secrets: bool,
+    config_last_applied_id: Option<Id>,
     teams_selected_chat: Option<Id>,
     workspace_selected_snapshot: Option<Id>,
 }
@@ -205,6 +206,7 @@ impl Default for DashboardState {
             local_send_notice: None,
             local_read_error: None,
             config_reveal_secrets: false,
+            config_last_applied_id: None,
             teams_selected_chat: None,
             workspace_selected_snapshot: None,
         }
@@ -299,6 +301,11 @@ struct AgentConfigRow {
     persona_id: Option<Id>,
     branch: Option<String>,
     branch_id: Option<Id>,
+    exec_branch_id: Option<Id>,
+    local_messages_branch_id: Option<Id>,
+    relations_branch_id: Option<Id>,
+    teams_branch_id: Option<Id>,
+    workspace_branch_id: Option<Id>,
     author: Option<String>,
     author_role: Option<String>,
     poll_ms: Option<u64>,
@@ -761,7 +768,37 @@ fn refresh_snapshot(state: &mut DashboardState) {
         }
     };
     let result = load_snapshot(repo, &config, previous, workspace_selected);
+    if let Ok(snapshot) = &result {
+        if let Some(agent_config) = snapshot.agent_config.as_ref() {
+            apply_branch_defaults_from_agent_config(state, agent_config);
+        }
+    }
     state.snapshot = Some(result);
+}
+
+fn apply_branch_defaults_from_agent_config(state: &mut DashboardState, config: &AgentConfigRow) {
+    if state.config_last_applied_id == Some(config.id) {
+        return;
+    }
+
+    // Use the config entry as a stable "defaults bundle" for diagnostics selectors.
+    if let Some(id) = config.exec_branch_id.or(config.branch_id) {
+        state.config.exec_branches = format!("{id:x}");
+    }
+    if let Some(id) = config.local_messages_branch_id {
+        state.config.local_message_branches = format!("{id:x}");
+    }
+    if let Some(id) = config.relations_branch_id {
+        state.config.relations_branches = format!("{id:x}");
+    }
+    if let Some(id) = config.teams_branch_id {
+        state.config.teams_branches = format!("{id:x}");
+    }
+    if let Some(id) = config.workspace_branch_id {
+        state.config.workspace_branches = format!("{id:x}");
+    }
+
+    state.config_last_applied_id = Some(config.id);
 }
 
 fn load_snapshot(
@@ -1185,6 +1222,14 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
     let persona_id = load_optional_id_attr(data, config_id, playground_config::persona_id);
     let branch = load_optional_string_attr(data, ws, config_id, playground_config::branch);
     let branch_id = load_optional_id_attr(data, config_id, playground_config::branch_id);
+    let exec_branch_id = load_optional_id_attr(data, config_id, playground_config::exec_branch_id);
+    let local_messages_branch_id =
+        load_optional_id_attr(data, config_id, playground_config::local_messages_branch_id);
+    let relations_branch_id =
+        load_optional_id_attr(data, config_id, playground_config::relations_branch_id);
+    let teams_branch_id = load_optional_id_attr(data, config_id, playground_config::teams_branch_id);
+    let workspace_branch_id =
+        load_optional_id_attr(data, config_id, playground_config::workspace_branch_id);
     let author = load_optional_string_attr(data, ws, config_id, playground_config::author);
     let author_role = load_optional_string_attr(data, ws, config_id, playground_config::author_role);
     let poll_ms = load_optional_u64_attr(data, config_id, playground_config::poll_ms);
@@ -1213,6 +1258,11 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         persona_id,
         branch,
         branch_id,
+        exec_branch_id,
+        local_messages_branch_id,
+        relations_branch_id,
+        teams_branch_id,
+        workspace_branch_id,
         author,
         author_role,
         poll_ms,
@@ -2581,6 +2631,51 @@ fn render_agent_config(
             );
             ui.end_row();
 
+            ui.label("exec_branch_id");
+            ui.monospace(
+                config
+                    .exec_branch_id
+                    .map(|id| format!("{id:x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("local_messages_branch_id");
+            ui.monospace(
+                config
+                    .local_messages_branch_id
+                    .map(|id| format!("{id:x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("relations_branch_id");
+            ui.monospace(
+                config
+                    .relations_branch_id
+                    .map(|id| format!("{id:x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("teams_branch_id");
+            ui.monospace(
+                config
+                    .teams_branch_id
+                    .map(|id| format!("{id:x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("workspace_branch_id");
+            ui.monospace(
+                config
+                    .workspace_branch_id
+                    .map(|id| format!("{id:x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
             ui.label("author");
             ui.label(config.author.as_deref().unwrap_or("-"));
             ui.end_row();
@@ -2658,8 +2753,11 @@ fn render_agent_config(
 
     if let Some(prompt) = config.system_prompt.as_deref() {
         ui.add_space(8.0);
-        egui::CollapsingHeader::new(egui::RichText::new("System prompt").monospace())
-            .id_salt("agent_config_system_prompt")
+        ui.label(egui::RichText::new("System prompt").monospace());
+        egui::Frame::NONE
+            .fill(egui::Color32::from_gray(55))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.add(
                     egui::Label::new(egui::RichText::new(prompt).monospace())
