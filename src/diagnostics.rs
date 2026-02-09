@@ -2604,18 +2604,8 @@ fn render_workspace(
                 ui.small("Selected snapshot is not in the list (older than limit).");
             }
 
-            for entry in entries {
-                let kind = workspace_kind_tag(entry.kind);
-                if let Some(target) = entry.link_target.as_deref() {
-                    ui.monospace(format!(
-                        "{kind} {} -> {}",
-                        entry.path,
-                        truncate_single_line(target, 80)
-                    ));
-                } else {
-                    ui.monospace(format!("{kind} {}", entry.path));
-                }
-            }
+            let tree = build_workspace_tree(entries);
+            render_workspace_tree(ui, "", &tree, true);
 
         }
     }
@@ -2628,6 +2618,118 @@ fn workspace_kind_tag(kind: WorkspaceEntryKind) -> &'static str {
         WorkspaceEntryKind::Symlink => "L",
         WorkspaceEntryKind::Unknown => "?",
     }
+}
+
+#[derive(Default)]
+struct WorkspaceTreeNode {
+    dirs: std::collections::BTreeMap<String, WorkspaceTreeNode>,
+    files: Vec<WorkspaceTreeLeaf>,
+}
+
+#[derive(Clone)]
+struct WorkspaceTreeLeaf {
+    name: String,
+    kind: WorkspaceEntryKind,
+    link_target: Option<String>,
+}
+
+impl WorkspaceTreeNode {
+    fn sort_recursive(&mut self) {
+        self.files.sort_by(|a, b| a.name.cmp(&b.name));
+        for child in self.dirs.values_mut() {
+            child.sort_recursive();
+        }
+    }
+}
+
+fn build_workspace_tree(entries: &[WorkspaceEntryRow]) -> WorkspaceTreeNode {
+    let mut root = WorkspaceTreeNode::default();
+
+    for entry in entries {
+        let parts: Vec<&str> = entry.path.split('/').filter(|part| !part.is_empty()).collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let mut node = &mut root;
+        for dir in &parts[..parts.len().saturating_sub(1)] {
+            node = node.dirs.entry((*dir).to_string()).or_default();
+        }
+
+        let name = parts[parts.len() - 1].to_string();
+        match entry.kind {
+            WorkspaceEntryKind::Dir => {
+                node.dirs.entry(name).or_default();
+            }
+            kind => {
+                node.files.push(WorkspaceTreeLeaf {
+                    name,
+                    kind,
+                    link_target: entry.link_target.clone(),
+                });
+            }
+        }
+    }
+
+    root.sort_recursive();
+    root
+}
+
+fn render_workspace_tree(
+    ui: &mut egui::Ui,
+    base_path: &str,
+    node: &WorkspaceTreeNode,
+    open_one_root: bool,
+) {
+    let default_open_root = open_one_root && base_path.is_empty() && node.dirs.len() == 1;
+    for (name, child) in &node.dirs {
+        render_workspace_dir(ui, base_path, name, child, default_open_root);
+    }
+
+    for file in &node.files {
+        let kind = workspace_kind_tag(file.kind);
+        if let Some(target) = file.link_target.as_deref() {
+            ui.monospace(format!(
+                "{kind} {} -> {}",
+                file.name,
+                truncate_single_line(target, 80)
+            ));
+        } else {
+            ui.monospace(format!("{kind} {}", file.name));
+        }
+    }
+}
+
+fn render_workspace_dir(
+    ui: &mut egui::Ui,
+    base_path: &str,
+    name: &str,
+    child: &WorkspaceTreeNode,
+    default_open: bool,
+) {
+    let mut display = name.to_string();
+    let mut full_path = if base_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{base_path}/{name}")
+    };
+
+    let mut node = child;
+    while node.files.is_empty() && node.dirs.len() == 1 {
+        let (next_name, next_node) = node.dirs.iter().next().expect("len == 1");
+        display.push('/');
+        display.push_str(next_name);
+        full_path.push('/');
+        full_path.push_str(next_name);
+        node = next_node;
+    }
+
+    egui::CollapsingHeader::new(egui::RichText::new(format!("D {display}")).monospace())
+        .id_salt(format!("workspace_dir::{full_path}"))
+        .default_open(default_open)
+        .show(ui, |ui| {
+            render_workspace_tree(ui, &full_path, node, false);
+        });
 }
 
 fn parse_response_json(raw: &str) -> Option<JsonValue> {
