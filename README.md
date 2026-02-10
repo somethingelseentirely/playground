@@ -9,7 +9,7 @@ cargo run --manifest-path playground/Cargo.toml -- diagnostics
 ```
 
 The dashboard defaults to `./personas/<instance>/pile/self.pile` (instance defaults to `playground`)
-and branch `main`; change the path or branch in the UI if
+and branch `cognition`; change the path or branch in the UI if
 your VM writes elsewhere.
 
 Prefill the dashboard with a pile path:

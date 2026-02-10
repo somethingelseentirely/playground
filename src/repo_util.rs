@@ -11,7 +11,6 @@ use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle};
 use triblespace::prelude::*;
 
-use crate::branch_util::find_branch_id;
 use crate::config::Config;
 pub(crate) use crate::repo_ops::push_workspace;
 use crate::schema::build_playground_metadata;
@@ -24,18 +23,12 @@ pub(crate) fn init_repo(config: &Config) -> Result<(Repository<Pile>, Id)> {
     pile.restore().context("restore pile")?;
 
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
-    let branch_id = if let Some(branch_id) = config.branch_id {
-        repo.pull(branch_id)
-            .map(|_| ())
-            .map_err(|err| anyhow!("pull branch {branch_id:x}: {err:?}"))?;
-        branch_id
-    } else {
-        find_branch_id(repo.storage_mut(), config.branch.as_str())?.unwrap_or_else(|| {
-            *repo
-                .create_branch(config.branch.as_str(), None)
-                .expect("create branch")
-        })
-    };
+    let branch_id = config
+        .branch_id
+        .ok_or_else(|| anyhow!("config is missing branch_id; run `playground config set branch-id <ID>`"))?;
+    repo.pull(branch_id)
+        .map(|_| ())
+        .map_err(|err| anyhow!("pull branch {branch_id:x}: {err:?}"))?;
 
     Ok((repo, branch_id))
 }

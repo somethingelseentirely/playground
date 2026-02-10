@@ -19,8 +19,9 @@ const DEFAULT_MODEL: &str = "gpt-oss:120b";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1/responses";
 const DEFAULT_STREAM: bool = false;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a terminal-based agent. Respond with exactly one shell command per turn. You can include an optional leading comment block for context. Faculties are executable helper scripts in ./faculties; run them with no arguments to see usage and prefer them over ad-hoc commands when applicable.";
-const DEFAULT_BRANCH: &str = "main";
-const DEFAULT_EXEC_BRANCH: &str = "main";
+// The branch that carries the core cognition loop + exec/LLM request state.
+const DEFAULT_BRANCH: &str = "cognition";
+const DEFAULT_EXEC_BRANCH: &str = "cognition";
 const DEFAULT_LOCAL_MESSAGES_BRANCH: &str = "local-messages";
 const DEFAULT_RELATIONS_BRANCH: &str = "relations";
 const DEFAULT_TEAMS_BRANCH: &str = "teams";
