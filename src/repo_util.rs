@@ -23,14 +23,18 @@ pub(crate) fn init_repo(config: &Config) -> Result<(Repository<Pile>, Id)> {
     pile.restore().context("restore pile")?;
 
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
-    let branch_id = config
-        .branch_id
-        .ok_or_else(|| anyhow!("config is missing branch_id; run `playground config set branch-id <ID>`"))?;
+    let branch_id = config.branch_id.ok_or_else(|| {
+        anyhow!("config is missing branch_id; run `playground config set branch-id <ID>`")
+    })?;
     repo.pull(branch_id)
         .map(|_| ())
         .map_err(|err| anyhow!("pull branch {branch_id:x}: {err:?}"))?;
 
     Ok((repo, branch_id))
+}
+
+pub(crate) fn close_repo(repo: Repository<Pile>) -> Result<()> {
+    repo.into_storage().close().context("close pile")
 }
 
 pub(crate) fn seed_metadata(repo: &mut Repository<Pile>) -> Result<()> {

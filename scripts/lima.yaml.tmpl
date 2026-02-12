@@ -33,6 +33,8 @@ provision:
       echo "[playground] system provision start"
       apt-get update
       apt-get install -y --no-install-recommends ca-certificates curl build-essential
+      ln -sfn __PILE_PATH__ /self.pile
+      ln -sfn /self.pile __VM_ROOT__/self.pile
       cat >/etc/systemd/system/playground-exec.service <<'SERVICE'
       [Unit]
       Description=Playground Exec Worker
@@ -41,8 +43,8 @@ provision:
       [Service]
       User=__VM_USER__
       Group=__VM_USER__
-      WorkingDirectory=/opt/playground
-      ExecStart=/bin/bash -lc 'source $HOME/.cargo/env >/dev/null 2>&1 || true; CARGO_TARGET_DIR=/workspace/target cargo run --manifest-path /opt/playground/Cargo.toml --no-default-features -- exec --pile __PILE_PATH__'
+      WorkingDirectory=__VM_ROOT__
+      ExecStart=/bin/bash -lc 'source $HOME/.cargo/env >/dev/null 2>&1 || true; CARGO_TARGET_DIR=__VM_ROOT__/target cargo run --manifest-path /opt/playground/Cargo.toml --no-default-features -- exec --pile /self.pile'
       Restart=always
       RestartSec=2
 
@@ -60,5 +62,11 @@ provision:
       if [ ! -x "$HOME/.cargo/bin/rustc" ]; then
         echo "[playground] installing rustup"
         curl https://sh.rustup.rs -sSf | sh -s -- -y
+      fi
+      source "$HOME/.cargo/env" >/dev/null 2>&1 || true
+      rustup target add wasm32-unknown-unknown
+      if ! command -v rust-script >/dev/null 2>&1; then
+        echo "[playground] installing rust-script"
+        cargo install --locked rust-script
       fi
       echo "[playground] user provision done"

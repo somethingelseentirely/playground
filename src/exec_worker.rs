@@ -19,7 +19,9 @@ use triblespace::prelude::*;
 
 use crate::branch_util::ensure_branch_id;
 use crate::config::Config;
-use crate::repo_util::{ensure_worker_name, init_repo, load_text, push_workspace, seed_metadata};
+use crate::repo_util::{
+    close_repo, ensure_worker_name, init_repo, load_text, push_workspace, seed_metadata,
+};
 use crate::schema::playground_exec;
 use crate::time_util::{epoch_interval, interval_key, now_epoch};
 use crate::workspace_snapshot::{DEFAULT_WORKSPACE_BRANCH, restore_snapshot};
@@ -58,103 +60,114 @@ pub(crate) fn run_exec_loop(
         .map(|path| path.to_string_lossy().to_string());
 
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
-    seed_metadata(&mut repo)?;
-    let label = format!("exec-{}", id_prefix(worker_id));
-    ensure_worker_name(&mut repo, branch_id, worker_id, &label)?;
-    maybe_bootstrap_workspace(&mut repo)?;
+    let result = (|| -> Result<()> {
+        seed_metadata(&mut repo)?;
+        let label = format!("exec-{}", id_prefix(worker_id));
+        ensure_worker_name(&mut repo, branch_id, worker_id, &label)?;
+        maybe_bootstrap_workspace(&mut repo)?;
 
-    loop {
-        if stop_requested(&stop) {
-            break;
+        loop {
+            if stop_requested(&stop) {
+                break;
+            }
+
+            let mut ws = repo
+                .pull(branch_id)
+                .map_err(|err| anyhow!("pull workspace: {err:?}"))?;
+            let catalog = ws.checkout(..).context("checkout workspace")?;
+            let Some(request) = next_request(&catalog, worker_id) else {
+                sleep(Duration::from_millis(poll_ms));
+                continue;
+            };
+
+            if stop_requested(&stop) {
+                break;
+            }
+
+            let command = load_text(&mut ws, request.command).context("load command")?;
+            let cwd = match request.cwd {
+                Some(handle) => Some(load_text(&mut ws, handle).context("load cwd")?),
+                None => default_cwd.clone(),
+            };
+            let stdin = load_stdin(&mut ws, &request).context("load stdin")?;
+            let attempt: u64 = 1;
+
+            let started_at = epoch_interval(now_epoch());
+            let in_progress_id = ufoid();
+            let mut change = TribleSet::new();
+            change += entity! { &in_progress_id @
+                playground_exec::kind: playground_exec::kind_in_progress,
+                playground_exec::about_request: request.id,
+                playground_exec::worker: worker_id,
+                playground_exec::started_at: started_at,
+                playground_exec::attempt: attempt,
+            };
+            ws.commit(change, None, Some("playground_exec in_progress"));
+            push_workspace(&mut repo, &mut ws).context("push in_progress")?;
+
+            let started = Instant::now();
+            let output = execute_command(&command, cwd.as_deref(), stdin);
+            let ExecOutput {
+                stdout,
+                stderr,
+                exit_code,
+                stdout_text,
+                stderr_text,
+                error,
+            } = output;
+            let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let finished_at = epoch_interval(now_epoch());
+
+            let result_id = ufoid();
+            let mut change = TribleSet::new();
+            change += entity! { &result_id @
+                playground_exec::kind: playground_exec::kind_command_result,
+                playground_exec::about_request: request.id,
+                playground_exec::finished_at: finished_at,
+                playground_exec::attempt: attempt,
+                playground_exec::duration_ms: duration_ms,
+            };
+            let stdout_handle = ws.put::<UnknownBlob, _>(Bytes::from_source(stdout));
+            let stderr_handle = ws.put::<UnknownBlob, _>(Bytes::from_source(stderr));
+            change += entity! { &result_id @
+                playground_exec::stdout: stdout_handle,
+                playground_exec::stderr: stderr_handle,
+            };
+
+            if let Some(exit_code) = exit_code.and_then(|code| u64::try_from(code).ok()) {
+                change += entity! { &result_id @ playground_exec::exit_code: exit_code };
+            }
+
+            if let Some(stdout_text) = stdout_text {
+                let handle = ws.put(stdout_text);
+                change += entity! { &result_id @ playground_exec::stdout_text: handle };
+            }
+
+            if let Some(stderr_text) = stderr_text {
+                let handle = ws.put(stderr_text);
+                change += entity! { &result_id @ playground_exec::stderr_text: handle };
+            }
+
+            if let Some(error) = error {
+                let handle = ws.put(error);
+                change += entity! { &result_id @ playground_exec::error: handle };
+            }
+
+            ws.commit(change, None, Some("playground_exec result"));
+            push_workspace(&mut repo, &mut ws).context("push result")?;
         }
 
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull workspace: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout workspace")?;
-        let Some(request) = next_request(&catalog) else {
-            sleep(Duration::from_millis(poll_ms));
-            continue;
-        };
+        Ok(())
+    })();
 
-        if stop_requested(&stop) {
-            break;
+    if let Err(err) = close_repo(repo) {
+        if result.is_ok() {
+            return Err(err);
         }
-
-        let command = load_text(&mut ws, request.command).context("load command")?;
-        let cwd = match request.cwd {
-            Some(handle) => Some(load_text(&mut ws, handle).context("load cwd")?),
-            None => default_cwd.clone(),
-        };
-        let stdin = load_stdin(&mut ws, &request).context("load stdin")?;
-        let attempt: u64 = 1;
-
-        let started_at = epoch_interval(now_epoch());
-        let in_progress_id = ufoid();
-        let mut change = TribleSet::new();
-        change += entity! { &in_progress_id @
-            playground_exec::kind: playground_exec::kind_in_progress,
-            playground_exec::about_request: request.id,
-            playground_exec::worker: worker_id,
-            playground_exec::started_at: started_at,
-            playground_exec::attempt: attempt,
-        };
-        ws.commit(change, None, Some("playground_exec in_progress"));
-        push_workspace(&mut repo, &mut ws).context("push in_progress")?;
-
-        let started = Instant::now();
-        let output = execute_command(&command, cwd.as_deref(), stdin);
-        let ExecOutput {
-            stdout,
-            stderr,
-            exit_code,
-            stdout_text,
-            stderr_text,
-            error,
-        } = output;
-        let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        let finished_at = epoch_interval(now_epoch());
-
-        let result_id = ufoid();
-        let mut change = TribleSet::new();
-        change += entity! { &result_id @
-            playground_exec::kind: playground_exec::kind_command_result,
-            playground_exec::about_request: request.id,
-            playground_exec::finished_at: finished_at,
-            playground_exec::attempt: attempt,
-            playground_exec::duration_ms: duration_ms,
-        };
-        let stdout_handle = ws.put::<UnknownBlob, _>(Bytes::from_source(stdout));
-        let stderr_handle = ws.put::<UnknownBlob, _>(Bytes::from_source(stderr));
-        change += entity! { &result_id @
-            playground_exec::stdout: stdout_handle,
-            playground_exec::stderr: stderr_handle,
-        };
-
-        if let Some(exit_code) = exit_code.and_then(|code| u64::try_from(code).ok()) {
-            change += entity! { &result_id @ playground_exec::exit_code: exit_code };
-        }
-
-        if let Some(stdout_text) = stdout_text {
-            let handle = ws.put(stdout_text);
-            change += entity! { &result_id @ playground_exec::stdout_text: handle };
-        }
-
-        if let Some(stderr_text) = stderr_text {
-            let handle = ws.put(stderr_text);
-            change += entity! { &result_id @ playground_exec::stderr_text: handle };
-        }
-
-        if let Some(error) = error {
-            let handle = ws.put(error);
-            change += entity! { &result_id @ playground_exec::error: handle };
-        }
-
-        ws.commit(change, None, Some("playground_exec result"));
-        push_workspace(&mut repo, &mut ws).context("push result")?;
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
     }
 
-    Ok(())
+    result
 }
 
 fn stop_requested(stop: &Option<Arc<AtomicBool>>) -> bool {
@@ -278,7 +291,7 @@ fn env_path(key: &str) -> Option<PathBuf> {
     env_string(key).map(PathBuf::from)
 }
 
-fn next_request(catalog: &TribleSet) -> Option<CommandRequest> {
+fn next_request(catalog: &TribleSet, worker_id: Id) -> Option<CommandRequest> {
     let mut requests: HashMap<Id, CommandRequest> = HashMap::new();
     for (request_id, command) in find!(
         (request_id: Id, command: Value<Handle<Blake3, LongString>>),
@@ -362,14 +375,23 @@ fn next_request(catalog: &TribleSet) -> Option<CommandRequest> {
     }
 
     let mut in_progress = HashSet::new();
-    for (request_id,) in find!(
-        (request_id: Id),
+    for (request_id, in_progress_worker_id) in find!(
+        (
+            request_id: Id,
+            in_progress_worker_id: Id
+        ),
         pattern!(catalog, [{
             _?event @
             playground_exec::kind: playground_exec::kind_in_progress,
             playground_exec::about_request: ?request_id,
+            playground_exec::worker: ?in_progress_worker_id,
         }])
     ) {
+        // A different worker id indicates another process/run; treat its in-progress marker
+        // as reclaimable for this worker and rely on result facts to dedupe completed work.
+        if in_progress_worker_id != worker_id {
+            continue;
+        }
         in_progress.insert(request_id);
     }
 

@@ -28,6 +28,7 @@ use GORBIE::NotebookConfig;
 use GORBIE::NotebookCtx;
 use GORBIE::cards::{DEFAULT_CARD_PADDING, with_padding};
 use GORBIE::md;
+use GORBIE::themes::colorhash;
 use GORBIE::widgets::{Button, TextField};
 
 use crate::schema::openai_responses;
@@ -84,13 +85,15 @@ mod compass {
 
 type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 const EXEC_SCROLL_HEIGHT: f32 = 260.0;
-const SUMMARY_SCROLL_HEIGHT: f32 = 220.0;
+const COGNITION_TRAIL_HEIGHT: f32 = 320.0;
 const LOCAL_MESSAGE_SCROLL_HEIGHT: f32 = 780.0;
 const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
 const RELATIONS_SCROLL_HEIGHT: f32 = 260.0;
 const TEAMS_SCROLL_HEIGHT: f32 = 520.0;
 const TEAMS_CHAT_LIST_WIDTH: f32 = 220.0;
 const WORKSPACE_SNAPSHOT_LIMIT: usize = 10;
+const EXEC_RECENT_LIMIT: usize = 8;
+const COGNITION_TRAIL_LIMIT: usize = 20;
 
 static DIAGNOSTICS_PILE_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 static DIAGNOSTICS_HEADLESS: AtomicBool = AtomicBool::new(false);
@@ -282,7 +285,16 @@ struct LocalMessageRow {
     to_id: Id,
     body: String,
     read_by_me: bool,
-    read_by_peer: bool,
+    readers: Vec<Id>,
+}
+
+#[derive(Debug, Clone)]
+enum LocalMessageStatus {
+    Unread,
+    Read,
+    Sent,
+    ReadBy(String),
+    Other,
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +317,26 @@ struct TeamsChatRow {
 struct ReasoningSummaryRow {
     created_at: Option<i128>,
     summary: String,
+}
+
+#[derive(Debug, Clone)]
+enum CognitionTrailEvent {
+    Command {
+        command: String,
+        status: ExecStatus,
+        exit_code: Option<u64>,
+        worker: Option<Id>,
+        error: Option<String>,
+    },
+    Reasoning {
+        summary: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct CognitionTrailRow {
+    at: Option<i128>,
+    event: CognitionTrailEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -353,6 +385,7 @@ struct AgentConfigRow {
     persona_id: Option<Id>,
     branch: Option<String>,
     branch_id: Option<Id>,
+    compass_branch_id: Option<Id>,
     exec_branch_id: Option<Id>,
     local_messages_branch_id: Option<Id>,
     relations_branch_id: Option<Id>,
@@ -381,7 +414,7 @@ struct DashboardSnapshot {
     exec_error: Option<String>,
     agent_config: Option<AgentConfigRow>,
     agent_config_error: Option<String>,
-    reasoning_summaries: Vec<ReasoningSummaryRow>,
+    cognition_trail: Vec<CognitionTrailRow>,
     compass_rows: Vec<(CompassTaskRow, usize)>,
     compass_notes: HashMap<Id, Vec<CompassNoteRow>>,
     compass_error: Option<String>,
@@ -662,7 +695,13 @@ _Live view of the agent pile, exec queue, and message activity._"
                 ui.colored_label(egui::Color32::RED, err);
             } else {
                 render_exec_summary(ui, &snapshot.exec_summary);
-                render_exec_rows(ui, snapshot.now_key, &snapshot.exec_rows, &snapshot.labels);
+                render_exec_rows(
+                    ui,
+                    snapshot.now_key,
+                    &snapshot.exec_rows,
+                    &snapshot.labels,
+                    EXEC_RECENT_LIMIT,
+                );
             }
         });
     });
@@ -670,14 +709,19 @@ _Live view of the agent pile, exec queue, and message activity._"
     nb.view(move |ui| {
         let state = dashboard.read(ui);
         with_padding(ui, padding, |ui| {
-            ui.heading("Reasoning summaries");
+            ui.heading("Cognition trail");
             let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
                 return;
             };
-            if snapshot.reasoning_summaries.is_empty() {
-                ui.label("No summaries yet.");
+            if snapshot.cognition_trail.is_empty() {
+                ui.label("No cognition events yet.");
             } else {
-                render_reasoning_summaries(ui, snapshot.now_key, &snapshot.reasoning_summaries);
+                render_cognition_trail(
+                    ui,
+                    snapshot.now_key,
+                    &snapshot.cognition_trail,
+                    &snapshot.labels,
+                );
             }
         });
     });
@@ -706,7 +750,7 @@ _Live view of the agent pile, exec queue, and message activity._"
                     snapshot.now_key,
                     &snapshot.local_message_rows,
                     snapshot.local_me_id,
-                    snapshot.local_peer_id,
+                    &snapshot.relations_labels,
                 );
             }
             render_local_composer(ui, &mut state, &snapshot.branches, &snapshot);
@@ -872,6 +916,9 @@ fn apply_branch_defaults_from_agent_config(state: &mut DashboardState, config: &
     if let Some(id) = config.exec_branch_id.or(config.branch_id) {
         state.config.exec_branches = format!("{id:x}");
     }
+    if let Some(id) = config.compass_branch_id {
+        state.config.compass_branches = format!("{id:x}");
+    }
     if let Some(id) = config.local_messages_branch_id {
         state.config.local_message_branches = format!("{id:x}");
     }
@@ -994,7 +1041,7 @@ fn load_snapshot(
             exec_error,
             agent_config: None,
             agent_config_error,
-            reasoning_summaries: Vec::new(),
+            cognition_trail: Vec::new(),
             compass_rows: Vec::new(),
             compass_notes: HashMap::new(),
             compass_error,
@@ -1071,9 +1118,11 @@ fn build_snapshot(
     let exec_rows = collect_exec_rows(&exec_data, ws);
     let exec_summary = summarize_exec(&exec_rows);
     let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
+    let cognition_trail =
+        build_cognition_trail(&exec_rows, &reasoning_summaries, COGNITION_TRAIL_LIMIT);
     let compass_rows = collect_compass_rows(&compass_data, ws);
     let compass_notes = collect_compass_notes(&compass_data, ws);
-    let local_message_rows = collect_local_messages(&local_data, ws, local_me_id, local_peer_id);
+    let local_message_rows = collect_local_messages(&local_data, ws, local_me_id);
     let (teams_messages, teams_chats) = collect_teams_messages(&teams_data, ws);
     let workspace_snapshots = collect_workspace_snapshots(&workspace_data, ws);
     let workspace_latest_id = workspace_snapshots.first().map(|row| row.id);
@@ -1090,7 +1139,7 @@ fn build_snapshot(
         exec_error,
         agent_config,
         agent_config_error,
-        reasoning_summaries,
+        cognition_trail,
         compass_rows,
         compass_notes,
         compass_error,
@@ -1327,6 +1376,8 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
     let persona_id = load_optional_id_attr(data, config_id, playground_config::persona_id);
     let branch = load_optional_string_attr(data, ws, config_id, playground_config::branch);
     let branch_id = load_optional_id_attr(data, config_id, playground_config::branch_id);
+    let compass_branch_id =
+        load_optional_id_attr(data, config_id, playground_config::compass_branch_id);
     let exec_branch_id = load_optional_id_attr(data, config_id, playground_config::exec_branch_id);
     let local_messages_branch_id =
         load_optional_id_attr(data, config_id, playground_config::local_messages_branch_id);
@@ -1362,6 +1413,7 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         persona_id,
         branch,
         branch_id,
+        compass_branch_id,
         exec_branch_id,
         local_messages_branch_id,
         relations_branch_id,
@@ -1477,7 +1529,6 @@ fn collect_local_messages(
     data: &TribleSet,
     ws: &mut Workspace<Pile>,
     me_id: Option<Id>,
-    peer_id: Option<Id>,
 ) -> Vec<LocalMessageRow> {
     let mut rows = Vec::new();
     for (message_id, from, to, body_handle, created_at) in find!(
@@ -1505,7 +1556,7 @@ fn collect_local_messages(
             to_id: to,
             body,
             read_by_me: false,
-            read_by_peer: false,
+            readers: Vec::new(),
         });
     }
 
@@ -1531,17 +1582,16 @@ fn collect_local_messages(
 
     for row in &mut rows {
         if let Some(readers) = reads.get(&row.id) {
+            let mut reader_list: Vec<Id> = readers.iter().copied().collect();
+            reader_list.sort_by_key(|id| format!("{id:x}"));
+            row.readers = reader_list;
             if let Some(me_id) = me_id {
                 row.read_by_me = readers.contains(&me_id);
-            }
-            if let Some(peer_id) = peer_id {
-                row.read_by_peer = readers.contains(&peer_id);
             }
         }
     }
 
     rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
-    rows.reverse();
     rows
 }
 
@@ -2016,6 +2066,41 @@ fn collect_reasoning_summaries(
     rows
 }
 
+fn build_cognition_trail(
+    exec_rows: &[ExecRow],
+    reasoning_rows: &[ReasoningSummaryRow],
+    limit: usize,
+) -> Vec<CognitionTrailRow> {
+    let mut rows = Vec::new();
+
+    for row in exec_rows {
+        rows.push(CognitionTrailRow {
+            at: row.finished_at.or(row.started_at).or(row.requested_at),
+            event: CognitionTrailEvent::Command {
+                command: row.command.clone(),
+                status: row.status,
+                exit_code: row.exit_code,
+                worker: row.worker,
+                error: row.error.clone(),
+            },
+        });
+    }
+
+    for row in reasoning_rows {
+        rows.push(CognitionTrailRow {
+            at: row.created_at,
+            event: CognitionTrailEvent::Reasoning {
+                summary: row.summary.clone(),
+            },
+        });
+    }
+
+    rows.sort_by_key(|row| row.at.unwrap_or(i128::MIN));
+    rows.reverse();
+    rows.truncate(limit);
+    rows
+}
+
 fn collect_compass_rows(
     data: &TribleSet,
     ws: &mut Workspace<Pile>,
@@ -2451,31 +2536,28 @@ fn render_teams_conversations(
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.set_min_width(TEAMS_CHAT_LIST_WIDTH);
+            ui.set_min_height(TEAMS_SCROLL_HEIGHT);
             ui.label("Chats");
-            egui::ScrollArea::vertical()
-                .id_salt("teams_chat_list_scroll")
-                .max_height(TEAMS_SCROLL_HEIGHT)
-                .show(ui, |ui| {
-                    let all_selected = state.teams_selected_chat.is_none();
-                    if ui.selectable_label(all_selected, "All chats").clicked() {
-                        state.teams_selected_chat = None;
-                    }
-                    ui.add_space(6.0);
-                    for chat in chats {
-                        let selected = state.teams_selected_chat == Some(chat.id);
-                        let label = format!("{} ({})", chat.label, chat.message_count);
-                        if ui.selectable_label(selected, label).clicked() {
-                            state.teams_selected_chat = Some(chat.id);
-                        }
-                        ui.small(format_age(now_key, chat.last_at));
-                        ui.add_space(4.0);
-                    }
-                });
+            let all_selected = state.teams_selected_chat.is_none();
+            if ui.selectable_label(all_selected, "All chats").clicked() {
+                state.teams_selected_chat = None;
+            }
+            ui.add_space(6.0);
+            for chat in chats {
+                let selected = state.teams_selected_chat == Some(chat.id);
+                let label = format!("{} ({})", chat.label, chat.message_count);
+                if ui.selectable_label(selected, label).clicked() {
+                    state.teams_selected_chat = Some(chat.id);
+                }
+                ui.small(format_age(now_key, chat.last_at));
+                ui.add_space(4.0);
+            }
         });
 
         ui.add_space(12.0);
 
         ui.vertical(|ui| {
+            ui.set_min_height(TEAMS_SCROLL_HEIGHT);
             let selected_chat = state.teams_selected_chat;
             let title = match selected_chat {
                 Some(chat_id) => chats
@@ -2487,34 +2569,29 @@ fn render_teams_conversations(
             };
             ui.label(title);
 
-            egui::ScrollArea::vertical()
-                .id_salt("teams_message_scroll")
-                .max_height(TEAMS_SCROLL_HEIGHT)
-                .show(ui, |ui| {
-                    for row in messages {
-                        if let Some(chat_id) = selected_chat {
-                            if row.chat_id != chat_id {
-                                continue;
-                            }
-                        }
-                        let author = row.author_name.as_deref().unwrap_or("<unknown>");
-                        let age = format_age(now_key, row.created_at);
-                        let chat_label = chats
-                            .iter()
-                            .find(|chat| chat.id == row.chat_id)
-                            .map(|chat| chat.label.as_str())
-                            .unwrap_or("<chat>");
-
-                        let meta = if selected_chat.is_some() {
-                            format!("{author} · {age}")
-                        } else {
-                            format!("{chat_label} · {author} · {age}")
-                        };
-                        ui.small(meta);
-                        ui.label(&row.content);
-                        ui.add_space(8.0);
+            for row in messages {
+                if let Some(chat_id) = selected_chat {
+                    if row.chat_id != chat_id {
+                        continue;
                     }
-                });
+                }
+                let author = row.author_name.as_deref().unwrap_or("<unknown>");
+                let age = format_age(now_key, row.created_at);
+                let chat_label = chats
+                    .iter()
+                    .find(|chat| chat.id == row.chat_id)
+                    .map(|chat| chat.label.as_str())
+                    .unwrap_or("<chat>");
+
+                let meta = if selected_chat.is_some() {
+                    format!("{author} · {age}")
+                } else {
+                    format!("{chat_label} · {author} · {age}")
+                };
+                ui.small(meta);
+                ui.label(&row.content);
+                ui.add_space(8.0);
+            }
         });
     });
 }
@@ -2957,6 +3034,15 @@ fn render_agent_config(
             );
             ui.end_row();
 
+            ui.label("compass_branch_id");
+            ui.monospace(
+                config
+                    .compass_branch_id
+                    .map(|id| format!("{id:x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
             ui.label("local_messages_branch_id");
             ui.monospace(
                 config
@@ -3118,62 +3204,92 @@ fn render_exec_rows(
     now_key: i128,
     rows: &[ExecRow],
     labels: &HashMap<Id, String>,
+    limit: usize,
 ) {
-    egui::ScrollArea::vertical()
-        .id_salt("exec_rows_scroll")
-        .max_height(EXEC_SCROLL_HEIGHT)
+    ui.set_min_height(EXEC_SCROLL_HEIGHT);
+    if rows.len() > limit {
+        ui.small(format!("Showing {limit} of {} commands.", rows.len()));
+    }
+    egui::Grid::new("exec_rows")
+        .striped(true)
+        .spacing(egui::Vec2::new(12.0, 6.0))
         .show(ui, |ui| {
-            egui::Grid::new("exec_rows")
-                .striped(true)
-                .spacing(egui::Vec2::new(12.0, 6.0))
-                .show(ui, |ui| {
-                    ui.label("Status");
-                    ui.label("Age");
-                    ui.label("Command");
-                    ui.label("Exit");
-                    ui.label("Worker");
+            ui.label("Status");
+            ui.label("Age");
+            ui.label("Command");
+            ui.label("Exit");
+            ui.label("Worker");
+            ui.end_row();
+
+            for row in rows.iter().take(limit) {
+                ui.label(status_label(row.status));
+                ui.label(format_age(now_key, row.requested_at));
+                ui.monospace(truncate_single_line(&row.command, 80));
+                ui.label(
+                    row.exit_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.label(
+                    row.worker
+                        .map(|id| format_id(labels, id))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.end_row();
+
+                if let Some(error) = &row.error {
+                    ui.label("");
+                    ui.label("error");
+                    ui.label(truncate_single_line(error, 120));
+                    ui.label("");
+                    ui.label("");
                     ui.end_row();
-
-                    for row in rows {
-                        ui.label(status_label(row.status));
-                        ui.label(format_age(now_key, row.requested_at));
-                        ui.monospace(truncate_single_line(&row.command, 80));
-                        ui.label(
-                            row.exit_code
-                                .map(|code| code.to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                        );
-                        ui.label(
-                            row.worker
-                                .map(|id| format_id(labels, id))
-                                .unwrap_or_else(|| "-".to_string()),
-                        );
-                        ui.end_row();
-
-                        if let Some(error) = &row.error {
-                            ui.label("");
-                            ui.label("error");
-                            ui.label(truncate_single_line(error, 120));
-                            ui.label("");
-                            ui.label("");
-                            ui.end_row();
-                        }
-                    }
-                });
+                }
+            }
         });
 }
 
-fn render_reasoning_summaries(ui: &mut egui::Ui, now_key: i128, rows: &[ReasoningSummaryRow]) {
-    egui::ScrollArea::vertical()
-        .id_salt("reasoning_summary_scroll")
-        .max_height(SUMMARY_SCROLL_HEIGHT)
-        .show(ui, |ui| {
-            for row in rows {
-                ui.small(format_age(now_key, row.created_at));
-                ui.label(&row.summary);
-                ui.add_space(8.0);
+fn render_cognition_trail(
+    ui: &mut egui::Ui,
+    now_key: i128,
+    rows: &[CognitionTrailRow],
+    labels: &HashMap<Id, String>,
+) {
+    ui.set_min_height(COGNITION_TRAIL_HEIGHT);
+    for row in rows {
+        match &row.event {
+            CognitionTrailEvent::Command {
+                command,
+                status,
+                exit_code,
+                worker,
+                error,
+            } => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(format_age(now_key, row.at));
+                    ui.label(status_label(*status));
+                    if let Some(code) = exit_code {
+                        ui.small(format!("exit:{code}"));
+                    }
+                    if let Some(worker_id) = worker {
+                        ui.small(format!("worker:{}", format_id(labels, *worker_id)));
+                    }
+                });
+                ui.monospace(truncate_single_line(command, 180));
+                if let Some(error) = error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, truncate_single_line(error, 180));
+                }
             }
-        });
+            CognitionTrailEvent::Reasoning { summary } => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(format_age(now_key, row.at));
+                    ui.label(egui::RichText::new("reasoning").color(egui::Color32::LIGHT_BLUE));
+                });
+                ui.add(egui::Label::new(summary).wrap_mode(egui::TextWrapMode::Wrap));
+            }
+        }
+        ui.add_space(8.0);
+    }
 }
 
 fn render_compass_swimlanes(
@@ -3466,51 +3582,131 @@ fn render_local_messages(
     now_key: i128,
     rows: &[LocalMessageRow],
     me_id: Option<Id>,
-    peer_id: Option<Id>,
+    labels: &HashMap<Id, String>,
 ) {
-    egui::ScrollArea::vertical()
-        .id_salt("local_messages_scroll")
-        .min_scrolled_height(LOCAL_MESSAGE_SCROLL_HEIGHT)
-        .max_height(LOCAL_MESSAGE_SCROLL_HEIGHT)
-        .show(ui, |ui| {
-            for row in rows {
-                let is_sender = me_id.map_or(false, |id| row.from_id == id);
-                let age = format_age(now_key, row.created_at);
-                let meta = if is_sender {
-                    if peer_id.is_some() && row.read_by_peer {
-                        format!("{age} · read")
-                    } else {
-                        format!("{age} · sent")
-                    }
-                } else {
-                    age
-                };
+    ui.set_min_height(LOCAL_MESSAGE_SCROLL_HEIGHT);
+    let bubble_width = (ui.available_width() * 0.75).max(220.0);
+    for row in rows {
+        let is_sender = me_id.map_or(false, |id| row.from_id == id);
+        let from_label = format_id(labels, row.from_id);
+        let to_label = format_id(labels, row.to_id);
+        let status = local_message_status(row, me_id, labels);
+        let age = format_age(now_key, row.created_at);
+        let meta = format!("{age} · {}", local_message_status_text(&status));
+        let align = if is_sender {
+            egui::Layout::right_to_left(egui::Align::TOP)
+        } else {
+            egui::Layout::left_to_right(egui::Align::TOP)
+        };
+        let from_chip_color = colorhash::ral_categorical(row.from_id.as_ref());
+        let to_chip_color = colorhash::ral_categorical(row.to_id.as_ref());
+        let bubble_color = from_chip_color;
+        let text_color = colorhash::text_color_on(bubble_color);
 
-                let align = if is_sender {
-                    egui::Layout::right_to_left(egui::Align::TOP)
-                } else {
-                    egui::Layout::left_to_right(egui::Align::TOP)
-                };
-                let bubble_color = if is_sender {
-                    egui::Color32::from_rgb(92, 120, 155)
-                } else {
-                    egui::Color32::from_gray(70)
-                };
+        ui.with_layout(align, |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    render_person_chip(ui, &from_label, from_chip_color);
+                    ui.small("→");
+                    render_person_chip(ui, &to_label, to_chip_color);
+                    ui.add_space(6.0);
+                    render_local_status_chip(ui, &status);
+                });
+                egui::Frame::NONE
+                    .fill(bubble_color)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            [bubble_width, 0.0],
+                            egui::Label::new(egui::RichText::new(&row.body).color(text_color))
+                                .wrap_mode(egui::TextWrapMode::Wrap),
+                        );
+                    });
+                ui.small(meta);
+            });
+        });
+        ui.add_space(6.0);
+    }
+}
 
-                ui.with_layout(align, |ui| {
-                    egui::Frame::NONE
-                        .fill(bubble_color)
-                        .corner_radius(egui::CornerRadius::same(6))
-                        .inner_margin(egui::Margin::symmetric(10, 6))
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new(&row.body).color(egui::Color32::WHITE));
-                        });
-                });
-                ui.with_layout(align, |ui| {
-                    ui.small(meta);
-                });
-                ui.add_space(6.0);
+fn local_message_status(
+    row: &LocalMessageRow,
+    me_id: Option<Id>,
+    labels: &HashMap<Id, String>,
+) -> LocalMessageStatus {
+    let read_by = |reader_id: Id| row.readers.iter().any(|id| *id == reader_id);
+    match me_id {
+        Some(me) if row.to_id == me => {
+            if read_by(me) {
+                LocalMessageStatus::Read
+            } else {
+                LocalMessageStatus::Unread
             }
+        }
+        Some(me) if row.from_id == me => {
+            if read_by(row.to_id) {
+                let to_label = format_id(labels, row.to_id);
+                LocalMessageStatus::ReadBy(to_label)
+            } else {
+                LocalMessageStatus::Sent
+            }
+        }
+        Some(me) if read_by(me) => LocalMessageStatus::Read,
+        Some(_) => LocalMessageStatus::Other,
+        None => {
+            if read_by(row.to_id) {
+                let to_label = format_id(labels, row.to_id);
+                LocalMessageStatus::ReadBy(to_label)
+            } else {
+                LocalMessageStatus::Sent
+            }
+        }
+    }
+}
+
+fn local_message_status_text(status: &LocalMessageStatus) -> String {
+    match status {
+        LocalMessageStatus::Unread => "unread".to_string(),
+        LocalMessageStatus::Read => "read".to_string(),
+        LocalMessageStatus::Sent => "sent".to_string(),
+        LocalMessageStatus::ReadBy(label) => format!("read-by:{label}"),
+        LocalMessageStatus::Other => "other".to_string(),
+    }
+}
+
+fn local_message_status_color(status: &LocalMessageStatus) -> egui::Color32 {
+    match status {
+        LocalMessageStatus::Unread => egui::Color32::from_rgb(202, 118, 45),
+        LocalMessageStatus::Read => egui::Color32::from_rgb(69, 141, 92),
+        LocalMessageStatus::Sent => egui::Color32::from_rgb(107, 118, 130),
+        LocalMessageStatus::ReadBy(_) => egui::Color32::from_rgb(74, 126, 183),
+        LocalMessageStatus::Other => egui::Color32::from_rgb(122, 104, 164),
+    }
+}
+
+fn render_local_status_chip(ui: &mut egui::Ui, status: &LocalMessageStatus) {
+    let fill = local_message_status_color(status);
+    let text_color = colorhash::text_color_on(fill);
+    let label = truncate_single_line(&local_message_status_text(status), 40);
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).color(text_color).small());
+        });
+}
+
+fn render_person_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
+    let text_color = colorhash::text_color_on(fill);
+    let label = truncate_single_line(label, 48);
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).color(text_color).small());
         });
 }
 
@@ -3519,40 +3715,36 @@ fn render_relations(ui: &mut egui::Ui, people: &[RelationRow]) {
         ui.label("No relations.");
         return;
     }
-    egui::ScrollArea::vertical()
-        .id_salt("relations_scroll")
-        .max_height(RELATIONS_SCROLL_HEIGHT)
-        .show(ui, |ui| {
-            for person in people {
-                let label = person.label.as_deref().unwrap_or("<unnamed>");
-                ui.label(format!("[{}] {}", id_prefix(person.id), label));
-                let full_name = match (&person.first_name, &person.last_name) {
-                    (Some(first), Some(last)) => Some(format!("{first} {last}")),
-                    (Some(first), None) => Some(first.clone()),
-                    (None, Some(last)) => Some(last.clone()),
-                    (None, None) => None,
-                };
-                if let Some(name) = person.display_name.as_ref().or(full_name.as_ref()) {
-                    ui.small(name);
-                }
-                if let Some(affinity) = &person.affinity {
-                    ui.small(format!("affinity: {affinity}"));
-                }
-                if let Some(teams) = &person.teams_user_id {
-                    ui.small(format!("teams: {teams}"));
-                }
-                if let Some(email) = &person.email {
-                    ui.small(format!("email: {email}"));
-                }
-                if !person.aliases.is_empty() {
-                    ui.small(format!("aliases: {}", person.aliases.join(", ")));
-                }
-                if let Some(note) = &person.note {
-                    ui.small(format!("note: {}", truncate_single_line(note, 120)));
-                }
-                ui.add_space(8.0);
-            }
-        });
+    ui.set_min_height(RELATIONS_SCROLL_HEIGHT);
+    for person in people {
+        let label = person.label.as_deref().unwrap_or("<unnamed>");
+        ui.label(format!("[{}] {}", id_prefix(person.id), label));
+        let full_name = match (&person.first_name, &person.last_name) {
+            (Some(first), Some(last)) => Some(format!("{first} {last}")),
+            (Some(first), None) => Some(first.clone()),
+            (None, Some(last)) => Some(last.clone()),
+            (None, None) => None,
+        };
+        if let Some(name) = person.display_name.as_ref().or(full_name.as_ref()) {
+            ui.small(name);
+        }
+        if let Some(affinity) = &person.affinity {
+            ui.small(format!("affinity: {affinity}"));
+        }
+        if let Some(teams) = &person.teams_user_id {
+            ui.small(format!("teams: {teams}"));
+        }
+        if let Some(email) = &person.email {
+            ui.small(format!("email: {email}"));
+        }
+        if !person.aliases.is_empty() {
+            ui.small(format!("aliases: {}", person.aliases.join(", ")));
+        }
+        if let Some(note) = &person.note {
+            ui.small(format!("note: {}", truncate_single_line(note, 120)));
+        }
+        ui.add_space(8.0);
+    }
 }
 
 fn render_workspace(

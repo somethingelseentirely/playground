@@ -13,6 +13,7 @@ pub mod playground_config {
         "950B556A74F71AC7CB008AB23FBB6544" as pub system_prompt: Handle<Blake3, LongString>;
         "35E36AE7B60AD946661BD63B3CD64672" as pub branch: Handle<Blake3, LongString>;
         "4E2F9CA7A8456DED8C43A3BE741ADA58" as pub branch_id: GenId;
+        "EDEFFF6AFF6318E44CCF6A602B012604" as pub compass_branch_id: GenId;
         "C188E12ABBDD83D283A23DBAD4B784AF" as pub exec_branch_id: GenId;
         "2ED6FF7EAB93CB5608555AE4B9664CF8" as pub local_messages_branch_id: GenId;
         "D35F4F02E29825FBC790E324EFCD1B34" as pub relations_branch_id: GenId;
@@ -131,6 +132,10 @@ where
     )?);
     metadata.union(describe_attribute(blobs, &playground_config::branch)?);
     metadata.union(describe_attribute(blobs, &playground_config::branch_id)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &playground_config::compass_branch_id,
+    )?);
     metadata.union(describe_attribute(
         blobs,
         &playground_config::exec_branch_id,

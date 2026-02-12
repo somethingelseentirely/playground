@@ -15,7 +15,9 @@ use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, ShortStr
 use triblespace::prelude::*;
 
 use crate::config::Config;
-use crate::repo_util::{ensure_worker_name, init_repo, load_text, push_workspace, seed_metadata};
+use crate::repo_util::{
+    close_repo, ensure_worker_name, init_repo, load_text, push_workspace, seed_metadata,
+};
 use crate::schema::openai_responses;
 use crate::time_util::{epoch_interval, interval_key, now_epoch};
 
@@ -24,6 +26,7 @@ struct LlmRequest {
     id: Id,
     prompt: Value<Handle<Blake3, LongString>>,
     model: Option<Value<ShortString>>,
+    previous_response_id: Option<Value<Handle<Blake3, LongString>>>,
     requested_at: Option<Value<NsTAIInterval>>,
 }
 
@@ -31,6 +34,7 @@ struct LlmRequest {
 struct OpenAIResult {
     output_text: String,
     raw: String,
+    response_id: Option<String>,
 }
 
 struct ResponsesClient {
@@ -39,6 +43,9 @@ struct ResponsesClient {
     api_key: Option<String>,
     stream: bool,
 }
+
+const SEND_MAX_ATTEMPTS: usize = 3;
+const SEND_RETRY_BASE_MS: u64 = 250;
 
 impl ResponsesClient {
     fn new(base_url: &str, api_key: Option<String>, stream: bool) -> Result<Self> {
@@ -52,6 +59,22 @@ impl ResponsesClient {
     }
 
     fn send_payload(&self, payload: &JsonValue) -> Result<OpenAIResult> {
+        let mut last_error = None;
+        for attempt in 1..=SEND_MAX_ATTEMPTS {
+            match self.send_payload_once(payload) {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt < SEND_MAX_ATTEMPTS {
+                        sleep(Duration::from_millis(SEND_RETRY_BASE_MS * attempt as u64));
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("request failed without error detail")))
+    }
+
+    fn send_payload_once(&self, payload: &JsonValue) -> Result<OpenAIResult> {
         let mut request = self.client.post(&self.base_url);
         if let Some(api_key) = self.api_key.as_ref() {
             request = request.bearer_auth(api_key);
@@ -70,7 +93,12 @@ impl ResponsesClient {
             let json: JsonValue = response.json().context("read response json")?;
             let output_text = extract_output_text(&json);
             let raw = serde_json::to_string(&json).context("serialize response")?;
-            Ok(OpenAIResult { output_text, raw })
+            let response_id = extract_response_id(&json);
+            Ok(OpenAIResult {
+                output_text,
+                raw,
+                response_id,
+            })
         }
     }
 }
@@ -82,140 +110,163 @@ pub(crate) fn run_llm_loop(
     stop: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
-    seed_metadata(&mut repo)?;
-    let label = format!("llm-{}", id_prefix(worker_id));
-    ensure_worker_name(&mut repo, branch_id, worker_id, &label)?;
+    let result = (|| -> Result<()> {
+        seed_metadata(&mut repo)?;
+        let label = format!("llm-{}", id_prefix(worker_id));
+        ensure_worker_name(&mut repo, branch_id, worker_id, &label)?;
 
-    let client = ResponsesClient::new(
-        config.llm.base_url.as_str(),
-        config.llm.api_key.clone(),
-        config.llm.stream,
-    )?;
-
-    loop {
-        if stop_requested(&stop) {
-            break;
-        }
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow::anyhow!("pull workspace: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout workspace")?;
-        let Some(request) = next_request(&catalog) else {
-            sleep(Duration::from_millis(poll_ms));
-            continue;
-        };
-
-        if stop_requested(&stop) {
-            break;
-        }
-
-        let prompt = load_text(&mut ws, request.prompt).context("load prompt")?;
-        let model = request
-            .model
-            .map(|value| String::from_value(&value))
-            .unwrap_or_else(|| config.llm.model.clone());
-
-        let payload = build_payload(
-            &model,
-            &prompt,
+        let client = ResponsesClient::new(
+            config.llm.base_url.as_str(),
+            config.llm.api_key.clone(),
             config.llm.stream,
-            config.llm.reasoning_effort.as_deref(),
-        );
-        let request_raw = serde_json::to_string(&payload).context("serialize request payload")?;
+        )?;
 
-        let started_at = epoch_interval(now_epoch());
-        let in_progress_id = ufoid();
-        let attempt: u64 = 1;
-        let request_raw_handle = ws.put(request_raw);
+        loop {
+            if stop_requested(&stop) {
+                break;
+            }
 
-        let mut change = TribleSet::new();
-        change += entity! { ExclusiveId::force_ref(&request.id) @
-            openai_responses::request_raw: request_raw_handle,
-        };
-        change += entity! { &in_progress_id @
-            openai_responses::kind: openai_responses::kind_in_progress,
-            openai_responses::about_request: request.id,
-            openai_responses::started_at: started_at,
-            openai_responses::worker: worker_id,
-            openai_responses::attempt: attempt,
-        };
-        ws.commit(change, None, Some("openai_responses in_progress"));
-        push_workspace(&mut repo, &mut ws).context("push in_progress")?;
+            let mut ws = repo
+                .pull(branch_id)
+                .map_err(|err| anyhow::anyhow!("pull workspace: {err:?}"))?;
+            let catalog = ws.checkout(..).context("checkout workspace")?;
+            let Some(request) = next_request(&catalog, worker_id) else {
+                sleep(Duration::from_millis(poll_ms));
+                continue;
+            };
 
-        let result = match client.send_payload(&payload) {
-            Ok(result) => Ok(result),
-            Err(err) => Err(err),
-        };
+            if stop_requested(&stop) {
+                break;
+            }
 
-        let finished_at = epoch_interval(now_epoch());
-        let result_id = ufoid();
-        let mut change = TribleSet::new();
-        change += entity! { &result_id @
-            openai_responses::kind: openai_responses::kind_result,
-            openai_responses::about_request: request.id,
-            openai_responses::finished_at: finished_at,
-            openai_responses::attempt: attempt,
-        };
+            let prompt = load_text(&mut ws, request.prompt).context("load prompt")?;
+            let model = request
+                .model
+                .map(|value| String::from_value(&value))
+                .unwrap_or_else(|| config.llm.model.clone());
+            let previous_response_id = request
+                .previous_response_id
+                .map(|value| load_text(&mut ws, value))
+                .transpose()
+                .context("load previous_response_id")?;
 
-        let mut import_data = None;
-        let mut import_metadata = None;
+            let payload = build_payload(
+                &model,
+                &prompt,
+                config.llm.stream,
+                config.llm.reasoning_effort.as_deref(),
+                previous_response_id.as_deref(),
+            );
+            let request_raw =
+                serde_json::to_string(&payload).context("serialize request payload")?;
 
-        match result {
-            Ok(result) => {
-                let raw_blob = result.raw.clone().to_blob();
-                let output_handle = ws.put(result.output_text);
-                let raw_handle = ws.put(result.raw);
-                change += entity! { &result_id @
-                    openai_responses::output_text: output_handle,
-                    openai_responses::response_raw: raw_handle,
-                };
+            let started_at = epoch_interval(now_epoch());
+            let in_progress_id = ufoid();
+            let attempt: u64 = 1;
+            let request_raw_handle = ws.put(request_raw);
 
-                let mut import_blobs = MemoryBlobStore::<Blake3>::new();
-                let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut import_blobs, None);
-                match importer.import_blob(raw_blob) {
-                    Ok(roots) => {
-                        let data = importer.data().clone();
-                        let metadata = importer
-                            .metadata()
-                            .context("build response import metadata")?;
-                        let import_reader = import_blobs
-                            .reader()
-                            .context("read response import blobs")?;
-                        for (_, blob) in import_reader.iter() {
-                            ws.put::<UnknownBlob, _>(blob.bytes.clone());
-                        }
+            let mut change = TribleSet::new();
+            change += entity! { ExclusiveId::force_ref(&request.id) @
+                openai_responses::request_raw: request_raw_handle,
+            };
+            change += entity! { &in_progress_id @
+                openai_responses::kind: openai_responses::kind_in_progress,
+                openai_responses::about_request: request.id,
+                openai_responses::started_at: started_at,
+                openai_responses::worker: worker_id,
+                openai_responses::attempt: attempt,
+            };
+            ws.commit(change, None, Some("openai_responses in_progress"));
+            push_workspace(&mut repo, &mut ws).context("push in_progress")?;
 
-                        for root in roots {
-                            change += entity! { &result_id @
-                                openai_responses::response_json_root: root,
-                            };
-                        }
+            let result = client.send_payload(&payload);
 
-                        import_data = Some(data);
-                        import_metadata = Some(metadata);
+            let finished_at = epoch_interval(now_epoch());
+            let result_id = ufoid();
+            let mut change = TribleSet::new();
+            change += entity! { &result_id @
+                openai_responses::kind: openai_responses::kind_result,
+                openai_responses::about_request: request.id,
+                openai_responses::finished_at: finished_at,
+                openai_responses::attempt: attempt,
+            };
+
+            let mut import_data = None;
+            let mut import_metadata = None;
+
+            match result {
+                Ok(result) => {
+                    let response_id = result.response_id.clone();
+                    let raw_blob = result.raw.clone().to_blob();
+                    let output_handle = ws.put(result.output_text);
+                    let raw_handle = ws.put(result.raw);
+                    change += entity! { &result_id @
+                        openai_responses::output_text: output_handle,
+                        openai_responses::response_raw: raw_handle,
+                    };
+                    if let Some(response_id) = response_id {
+                        let response_id_handle = ws.put(response_id);
+                        change += entity! { &result_id @
+                            openai_responses::response_id: response_id_handle,
+                        };
                     }
-                    Err(err) => {
-                        eprintln!("Failed to import response JSON: {err}");
+
+                    let mut import_blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer =
+                        JsonObjectImporter::<_, Blake3>::new(&mut import_blobs, None);
+                    match importer.import_blob(raw_blob) {
+                        Ok(roots) => {
+                            let data = importer.data().clone();
+                            let metadata = importer
+                                .metadata()
+                                .context("build response import metadata")?;
+                            let import_reader = import_blobs
+                                .reader()
+                                .context("read response import blobs")?;
+                            for (_, blob) in import_reader.iter() {
+                                ws.put::<UnknownBlob, _>(blob.bytes.clone());
+                            }
+
+                            for root in roots {
+                                change += entity! { &result_id @
+                                    openai_responses::response_json_root: root,
+                                };
+                            }
+
+                            import_data = Some(data);
+                            import_metadata = Some(metadata);
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to import response JSON: {err}");
+                        }
                     }
                 }
+                Err(err) => {
+                    let handle = ws.put(format!("{err:#}"));
+                    change += entity! { &result_id @
+                        openai_responses::error: handle,
+                    };
+                }
             }
-            Err(err) => {
-                let handle = ws.put(err.to_string());
-                change += entity! { &result_id @
-                    openai_responses::error: handle,
-                };
+
+            if let (Some(data), Some(metadata)) = (import_data, import_metadata) {
+                ws.commit(data, Some(metadata), Some("import response json"));
             }
+            ws.commit(change, None, Some("openai_responses result"));
+            push_workspace(&mut repo, &mut ws).context("push result")?;
         }
 
-        if let (Some(data), Some(metadata)) = (import_data, import_metadata) {
-            ws.commit(data, Some(metadata), Some("import response json"));
+        Ok(())
+    })();
+
+    if let Err(err) = close_repo(repo) {
+        if result.is_ok() {
+            return Err(err);
         }
-        ws.commit(change, None, Some("openai_responses result"));
-        push_workspace(&mut repo, &mut ws).context("push result")?;
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
     }
 
-    Ok(())
+    result
 }
 
 fn stop_requested(stop: &Option<Arc<AtomicBool>>) -> bool {
@@ -224,7 +275,7 @@ fn stop_requested(stop: &Option<Arc<AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
-fn next_request(catalog: &TribleSet) -> Option<LlmRequest> {
+fn next_request(catalog: &TribleSet, worker_id: Id) -> Option<LlmRequest> {
     let mut requests: HashMap<Id, LlmRequest> = HashMap::new();
     for (request_id, prompt) in find!(
         (request_id: Id, prompt: Value<Handle<Blake3, LongString>>),
@@ -240,6 +291,7 @@ fn next_request(catalog: &TribleSet) -> Option<LlmRequest> {
                 id: request_id,
                 prompt,
                 model: None,
+                previous_response_id: None,
                 requested_at: None,
             },
         );
@@ -271,15 +323,38 @@ fn next_request(catalog: &TribleSet) -> Option<LlmRequest> {
         }
     }
 
+    for (request_id, previous_response_id) in find!(
+        (
+            request_id: Id,
+            previous_response_id: Value<Handle<Blake3, LongString>>
+        ),
+        pattern!(catalog, [{
+            ?request_id @ openai_responses::previous_response_id: ?previous_response_id
+        }])
+    ) {
+        if let Some(entry) = requests.get_mut(&request_id) {
+            entry.previous_response_id = Some(previous_response_id);
+        }
+    }
+
     let mut in_progress = HashSet::new();
-    for (request_id,) in find!(
-        (request_id: Id),
+    for (request_id, in_progress_worker_id) in find!(
+        (
+            request_id: Id,
+            in_progress_worker_id: Id
+        ),
         pattern!(catalog, [{
             _?event @
             openai_responses::kind: openai_responses::kind_in_progress,
             openai_responses::about_request: ?request_id,
+            openai_responses::worker: ?in_progress_worker_id,
         }])
     ) {
+        // A different worker id indicates another process/run; treat its in-progress marker
+        // as reclaimable for this worker and rely on result facts to dedupe completed work.
+        if in_progress_worker_id != worker_id {
+            continue;
+        }
         in_progress.insert(request_id);
     }
 
@@ -308,6 +383,7 @@ fn build_payload(
     prompt: &str,
     stream: bool,
     reasoning_effort: Option<&str>,
+    previous_response_id: Option<&str>,
 ) -> JsonValue {
     let mut reasoning = serde_json::json!({
         "summary": "detailed",
@@ -315,13 +391,18 @@ fn build_payload(
     if let Some(effort) = reasoning_effort {
         reasoning["effort"] = JsonValue::String(effort.to_string());
     }
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "model": model,
         "input": [{"role": "user", "content": prompt}],
         "reasoning": reasoning,
         "include": ["reasoning.encrypted_content"],
         "stream": stream,
-    })
+        "store": true,
+    });
+    if let Some(previous_response_id) = previous_response_id {
+        payload["previous_response_id"] = JsonValue::String(previous_response_id.to_string());
+    }
+    payload
 }
 
 fn parse_stream(response: reqwest::blocking::Response) -> Result<OpenAIResult> {
@@ -382,7 +463,23 @@ fn parse_stream(response: reqwest::blocking::Response) -> Result<OpenAIResult> {
     } else {
         raw_events.join("\n")
     };
-    Ok(OpenAIResult { output_text, raw })
+    let response_id = if let Some(response) = serde_json::from_str::<JsonValue>(&raw).ok() {
+        extract_response_id(&response)
+    } else {
+        None
+    };
+    Ok(OpenAIResult {
+        output_text,
+        raw,
+        response_id,
+    })
+}
+
+fn extract_response_id(response: &JsonValue) -> Option<String> {
+    response
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
 }
 
 fn extract_output_text(response: &JsonValue) -> String {

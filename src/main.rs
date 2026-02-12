@@ -30,7 +30,7 @@ mod time_util;
 mod workspace_snapshot;
 
 use config::Config;
-use repo_util::{init_repo, load_text, push_workspace};
+use repo_util::{close_repo, init_repo, load_text, push_workspace};
 use schema::{openai_responses, playground_cog, playground_exec};
 use time_util::{epoch_interval, interval_key, now_epoch};
 
@@ -130,6 +130,7 @@ enum ConfigField {
     SystemPrompt,
     Branch,
     BranchId,
+    CompassBranchId,
     ExecBranchId,
     LocalMessagesBranchId,
     RelationsBranchId,
@@ -280,6 +281,10 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
         ConfigField::BranchId => {
             config.branch_id = parse_optional_hex_id(Some(args.value.as_str()), "branch_id")?;
         }
+        ConfigField::CompassBranchId => {
+            config.compass_branch_id =
+                parse_optional_hex_id(Some(args.value.as_str()), "compass_branch_id")?;
+        }
         ConfigField::ExecBranchId => {
             config.exec_branch_id =
                 parse_optional_hex_id(Some(args.value.as_str()), "exec_branch_id")?;
@@ -366,7 +371,6 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
     let vm_root = env_path("PLAYGROUND_LIMA_ROOT").unwrap_or_else(|| args.vm_root.clone());
 
     let pile_abs = absolute_pile_path(&config.pile_path)?;
-    ensure_append_only(&pile_abs)?;
     let pile_root = pile_abs
         .parent()
         .ok_or_else(|| anyhow!("pile path missing parent directory"))?
@@ -480,30 +484,6 @@ fn render_lima_template(
 
     fs::write(out_path, text)
         .with_context(|| format!("write Lima config {}", out_path.display()))?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn ensure_append_only(path: &Path) -> Result<()> {
-    if !path.exists() {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("create pile file {}", path.display()))?;
-    }
-    let status = Command::new("chflags")
-        .args(["uappnd", path.to_string_lossy().as_ref()])
-        .status()
-        .with_context(|| format!("set append-only on {}", path.display()))?;
-    if !status.success() {
-        return Err(anyhow!("chflags uappnd failed for {}", path.display()));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn ensure_append_only(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -649,6 +629,13 @@ fn print_config(config: &Config, show_secrets: bool) {
 
     println!("\n[branches]");
     println!(
+        "compass_branch_id = {}",
+        config
+            .compass_branch_id
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_string())
+    );
+    println!(
         "exec_branch_id = {}",
         config
             .exec_branch_id
@@ -733,43 +720,53 @@ fn run_loop(config: Config) -> Result<()> {
         .map(|path| path.to_string_lossy().to_string());
     let exec_profile = config.exec.sandbox_profile;
 
-    let mut request_info = ensure_llm_request(&mut repo, branch_id, &config)?;
+    let result = (|| -> Result<()> {
+        let mut request_info = ensure_llm_request(&mut repo, branch_id, &config)?;
 
-    loop {
-        let llm_result =
-            wait_for_llm_result(&mut repo, branch_id, request_info.id, config.poll_ms)?;
-        if let Some(error) = llm_result.error {
-            return Err(anyhow!("llm request failed: {error}"));
+        loop {
+            let llm_result =
+                wait_for_llm_result(&mut repo, branch_id, request_info.id, config.poll_ms)?;
+            if let Some(error) = llm_result.error {
+                return Err(anyhow!("llm request failed: {error}"));
+            }
+
+            let command = llm_result.output_text.trim();
+            if command.eq_ignore_ascii_case("exit") {
+                break;
+            }
+
+            let command_request_id = ensure_command_request(
+                &mut repo,
+                branch_id,
+                command,
+                request_info.thought_id,
+                exec_cwd.as_deref(),
+                exec_profile,
+            )?;
+            let command_result =
+                wait_for_command_result(&mut repo, branch_id, command_request_id, config.poll_ms)?;
+
+            let prompt_body = format_exec_output(command, command_result.result);
+            let prompt = compose_prompt(&config.system_prompt, &prompt_body);
+            request_info = create_thought_and_request(
+                &mut repo,
+                branch_id,
+                &prompt,
+                Some(command_result.id),
+                &config,
+            )?;
         }
+        Ok(())
+    })();
 
-        let command = llm_result.output_text.trim();
-        if command.eq_ignore_ascii_case("exit") {
-            break;
+    if let Err(err) = close_repo(repo) {
+        if result.is_ok() {
+            return Err(err);
         }
-
-        let command_request_id = ensure_command_request(
-            &mut repo,
-            branch_id,
-            command,
-            request_info.thought_id,
-            exec_cwd.as_deref(),
-            exec_profile,
-        )?;
-        let command_result =
-            wait_for_command_result(&mut repo, branch_id, command_request_id, config.poll_ms)?;
-
-        let prompt_body = format_exec_output(command, command_result.result);
-        let prompt = compose_prompt(&config.system_prompt, &prompt_body);
-        request_info = create_thought_and_request(
-            &mut repo,
-            branch_id,
-            &prompt,
-            Some(command_result.id),
-            &config,
-        )?;
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
     }
 
-    Ok(())
+    result
 }
 
 #[derive(Debug, Clone)]
@@ -815,21 +812,17 @@ fn ensure_llm_request(
             return Ok(request);
         }
 
-        if list_thoughts_by_created(&catalog).is_empty()
-            && collect_command_results(&catalog).is_empty()
-        {
-            if !has_pending_command_request(&catalog) {
-                drop(ws);
-                let command = orient_bootstrap_command(config);
-                ensure_command_request(
-                    repo,
-                    branch_id,
-                    &command,
-                    None,
-                    config.exec.default_cwd.as_ref().and_then(|p| p.to_str()),
-                    config.exec.sandbox_profile,
-                )?;
-            }
+        if !has_pending_command_request(&catalog) {
+            drop(ws);
+            let command = orient_bootstrap_command(config);
+            ensure_command_request(
+                repo,
+                branch_id,
+                &command,
+                None,
+                config.exec.default_cwd.as_ref().and_then(|p| p.to_str()),
+                config.exec.sandbox_profile,
+            )?;
             sleep(Duration::from_millis(config.poll_ms));
             continue;
         }
@@ -840,7 +833,7 @@ fn ensure_llm_request(
 
 fn orient_bootstrap_command(config: &Config) -> String {
     let _ = config;
-    "./faculties/orient.rs show".to_string()
+    "/opt/playground/faculties/orient.rs show".to_string()
 }
 
 fn create_thought_and_request(
@@ -879,6 +872,7 @@ fn create_thought_and_request(
         change += entity! { &thought_id @ playground_cog::about_exec_result: exec_result_id };
     }
 
+    let previous_response_id = latest_llm_response_id(&mut ws, &catalog)?;
     let request_id = ufoid();
     change += entity! { &request_id @
         openai_responses::kind: openai_responses::kind_request,
@@ -887,6 +881,12 @@ fn create_thought_and_request(
         openai_responses::requested_at: now,
         openai_responses::model: config.llm.model.as_str(),
     };
+    if let Some(previous_response_id) = previous_response_id {
+        let previous_response_id_handle = ws.put(previous_response_id);
+        change += entity! { &request_id @
+            openai_responses::previous_response_id: previous_response_id_handle,
+        };
+    }
 
     ws.commit(change, None, Some("create thought + llm request"));
     push_workspace(repo, &mut ws).context("push thought + request")?;
@@ -910,6 +910,7 @@ fn create_request_for_thought(
     let Some(prompt_handle) = thought_prompt_handle(catalog, thought_id) else {
         return Err(anyhow!("thought {thought_id:x} missing prompt"));
     };
+    let previous_response_id = latest_llm_response_id(ws, catalog)?;
     let now = epoch_interval(now_epoch());
     let request_id = ufoid();
     let mut change = TribleSet::new();
@@ -920,6 +921,12 @@ fn create_request_for_thought(
         openai_responses::requested_at: now,
         openai_responses::model: config.llm.model.as_str(),
     };
+    if let Some(previous_response_id) = previous_response_id {
+        let previous_response_id_handle = ws.put(previous_response_id);
+        change += entity! { &request_id @
+            openai_responses::previous_response_id: previous_response_id_handle,
+        };
+    }
     ws.commit(change, None, Some("create llm request"));
     Ok(*request_id)
 }
@@ -980,6 +987,30 @@ fn llm_request_results(catalog: &TribleSet) -> HashSet<Id> {
     .into_iter()
     .map(|(request_id,)| request_id)
     .collect()
+}
+
+fn latest_llm_response_id(ws: &mut Workspace<Pile>, catalog: &TribleSet) -> Result<Option<String>> {
+    let mut candidates = Vec::new();
+    for (response_id_handle, finished_at) in find!(
+        (
+            response_id_handle: Value<Handle<Blake3, LongString>>,
+            finished_at: Value<NsTAIInterval>
+        ),
+        pattern!(catalog, [{
+            _?result @
+            openai_responses::kind: openai_responses::kind_result,
+            openai_responses::response_id: ?response_id_handle,
+            openai_responses::finished_at: ?finished_at,
+        }])
+    ) {
+        candidates.push((interval_key(finished_at), response_id_handle));
+    }
+    candidates.sort_by_key(|(finished_at_key, _)| *finished_at_key);
+    let Some((_, response_id_handle)) = candidates.pop() else {
+        return Ok(None);
+    };
+    let response_id = load_text(ws, response_id_handle).context("load llm response_id")?;
+    Ok(Some(response_id))
 }
 
 fn request_thought_id(catalog: &TribleSet, request_id: Id) -> Option<Id> {

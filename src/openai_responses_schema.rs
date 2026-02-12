@@ -15,6 +15,7 @@ pub mod openai_responses {
         "DA8E31E47919337B3E00724EBE32D14E" as pub about_thought: GenId;
         "C1FFE9D4FEC549C09C96639665561DFE" as pub model: ShortString;
         "B6BF5BEE9961D6C0F4F825088DD2C3F2" as pub prompt: Handle<Blake3, LongString>;
+        "BEC10E9517D687F0EC563AE9DD8B8A6E" as pub previous_response_id: Handle<Blake3, LongString>;
         "0DA5DD275AA34F86B0297CC35F1B7395" as pub requested_at: NsTAIInterval;
         "430B9CD43A3BC414E730B29BCFD6349B" as pub request_raw: Handle<Blake3, LongString>;
         "4FC561A8EC8E9D750445AE8A0BE5E094" as pub worker: GenId;
@@ -22,6 +23,7 @@ pub mod openai_responses {
         "8CAEF4617646F8C9E90BC9A3ED3D0496" as pub attempt: U256BE;
         "238CF718317A94DB46B8D75E7CB6D609" as pub finished_at: NsTAIInterval;
         "B1B904590F0FA70AD1BA247F3D23A6CC" as pub output_text: Handle<Blake3, LongString>;
+        "9CD6494CB9825D01A2E86C7E2A56CA96" as pub response_id: Handle<Blake3, LongString>;
         "E41A91D2C68640AA86AB31A2CAB2858F" as pub response_raw: Handle<Blake3, LongString>;
         "BD1635514288254E9CB0448CC07C8B65" as pub response_json_root: GenId;
         "9E9B829C473E416E9150D4B94A6A2DC4" as pub error: Handle<Blake3, LongString>;
@@ -147,6 +149,10 @@ where
     metadata.union(describe_attribute(blobs, &openai_responses::about_thought)?);
     metadata.union(describe_attribute(blobs, &openai_responses::model)?);
     metadata.union(describe_attribute(blobs, &openai_responses::prompt)?);
+    metadata.union(describe_attribute(
+        blobs,
+        &openai_responses::previous_response_id,
+    )?);
     metadata.union(describe_attribute(blobs, &openai_responses::requested_at)?);
     metadata.union(describe_attribute(blobs, &openai_responses::request_raw)?);
     metadata.union(describe_attribute(blobs, &openai_responses::worker)?);
@@ -154,6 +160,7 @@ where
     metadata.union(describe_attribute(blobs, &openai_responses::attempt)?);
     metadata.union(describe_attribute(blobs, &openai_responses::finished_at)?);
     metadata.union(describe_attribute(blobs, &openai_responses::output_text)?);
+    metadata.union(describe_attribute(blobs, &openai_responses::response_id)?);
     metadata.union(describe_attribute(blobs, &openai_responses::response_raw)?);
     metadata.union(describe_attribute(
         blobs,

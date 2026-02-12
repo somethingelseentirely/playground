@@ -18,10 +18,11 @@ use crate::time_util::{epoch_interval, interval_key, now_epoch};
 const DEFAULT_MODEL: &str = "gpt-oss:120b";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1/responses";
 const DEFAULT_STREAM: bool = false;
-const DEFAULT_SYSTEM_PROMPT: &str = "You are a terminal-based agent. Respond with exactly one shell command per turn. You can include an optional leading comment block for context. Faculties are executable helper scripts in ./faculties; run them with no arguments to see usage and prefer them over ad-hoc commands when applicable.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a terminal-based agent. Respond with exactly one shell command per turn. Output only raw command text: no markdown fences, no commentary prelude, no channel labels, and no multi-command blocks. Prefer faculties in /opt/playground/faculties over ad-hoc shell when applicable; run a faculty with no arguments to inspect usage. If unsure what to do next, run `/opt/playground/faculties/orient.rs show`.";
 // The branch that carries the core cognition loop + exec/LLM request state.
 const DEFAULT_BRANCH: &str = "cognition";
 const DEFAULT_EXEC_BRANCH: &str = "cognition";
+const DEFAULT_COMPASS_BRANCH: &str = "compass";
 const DEFAULT_LOCAL_MESSAGES_BRANCH: &str = "local-messages";
 const DEFAULT_RELATIONS_BRANCH: &str = "relations";
 const DEFAULT_TEAMS_BRANCH: &str = "teams";
@@ -40,6 +41,7 @@ pub struct Config {
     pub system_prompt: String,
     pub branch_id: Option<Id>,
     pub branch: String,
+    pub compass_branch_id: Option<Id>,
     pub exec_branch_id: Option<Id>,
     pub local_messages_branch_id: Option<Id>,
     pub relations_branch_id: Option<Id>,
@@ -69,7 +71,7 @@ pub struct ExecConfig {
 impl Default for ExecConfig {
     fn default() -> Self {
         Self {
-            default_cwd: None,
+            default_cwd: Some(PathBuf::from("/workspace")),
             sandbox_profile: None,
         }
     }
@@ -118,6 +120,7 @@ fn default_config(pile_path: PathBuf) -> Config {
         system_prompt: default_system_prompt(),
         branch_id: None,
         branch: default_branch(),
+        compass_branch_id: None,
         exec_branch_id: None,
         local_messages_branch_id: None,
         relations_branch_id: None,
@@ -143,6 +146,7 @@ fn load_from_pile(pile_path: &Path) -> Result<Config> {
         let mut config = default_config(pile_path.to_path_buf());
         // Make the default config fully concrete (ids instead of names).
         config.branch_id = Some(ensure_branch_id(&mut repo, config.branch.as_str())?);
+        config.compass_branch_id = Some(ensure_branch_id(&mut repo, DEFAULT_COMPASS_BRANCH)?);
         config.exec_branch_id = Some(ensure_branch_id(&mut repo, DEFAULT_EXEC_BRANCH)?);
         config.local_messages_branch_id =
             Some(ensure_branch_id(&mut repo, DEFAULT_LOCAL_MESSAGES_BRANCH)?);
@@ -246,6 +250,9 @@ fn load_latest_config(
     if let Some(id) = load_id_attr(catalog, config_id, playground_config::branch_id) {
         config.branch_id = Some(id);
     }
+    if let Some(id) = load_id_attr(catalog, config_id, playground_config::compass_branch_id) {
+        config.compass_branch_id = Some(id);
+    }
     if let Some(id) = load_id_attr(catalog, config_id, playground_config::exec_branch_id) {
         config.exec_branch_id = Some(id);
     }
@@ -311,6 +318,9 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
 
     if let Some(id) = config.branch_id {
         change += entity! { &config_id @ playground_config::branch_id: id };
+    }
+    if let Some(id) = config.compass_branch_id {
+        change += entity! { &config_id @ playground_config::compass_branch_id: id };
     }
     if let Some(id) = config.exec_branch_id {
         change += entity! { &config_id @ playground_config::exec_branch_id: id };
