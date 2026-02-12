@@ -90,7 +90,6 @@ const RELATIONS_SCROLL_HEIGHT: f32 = 260.0;
 const TEAMS_SCROLL_HEIGHT: f32 = 520.0;
 const TEAMS_CHAT_LIST_WIDTH: f32 = 220.0;
 const WORKSPACE_SNAPSHOT_LIMIT: usize = 10;
-const ACTIVITY_TIMELINE_LIMIT: usize = 120;
 
 static DIAGNOSTICS_PILE_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 static DIAGNOSTICS_HEADLESS: AtomicBool = AtomicBool::new(false);
@@ -309,17 +308,55 @@ struct ReasoningSummaryRow {
 enum TimelineSource {
     Shell,
     Cognition,
-    LocalMessages,
     Teams,
+    LocalMessages,
     Goals,
+}
+
+#[derive(Debug, Clone)]
+enum TimelineEvent {
+    Shell {
+        status: ExecStatus,
+        command: String,
+        worker_label: Option<String>,
+        exit_code: Option<u64>,
+        error: Option<String>,
+    },
+    Cognition {
+        summary: String,
+    },
+    Teams {
+        author: String,
+        chat_label: String,
+        content: String,
+    },
+    LocalMessage {
+        from_id: Id,
+        to_id: Id,
+        from_label: String,
+        to_label: String,
+        status: LocalMessageStatus,
+        body: String,
+        is_sender: bool,
+    },
+    GoalCreated {
+        goal: CompassTaskRow,
+    },
+    GoalStatus {
+        goal: CompassTaskRow,
+        to_status: String,
+    },
+    GoalNote {
+        goal: CompassTaskRow,
+        note: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 struct TimelineRow {
     at: Option<i128>,
     source: TimelineSource,
-    summary: String,
-    details: Option<String>,
+    event: TimelineEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -1078,7 +1115,6 @@ fn build_snapshot(
         &compass_status_rows,
         &compass_notes,
         &labels,
-        ACTIVITY_TIMELINE_LIMIT,
     );
 
     DashboardSnapshot {
@@ -2016,31 +2052,20 @@ fn build_activity_timeline(
     compass_status_rows: &[CompassStatusRow],
     compass_notes: &HashMap<Id, Vec<CompassNoteRow>>,
     labels: &HashMap<Id, String>,
-    limit: usize,
 ) -> Vec<TimelineRow> {
     let mut rows = Vec::new();
 
     for row in exec_rows {
-        let mut details: Vec<String> = Vec::new();
-        if let Some(worker_id) = row.worker {
-            details.push(format!("worker {}", format_id(labels, worker_id)));
-        }
-        if let Some(code) = row.exit_code {
-            details.push(format!("exit {code}"));
-        }
-        if let Some(error) = row.error.as_deref() {
-            details.push(format!("error {}", truncate_single_line(error, 160)));
-        }
-
         rows.push(TimelineRow {
             at: row.finished_at.or(row.started_at).or(row.requested_at),
             source: TimelineSource::Shell,
-            summary: format!(
-                "{}: {}",
-                exec_status_text(row.status),
-                truncate_single_line(&row.command, 200)
-            ),
-            details: (!details.is_empty()).then_some(details.join(" · ")),
+            event: TimelineEvent::Shell {
+                status: row.status,
+                command: row.command.clone(),
+                worker_label: row.worker.map(|worker_id| format_id(labels, worker_id)),
+                exit_code: row.exit_code,
+                error: row.error.clone(),
+            },
         });
     }
 
@@ -2048,8 +2073,9 @@ fn build_activity_timeline(
         rows.push(TimelineRow {
             at: row.created_at,
             source: TimelineSource::Cognition,
-            summary: truncate_single_line(&row.summary, 160),
-            details: Some(row.summary.clone()),
+            event: TimelineEvent::Cognition {
+                summary: row.summary.clone(),
+            },
         });
     }
 
@@ -2060,12 +2086,15 @@ fn build_activity_timeline(
         rows.push(TimelineRow {
             at: row.created_at,
             source: TimelineSource::LocalMessages,
-            summary: format!("{from_label} → {to_label}"),
-            details: Some(format!(
-                "{} · {}",
-                local_message_status_text(&status),
-                truncate_single_line(&row.body, 240)
-            )),
+            event: TimelineEvent::LocalMessage {
+                from_id: row.from_id,
+                to_id: row.to_id,
+                from_label,
+                to_label,
+                status,
+                body: row.body.clone(),
+                is_sender: local_me_id == Some(row.from_id),
+            },
         });
     }
 
@@ -2082,75 +2111,72 @@ fn build_activity_timeline(
         rows.push(TimelineRow {
             at: row.created_at,
             source: TimelineSource::Teams,
-            summary: format!("{author} in {chat}"),
-            details: Some(truncate_single_line(&row.content, 240)),
+            event: TimelineEvent::Teams {
+                author: author.to_string(),
+                chat_label: chat,
+                content: row.content.clone(),
+            },
         });
     }
 
+    let mut goal_rows: HashMap<Id, CompassTaskRow> = HashMap::new();
     for (goal, _depth) in compass_rows {
-        let mut details: Vec<String> = Vec::new();
-        details.push(format!("status {}", goal.status));
-        details.push(format!("[{}]", goal.id_prefix));
-        if !goal.tags.is_empty() {
-            details.push(
-                goal.tags
-                    .iter()
-                    .map(|tag| format!("#{tag}"))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
-        }
-        if let Some(parent) = goal.parent {
-            details.push(format!("child-of {}", id_prefix(parent)));
-        }
+        goal_rows.insert(goal.id, goal.clone());
         rows.push(TimelineRow {
             at: parse_compass_stamp(&goal.created_at),
             source: TimelineSource::Goals,
-            summary: format!("created goal: {}", truncate_single_line(&goal.title, 160)),
-            details: Some(details.join(" · ")),
+            event: TimelineEvent::GoalCreated { goal: goal.clone() },
         });
     }
 
-    let mut goal_titles: HashMap<Id, String> = HashMap::new();
-    for (goal, _depth) in compass_rows {
-        goal_titles.insert(goal.id, goal.title.clone());
-    }
+    let fallback_goal = |task_id: Id| CompassTaskRow {
+        id: task_id,
+        id_prefix: id_prefix(task_id),
+        title: format!("[{}]", id_prefix(task_id)),
+        tags: Vec::new(),
+        created_at: String::new(),
+        status: "todo".to_string(),
+        status_at: None,
+        note_count: 0,
+        parent: None,
+    };
 
     for status in compass_status_rows {
-        let title = goal_titles
+        let mut goal = goal_rows
             .get(&status.task)
             .cloned()
-            .unwrap_or_else(|| format!("[{}]", id_prefix(status.task)));
+            .unwrap_or_else(|| fallback_goal(status.task));
+        goal.status = status.status.clone();
+        goal.status_at = Some(status.at.clone());
         rows.push(TimelineRow {
             at: parse_compass_stamp(&status.at),
             source: TimelineSource::Goals,
-            summary: format!(
-                "status: {} -> {}",
-                truncate_single_line(&title, 120),
-                status.status
-            ),
-            details: Some(format!("[{}]", id_prefix(status.task))),
+            event: TimelineEvent::GoalStatus {
+                goal,
+                to_status: status.status.clone(),
+            },
         });
     }
 
     for (task_id, notes) in compass_notes {
-        let title = goal_titles
+        let goal = goal_rows
             .get(task_id)
             .cloned()
-            .unwrap_or_else(|| format!("[{}]", id_prefix(*task_id)));
+            .unwrap_or_else(|| fallback_goal(*task_id));
         for note in notes {
             rows.push(TimelineRow {
                 at: parse_compass_stamp(&note.at),
                 source: TimelineSource::Goals,
-                summary: format!("note: {}", truncate_single_line(&title, 120)),
-                details: Some(truncate_single_line(&note.body, 280)),
+                event: TimelineEvent::GoalNote {
+                    goal: goal.clone(),
+                    note: note.body.clone(),
+                },
             });
         }
     }
 
     rows.sort_by_key(|row| row.at.unwrap_or(i128::MIN));
     rows.reverse();
-    rows.truncate(limit);
     rows
 }
 
@@ -3178,30 +3204,91 @@ fn mask_secret(secret: &str) -> String {
 fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRow]) {
     let render_rows = |ui: &mut egui::Ui| {
         for row in rows {
-            let (source_label, source_color) = timeline_source_style(row.source);
-            ui.horizontal_wrapped(|ui| {
-                ui.small(format_age(now_key, row.at));
-                render_timeline_source_chip(ui, source_label, source_color);
-                ui.label(&row.summary);
-            });
-            if let Some(details) = row.details.as_deref() {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(details).monospace())
-                        .wrap_mode(egui::TextWrapMode::Wrap),
-                );
-            }
+            render_timeline_row(ui, now_key, row);
             ui.add_space(8.0);
         }
     };
 
-    if diagnostics_is_headless() {
-        egui::ScrollArea::vertical()
-            .id_salt("timeline_headless_scroll")
-            .max_height(1800.0)
-            .show(ui, |ui| render_rows(ui));
+    let max_height = if diagnostics_is_headless() {
+        1800.0
     } else {
-        ui.set_min_height(ACTIVITY_TIMELINE_HEIGHT);
-        render_rows(ui);
+        ACTIVITY_TIMELINE_HEIGHT
+    };
+    egui::ScrollArea::vertical()
+        .id_salt("activity_timeline_scroll")
+        .max_height(max_height)
+        .show(ui, |ui| render_rows(ui));
+}
+
+fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) {
+    let (source_label, source_color) = timeline_source_style(row.source);
+    ui.horizontal_wrapped(|ui| {
+        ui.small(format_age(now_key, row.at));
+        render_timeline_source_chip(ui, source_label, source_color);
+    });
+
+    match &row.event {
+        TimelineEvent::Shell {
+            status,
+            command,
+            worker_label,
+            exit_code,
+            error,
+        } => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{}: {}", exec_status_text(*status), command));
+            });
+            let mut details = Vec::new();
+            if let Some(worker_label) = worker_label.as_deref() {
+                details.push(format!("worker {worker_label}"));
+            }
+            if let Some(code) = exit_code {
+                details.push(format!("exit {code}"));
+            }
+            if !details.is_empty() {
+                ui.small(details.join(" · "));
+            }
+            if let Some(error) = error.as_deref() {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+        }
+        TimelineEvent::Cognition { summary } => {
+            ui.add(
+                egui::Label::new(egui::RichText::new(summary).monospace())
+                    .wrap_mode(egui::TextWrapMode::Wrap),
+            );
+        }
+        TimelineEvent::Teams {
+            author,
+            chat_label,
+            content,
+        } => {
+            ui.small(format!("{author} in {chat_label}"));
+            ui.add(egui::Label::new(content).wrap_mode(egui::TextWrapMode::Wrap));
+        }
+        TimelineEvent::LocalMessage {
+            from_id,
+            to_id,
+            from_label,
+            to_label,
+            status,
+            body,
+            is_sender,
+        } => {
+            render_timeline_local_message(
+                ui, *from_id, *to_id, from_label, to_label, status, body, *is_sender, now_key,
+                row.at,
+            );
+        }
+        TimelineEvent::GoalCreated { goal } => {
+            render_timeline_goal_event(ui, goal, None);
+        }
+        TimelineEvent::GoalStatus { goal, to_status } => {
+            render_timeline_goal_event(ui, goal, Some(format!("status -> {to_status}")));
+        }
+        TimelineEvent::GoalNote { goal, note } => {
+            render_timeline_goal_event(ui, goal, Some(format!("note: {note}")));
+        }
     }
 }
 
@@ -3209,8 +3296,8 @@ fn timeline_source_style(source: TimelineSource) -> (&'static str, egui::Color32
     match source {
         TimelineSource::Shell => ("shell", egui::Color32::from_rgb(92, 132, 201)),
         TimelineSource::Cognition => ("mind", egui::Color32::from_rgb(123, 107, 168)),
-        TimelineSource::LocalMessages => ("local", egui::Color32::from_rgb(67, 149, 112)),
         TimelineSource::Teams => ("teams", egui::Color32::from_rgb(69, 124, 184)),
+        TimelineSource::LocalMessages => ("local", egui::Color32::from_rgb(67, 149, 112)),
         TimelineSource::Goals => ("goals", egui::Color32::from_rgb(202, 168, 68)),
     }
 }
@@ -3224,6 +3311,67 @@ fn render_timeline_source_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color
         .show(ui, |ui| {
             ui.label(egui::RichText::new(label).small().color(text_color));
         });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_timeline_local_message(
+    ui: &mut egui::Ui,
+    from_id: Id,
+    to_id: Id,
+    from_label: &str,
+    to_label: &str,
+    status: &LocalMessageStatus,
+    body: &str,
+    is_sender: bool,
+    now_key: i128,
+    at: Option<i128>,
+) {
+    let bubble_width = (ui.available_width() * 0.75).max(220.0);
+    let age = format_age(now_key, at);
+    let meta = format!("{age} · {}", local_message_status_text(status));
+    let align = if is_sender {
+        egui::Layout::right_to_left(egui::Align::TOP)
+    } else {
+        egui::Layout::left_to_right(egui::Align::TOP)
+    };
+    let from_chip_color = colorhash::ral_categorical(from_id.as_ref());
+    let to_chip_color = colorhash::ral_categorical(to_id.as_ref());
+    let bubble_color = from_chip_color;
+    let text_color = colorhash::text_color_on(bubble_color);
+
+    ui.with_layout(align, |ui| {
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                render_person_chip(ui, from_label, from_chip_color);
+                ui.small("→");
+                render_person_chip(ui, to_label, to_chip_color);
+                ui.add_space(6.0);
+                render_local_status_chip(ui, status);
+            });
+            egui::Frame::NONE
+                .fill(bubble_color)
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.add_sized(
+                        [bubble_width, 0.0],
+                        egui::Label::new(egui::RichText::new(body).color(text_color))
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                    );
+                });
+            ui.small(meta);
+        });
+    });
+}
+
+fn render_timeline_goal_event(ui: &mut egui::Ui, goal: &CompassTaskRow, detail: Option<String>) {
+    render_goal_card(ui, goal, 0.0);
+    if let Some(detail) = detail {
+        ui.add(
+            egui::Label::new(egui::RichText::new(detail).monospace())
+                .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+    }
 }
 
 fn render_compass_swimlanes(
@@ -3328,34 +3476,17 @@ fn status_color(status: &str) -> egui::Color32 {
     }
 }
 
-fn render_compass_swimlane_row(
-    ui: &mut egui::Ui,
-    expanded_goal: &mut Option<Id>,
-    notes: &HashMap<Id, Vec<CompassNoteRow>>,
-    row: &CompassTaskRow,
-    depth: usize,
-) {
-    fn draw_status_bar(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
-        // Draw inside the border so the thin outline stays crisp.
-        let inset = 1.0;
-        let bar_height = 4.0;
-        let min = egui::pos2(rect.left() + inset, rect.top() + inset);
-        let max = egui::pos2(rect.right() - inset, rect.top() + inset + bar_height);
-        ui.painter()
-            .rect_filled(egui::Rect::from_min_max(min, max), 0.0, color);
-    }
+fn draw_goal_status_bar(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
+    // Draw inside the border so the thin outline stays crisp.
+    let inset = 1.0;
+    let bar_height = 4.0;
+    let min = egui::pos2(rect.left() + inset, rect.top() + inset);
+    let max = egui::pos2(rect.right() - inset, rect.top() + inset + bar_height);
+    ui.painter()
+        .rect_filled(egui::Rect::from_min_max(min, max), 0.0, color);
+}
 
-    // Show hierarchy via left-side lines (outside the goal box). Deeper goals
-    // shift right a bit so the box "shrinks" from the left.
-    const DEP_LINE_STEP: f32 = 6.0;
-    const DEP_LINE_BASE: f32 = 8.0;
-    let dep_lines = depth.min(3);
-    let dep_indent = if dep_lines == 0 {
-        0.0
-    } else {
-        (dep_lines as f32 * DEP_LINE_STEP) + DEP_LINE_BASE
-    };
-
+fn goal_right_text(row: &CompassTaskRow) -> String {
     let mut right_parts: Vec<String> = Vec::new();
     if !row.tags.is_empty() {
         right_parts.push(
@@ -3373,9 +3504,11 @@ fn render_compass_swimlane_row(
         right_parts.push(format!("^{}", id_prefix(parent)));
     }
     right_parts.push(format!("[{}]", row.id_prefix));
-    let right_text = right_parts.join(" · ");
+    right_parts.join(" · ")
+}
 
-    let is_expanded = *expanded_goal == Some(row.id);
+fn render_goal_card(ui: &mut egui::Ui, row: &CompassTaskRow, dep_indent: f32) -> egui::Response {
+    let right_text = goal_right_text(row);
     let outline = ui.visuals().widgets.noninteractive.bg_stroke;
     let bar_color = status_color(&row.status);
     let inner = ui
@@ -3445,11 +3578,35 @@ fn render_compass_swimlane_row(
         })
         .inner;
 
-    draw_status_bar(ui, inner.response.rect, bar_color);
+    draw_goal_status_bar(ui, inner.response.rect, bar_color);
+    inner.response
+}
+
+fn render_compass_swimlane_row(
+    ui: &mut egui::Ui,
+    expanded_goal: &mut Option<Id>,
+    notes: &HashMap<Id, Vec<CompassNoteRow>>,
+    row: &CompassTaskRow,
+    depth: usize,
+) {
+    // Show hierarchy via left-side lines (outside the goal box). Deeper goals
+    // shift right a bit so the box "shrinks" from the left.
+    const DEP_LINE_STEP: f32 = 6.0;
+    const DEP_LINE_BASE: f32 = 8.0;
+    let dep_lines = depth.min(3);
+    let dep_indent = if dep_lines == 0 {
+        0.0
+    } else {
+        (dep_lines as f32 * DEP_LINE_STEP) + DEP_LINE_BASE
+    };
+
+    let is_expanded = *expanded_goal == Some(row.id);
+    let outline = ui.visuals().widgets.noninteractive.bg_stroke;
+    let response_rect = render_goal_card(ui, row, dep_indent).rect;
 
     // Make the whole row clickable to toggle note display.
     let click_id = ui.make_persistent_id(("compass_goal", row.id));
-    let response = ui.interact(inner.response.rect, click_id, egui::Sense::click());
+    let response = ui.interact(response_rect, click_id, egui::Sense::click());
     if response.clicked() {
         if *expanded_goal == Some(row.id) {
             *expanded_goal = None;
@@ -3500,7 +3657,7 @@ fn render_compass_swimlane_row(
     }
 
     // Draw a small "dependency gutter" to the left of the goal box.
-    let rect = inner.response.rect;
+    let rect = response_rect;
     let painter = ui.painter();
     let stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(130));
     for idx in 0..dep_lines {
@@ -3554,6 +3711,41 @@ fn local_message_status_text(status: &LocalMessageStatus) -> String {
         LocalMessageStatus::ReadBy(label) => format!("read-by:{label}"),
         LocalMessageStatus::Other => "other".to_string(),
     }
+}
+
+fn local_message_status_color(status: &LocalMessageStatus) -> egui::Color32 {
+    match status {
+        LocalMessageStatus::Unread => egui::Color32::from_rgb(202, 118, 45),
+        LocalMessageStatus::Read => egui::Color32::from_rgb(69, 141, 92),
+        LocalMessageStatus::Sent => egui::Color32::from_rgb(107, 118, 130),
+        LocalMessageStatus::ReadBy(_) => egui::Color32::from_rgb(74, 126, 183),
+        LocalMessageStatus::Other => egui::Color32::from_rgb(122, 104, 164),
+    }
+}
+
+fn render_local_status_chip(ui: &mut egui::Ui, status: &LocalMessageStatus) {
+    let fill = local_message_status_color(status);
+    let text_color = colorhash::text_color_on(fill);
+    let label = truncate_single_line(&local_message_status_text(status), 40);
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).color(text_color).small());
+        });
+}
+
+fn render_person_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
+    let text_color = colorhash::text_color_on(fill);
+    let label = truncate_single_line(label, 48);
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).color(text_color).small());
+        });
 }
 
 fn render_relations(ui: &mut egui::Ui, people: &[RelationRow]) {
