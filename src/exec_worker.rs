@@ -20,7 +20,8 @@ use triblespace::prelude::*;
 use crate::branch_util::ensure_branch_id;
 use crate::config::Config;
 use crate::repo_util::{
-    close_repo, ensure_worker_name, init_repo, load_text, push_workspace, seed_metadata,
+    close_repo, current_branch_head, ensure_worker_name, init_repo, load_text, push_workspace,
+    refresh_cached_checkout, seed_metadata,
 };
 use crate::schema::playground_exec;
 use crate::time_util::{epoch_interval, interval_key, now_epoch};
@@ -35,6 +36,13 @@ struct CommandRequest {
     stdin: Option<Value<Handle<Blake3, UnknownBlob>>>,
     stdin_text: Option<Value<Handle<Blake3, LongString>>>,
     timeout_ms: Option<Value<U256BE>>,
+}
+
+#[derive(Default)]
+struct CommandRequestIndex {
+    requests: HashMap<Id, CommandRequest>,
+    in_progress_by_worker: HashSet<Id>,
+    done: HashSet<Id>,
 }
 
 #[derive(Debug)]
@@ -65,17 +73,27 @@ pub(crate) fn run_exec_loop(
         let label = format!("exec-{}", id_prefix(worker_id));
         ensure_worker_name(&mut repo, branch_id, worker_id, &label)?;
         maybe_bootstrap_workspace(&mut repo)?;
+        let mut cached_head = None;
+        let mut cached_catalog = TribleSet::new();
+        let mut request_index = CommandRequestIndex::default();
 
         loop {
             if stop_requested(&stop) {
                 break;
             }
 
+            let branch_head = current_branch_head(&mut repo, branch_id)?;
+            if branch_head == cached_head {
+                sleep(Duration::from_millis(poll_ms));
+                continue;
+            }
+
             let mut ws = repo
                 .pull(branch_id)
                 .map_err(|err| anyhow!("pull workspace: {err:?}"))?;
-            let catalog = ws.checkout(..).context("checkout workspace")?;
-            let Some(request) = next_request(&catalog, worker_id) else {
+            let delta = refresh_cached_checkout(&mut ws, &mut cached_head, &mut cached_catalog)?;
+            request_index.apply_delta(&cached_catalog, &delta, worker_id);
+            let Some(request) = request_index.next_pending() else {
                 sleep(Duration::from_millis(poll_ms));
                 continue;
             };
@@ -291,128 +309,130 @@ fn env_path(key: &str) -> Option<PathBuf> {
     env_string(key).map(PathBuf::from)
 }
 
-fn next_request(catalog: &TribleSet, worker_id: Id) -> Option<CommandRequest> {
-    let mut requests: HashMap<Id, CommandRequest> = HashMap::new();
-    for (request_id, command) in find!(
-        (request_id: Id, command: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{
-            ?request_id @
-            playground_exec::kind: playground_exec::kind_command_request,
-            playground_exec::command_text: ?command,
-        }])
-    ) {
-        requests.insert(
-            request_id,
-            CommandRequest {
-                id: request_id,
-                command,
-                requested_at: None,
-                cwd: None,
-                stdin: None,
-                stdin_text: None,
-                timeout_ms: None,
-            },
-        );
-    }
+impl CommandRequestIndex {
+    fn apply_delta(&mut self, updated: &TribleSet, delta: &TribleSet, worker_id: Id) {
+        if delta.is_empty() {
+            return;
+        }
 
-    if requests.is_empty() {
-        return None;
-    }
+        for (request_id, command) in find!(
+            (request_id: Id, command: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @
+                playground_exec::kind: playground_exec::kind_command_request,
+                playground_exec::command_text: ?command,
+            }])
+        ) {
+            self.requests.insert(
+                request_id,
+                CommandRequest {
+                    id: request_id,
+                    command,
+                    requested_at: None,
+                    cwd: None,
+                    stdin: None,
+                    stdin_text: None,
+                    timeout_ms: None,
+                },
+            );
+        }
 
-    for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Value<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?request_id @ playground_exec::requested_at: ?requested_at
-        }])
-    ) {
-        if let Some(entry) = requests.get_mut(&request_id) {
-            entry.requested_at = Some(requested_at);
+        for (request_id, requested_at) in find!(
+            (request_id: Id, requested_at: Value<NsTAIInterval>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ playground_exec::requested_at: ?requested_at
+            }])
+        ) {
+            if let Some(entry) = self.requests.get_mut(&request_id) {
+                entry.requested_at = Some(requested_at);
+            }
+        }
+
+        for (request_id, cwd) in find!(
+            (request_id: Id, cwd: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ playground_exec::cwd: ?cwd
+            }])
+        ) {
+            if let Some(entry) = self.requests.get_mut(&request_id) {
+                entry.cwd = Some(cwd);
+            }
+        }
+
+        for (request_id, stdin) in find!(
+            (request_id: Id, stdin: Value<Handle<Blake3, UnknownBlob>>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ playground_exec::stdin: ?stdin
+            }])
+        ) {
+            if let Some(entry) = self.requests.get_mut(&request_id) {
+                entry.stdin = Some(stdin);
+            }
+        }
+
+        for (request_id, stdin_text) in find!(
+            (request_id: Id, stdin_text: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ playground_exec::stdin_text: ?stdin_text
+            }])
+        ) {
+            if let Some(entry) = self.requests.get_mut(&request_id) {
+                entry.stdin_text = Some(stdin_text);
+            }
+        }
+
+        for (request_id, timeout_ms) in find!(
+            (request_id: Id, timeout_ms: Value<U256BE>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ playground_exec::timeout_ms: ?timeout_ms
+            }])
+        ) {
+            if let Some(entry) = self.requests.get_mut(&request_id) {
+                entry.timeout_ms = Some(timeout_ms);
+            }
+        }
+
+        for (request_id, in_progress_worker_id) in find!(
+            (
+                request_id: Id,
+                in_progress_worker_id: Id
+            ),
+            pattern_changes!(updated, delta, [{
+                _?event @
+                playground_exec::kind: playground_exec::kind_in_progress,
+                playground_exec::about_request: ?request_id,
+                playground_exec::worker: ?in_progress_worker_id,
+            }])
+        ) {
+            if in_progress_worker_id == worker_id {
+                self.in_progress_by_worker.insert(request_id);
+            }
+        }
+
+        for (request_id,) in find!(
+            (request_id: Id),
+            pattern_changes!(updated, delta, [{
+                _?event @
+                playground_exec::kind: playground_exec::kind_command_result,
+                playground_exec::about_request: ?request_id,
+            }])
+        ) {
+            self.done.insert(request_id);
         }
     }
 
-    for (request_id, cwd) in find!(
-        (request_id: Id, cwd: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{
-            ?request_id @ playground_exec::cwd: ?cwd
-        }])
-    ) {
-        if let Some(entry) = requests.get_mut(&request_id) {
-            entry.cwd = Some(cwd);
-        }
+    fn next_pending(&self) -> Option<CommandRequest> {
+        let mut candidates: Vec<CommandRequest> = self
+            .requests
+            .values()
+            .filter(|req| {
+                !self.in_progress_by_worker.contains(&req.id) && !self.done.contains(&req.id)
+            })
+            .cloned()
+            .collect();
+        candidates.sort_by_key(|req| req.requested_at.map(interval_key).unwrap_or(i128::MIN));
+        candidates.into_iter().next()
     }
-
-    for (request_id, stdin) in find!(
-        (request_id: Id, stdin: Value<Handle<Blake3, UnknownBlob>>),
-        pattern!(catalog, [{
-            ?request_id @ playground_exec::stdin: ?stdin
-        }])
-    ) {
-        if let Some(entry) = requests.get_mut(&request_id) {
-            entry.stdin = Some(stdin);
-        }
-    }
-
-    for (request_id, stdin_text) in find!(
-        (request_id: Id, stdin_text: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{
-            ?request_id @ playground_exec::stdin_text: ?stdin_text
-        }])
-    ) {
-        if let Some(entry) = requests.get_mut(&request_id) {
-            entry.stdin_text = Some(stdin_text);
-        }
-    }
-
-    for (request_id, timeout_ms) in find!(
-        (request_id: Id, timeout_ms: Value<U256BE>),
-        pattern!(catalog, [{
-            ?request_id @ playground_exec::timeout_ms: ?timeout_ms
-        }])
-    ) {
-        if let Some(entry) = requests.get_mut(&request_id) {
-            entry.timeout_ms = Some(timeout_ms);
-        }
-    }
-
-    let mut in_progress = HashSet::new();
-    for (request_id, in_progress_worker_id) in find!(
-        (
-            request_id: Id,
-            in_progress_worker_id: Id
-        ),
-        pattern!(catalog, [{
-            _?event @
-            playground_exec::kind: playground_exec::kind_in_progress,
-            playground_exec::about_request: ?request_id,
-            playground_exec::worker: ?in_progress_worker_id,
-        }])
-    ) {
-        // A different worker id indicates another process/run; treat its in-progress marker
-        // as reclaimable for this worker and rely on result facts to dedupe completed work.
-        if in_progress_worker_id != worker_id {
-            continue;
-        }
-        in_progress.insert(request_id);
-    }
-
-    let mut done = HashSet::new();
-    for (request_id,) in find!(
-        (request_id: Id),
-        pattern!(catalog, [{
-            _?event @
-            playground_exec::kind: playground_exec::kind_command_result,
-            playground_exec::about_request: ?request_id,
-        }])
-    ) {
-        done.insert(request_id);
-    }
-
-    let mut candidates: Vec<CommandRequest> = requests
-        .into_values()
-        .filter(|req| !in_progress.contains(&req.id) && !done.contains(&req.id))
-        .collect();
-    candidates.sort_by_key(|req| req.requested_at.map(interval_key).unwrap_or(i128::MIN));
-    candidates.into_iter().next()
 }
 
 fn load_stdin(ws: &mut Workspace<Pile>, request: &CommandRequest) -> Result<Option<Bytes>> {

@@ -16,7 +16,8 @@ use triblespace::prelude::*;
 
 use crate::config::Config;
 use crate::repo_util::{
-    close_repo, ensure_worker_name, init_repo, load_text, push_workspace, seed_metadata,
+    close_repo, current_branch_head, ensure_worker_name, init_repo, load_text, push_workspace,
+    refresh_cached_checkout, seed_metadata,
 };
 use crate::schema::openai_responses;
 use crate::time_util::{epoch_interval, interval_key, now_epoch};
@@ -28,6 +29,13 @@ struct LlmRequest {
     model: Option<Value<ShortString>>,
     previous_response_id: Option<Value<Handle<Blake3, LongString>>>,
     requested_at: Option<Value<NsTAIInterval>>,
+}
+
+#[derive(Default)]
+struct LlmRequestIndex {
+    requests: HashMap<Id, LlmRequest>,
+    in_progress_by_worker: HashSet<Id>,
+    done: HashSet<Id>,
 }
 
 #[derive(Debug)]
@@ -114,6 +122,9 @@ pub(crate) fn run_llm_loop(
         seed_metadata(&mut repo)?;
         let label = format!("llm-{}", id_prefix(worker_id));
         ensure_worker_name(&mut repo, branch_id, worker_id, &label)?;
+        let mut cached_head = None;
+        let mut cached_catalog = TribleSet::new();
+        let mut request_index = LlmRequestIndex::default();
 
         let client = ResponsesClient::new(
             config.llm.base_url.as_str(),
@@ -126,11 +137,18 @@ pub(crate) fn run_llm_loop(
                 break;
             }
 
+            let branch_head = current_branch_head(&mut repo, branch_id)?;
+            if branch_head == cached_head {
+                sleep(Duration::from_millis(poll_ms));
+                continue;
+            }
+
             let mut ws = repo
                 .pull(branch_id)
                 .map_err(|err| anyhow::anyhow!("pull workspace: {err:?}"))?;
-            let catalog = ws.checkout(..).context("checkout workspace")?;
-            let Some(request) = next_request(&catalog, worker_id) else {
+            let delta = refresh_cached_checkout(&mut ws, &mut cached_head, &mut cached_catalog)?;
+            request_index.apply_delta(&cached_catalog, &delta, worker_id);
+            let Some(request) = request_index.next_pending() else {
                 sleep(Duration::from_millis(poll_ms));
                 continue;
             };
@@ -275,107 +293,109 @@ fn stop_requested(stop: &Option<Arc<AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
-fn next_request(catalog: &TribleSet, worker_id: Id) -> Option<LlmRequest> {
-    let mut requests: HashMap<Id, LlmRequest> = HashMap::new();
-    for (request_id, prompt) in find!(
-        (request_id: Id, prompt: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{
-            ?request_id @
-            openai_responses::kind: openai_responses::kind_request,
-            openai_responses::prompt: ?prompt,
-        }])
-    ) {
-        requests.insert(
-            request_id,
-            LlmRequest {
-                id: request_id,
-                prompt,
-                model: None,
-                previous_response_id: None,
-                requested_at: None,
-            },
-        );
-    }
+impl LlmRequestIndex {
+    fn apply_delta(&mut self, updated: &TribleSet, delta: &TribleSet, worker_id: Id) {
+        if delta.is_empty() {
+            return;
+        }
 
-    if requests.is_empty() {
-        return None;
-    }
+        for (request_id, prompt) in find!(
+            (request_id: Id, prompt: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @
+                openai_responses::kind: openai_responses::kind_request,
+                openai_responses::prompt: ?prompt,
+            }])
+        ) {
+            self.requests.insert(
+                request_id,
+                LlmRequest {
+                    id: request_id,
+                    prompt,
+                    model: None,
+                    previous_response_id: None,
+                    requested_at: None,
+                },
+            );
+        }
 
-    for (request_id, model) in find!(
-        (request_id: Id, model: Value<ShortString>),
-        pattern!(catalog, [{
-            ?request_id @ openai_responses::model: ?model
-        }])
-    ) {
-        if let Some(entry) = requests.get_mut(&request_id) {
-            entry.model = Some(model);
+        for (request_id, model) in find!(
+            (request_id: Id, model: Value<ShortString>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ openai_responses::model: ?model
+            }])
+        ) {
+            if let Some(entry) = self.requests.get_mut(&request_id) {
+                entry.model = Some(model);
+            }
+        }
+
+        for (request_id, requested_at) in find!(
+            (request_id: Id, requested_at: Value<NsTAIInterval>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ openai_responses::requested_at: ?requested_at
+            }])
+        ) {
+            if let Some(entry) = self.requests.get_mut(&request_id) {
+                entry.requested_at = Some(requested_at);
+            }
+        }
+
+        for (request_id, previous_response_id) in find!(
+            (
+                request_id: Id,
+                previous_response_id: Value<Handle<Blake3, LongString>>
+            ),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ openai_responses::previous_response_id: ?previous_response_id
+            }])
+        ) {
+            if let Some(entry) = self.requests.get_mut(&request_id) {
+                entry.previous_response_id = Some(previous_response_id);
+            }
+        }
+
+        for (request_id, in_progress_worker_id) in find!(
+            (
+                request_id: Id,
+                in_progress_worker_id: Id
+            ),
+            pattern_changes!(updated, delta, [{
+                _?event @
+                openai_responses::kind: openai_responses::kind_in_progress,
+                openai_responses::about_request: ?request_id,
+                openai_responses::worker: ?in_progress_worker_id,
+            }])
+        ) {
+            if in_progress_worker_id == worker_id {
+                self.in_progress_by_worker.insert(request_id);
+            }
+        }
+
+        for (request_id,) in find!(
+            (request_id: Id),
+            pattern_changes!(updated, delta, [{
+                _?event @
+                openai_responses::kind: openai_responses::kind_result,
+                openai_responses::about_request: ?request_id,
+            }])
+        ) {
+            self.done.insert(request_id);
         }
     }
 
-    for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Value<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?request_id @ openai_responses::requested_at: ?requested_at
-        }])
-    ) {
-        if let Some(entry) = requests.get_mut(&request_id) {
-            entry.requested_at = Some(requested_at);
-        }
+    fn next_pending(&self) -> Option<LlmRequest> {
+        let mut candidates: Vec<LlmRequest> = self
+            .requests
+            .values()
+            .filter(|req| {
+                !self.in_progress_by_worker.contains(&req.id) && !self.done.contains(&req.id)
+            })
+            .cloned()
+            .collect();
+        candidates.sort_by_key(|req| req.requested_at.map(interval_key).unwrap_or(i128::MIN));
+        candidates.into_iter().next()
     }
-
-    for (request_id, previous_response_id) in find!(
-        (
-            request_id: Id,
-            previous_response_id: Value<Handle<Blake3, LongString>>
-        ),
-        pattern!(catalog, [{
-            ?request_id @ openai_responses::previous_response_id: ?previous_response_id
-        }])
-    ) {
-        if let Some(entry) = requests.get_mut(&request_id) {
-            entry.previous_response_id = Some(previous_response_id);
-        }
-    }
-
-    let mut in_progress = HashSet::new();
-    for (request_id, in_progress_worker_id) in find!(
-        (
-            request_id: Id,
-            in_progress_worker_id: Id
-        ),
-        pattern!(catalog, [{
-            _?event @
-            openai_responses::kind: openai_responses::kind_in_progress,
-            openai_responses::about_request: ?request_id,
-            openai_responses::worker: ?in_progress_worker_id,
-        }])
-    ) {
-        // A different worker id indicates another process/run; treat its in-progress marker
-        // as reclaimable for this worker and rely on result facts to dedupe completed work.
-        if in_progress_worker_id != worker_id {
-            continue;
-        }
-        in_progress.insert(request_id);
-    }
-
-    let mut done = HashSet::new();
-    for (request_id,) in find!(
-        (request_id: Id),
-        pattern!(catalog, [{
-            _?event @
-            openai_responses::kind: openai_responses::kind_result,
-            openai_responses::about_request: ?request_id,
-        }])
-    ) {
-        done.insert(request_id);
-    }
-
-    let mut candidates: Vec<LlmRequest> = requests
-        .into_values()
-        .filter(|req| !in_progress.contains(&req.id) && !done.contains(&req.id))
-        .collect();
-    candidates.sort_by_key(|req| req.requested_at.map(interval_key).unwrap_or(i128::MIN));
-    candidates.into_iter().next()
 }
 
 fn build_payload(

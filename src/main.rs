@@ -30,7 +30,9 @@ mod time_util;
 mod workspace_snapshot;
 
 use config::Config;
-use repo_util::{close_repo, init_repo, load_text, push_workspace};
+use repo_util::{
+    close_repo, current_branch_head, init_repo, load_text, push_workspace, refresh_cached_checkout,
+};
 use schema::{openai_responses, playground_cog, playground_exec};
 use time_util::{epoch_interval, interval_key, now_epoch};
 
@@ -776,9 +778,50 @@ struct LlmRequestInfo {
 }
 
 #[derive(Debug, Clone)]
-struct ThoughtRecord {
+struct CoreLlmRequest {
     id: Id,
-    created_at_key: i128,
+    requested_at: Option<Value<NsTAIInterval>>,
+    thought_id: Option<Id>,
+}
+
+#[derive(Debug, Clone)]
+struct CoreThought {
+    id: Id,
+    created_at: Option<Value<NsTAIInterval>>,
+    prompt: Option<Value<Handle<Blake3, LongString>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CoreCommandRequest {
+    id: Id,
+    requested_at: Option<Value<NsTAIInterval>>,
+    about_thought: Option<Id>,
+    command: Option<Value<Handle<Blake3, LongString>>>,
+}
+
+#[derive(Debug, Clone)]
+struct LlmResultEntry {
+    about_request: Option<Id>,
+    finished_at: Option<Value<NsTAIInterval>>,
+    attempt: Option<Value<U256BE>>,
+    output_text: Option<Value<Handle<Blake3, LongString>>>,
+    error: Option<Value<Handle<Blake3, LongString>>>,
+    response_id: Option<Value<Handle<Blake3, LongString>>>,
+}
+
+#[derive(Default)]
+struct CoreIndex {
+    llm_requests: HashMap<Id, CoreLlmRequest>,
+    llm_done_requests: HashSet<Id>,
+    request_for_thought: HashMap<Id, Id>,
+    thoughts: HashMap<Id, CoreThought>,
+    thought_for_exec_result: HashMap<Id, Id>,
+    requested_thoughts: HashSet<Id>,
+    llm_results: HashMap<Id, LlmResultEntry>,
+    command_requests: HashMap<Id, CoreCommandRequest>,
+    command_done_requests: HashSet<Id>,
+    command_results: HashMap<Id, CommandResultInfo>,
+    used_exec_results: HashSet<Id>,
 }
 
 fn ensure_llm_request(
@@ -786,18 +829,29 @@ fn ensure_llm_request(
     branch_id: Id,
     config: &Config,
 ) -> Result<LlmRequestInfo> {
+    let mut cached_head = None;
+    let mut cached_catalog = TribleSet::new();
+    let mut core_index = CoreIndex::default();
     loop {
+        let branch_head = current_branch_head(repo, branch_id)?;
+        if branch_head == cached_head {
+            sleep(Duration::from_millis(config.poll_ms));
+            continue;
+        }
+
         let mut ws = repo
             .pull(branch_id)
             .map_err(|err| anyhow!("pull workspace for llm request: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout workspace")?;
+        let delta = refresh_cached_checkout(&mut ws, &mut cached_head, &mut cached_catalog)?;
+        core_index.apply_delta(&cached_catalog, &delta);
 
-        if let Some(request) = latest_pending_llm_request(&catalog) {
+        if let Some(request) = core_index.latest_pending_llm_request() {
             return Ok(request);
         }
 
-        if let Some(thought_id) = latest_unrequested_thought(&catalog) {
-            let request_id = create_request_for_thought(&mut ws, &catalog, thought_id, config)?;
+        if let Some(thought_id) = core_index.latest_unrequested_thought() {
+            let request_id =
+                create_request_for_thought_from_index(&mut ws, &core_index, thought_id, config)?;
             push_workspace(repo, &mut ws).context("push llm request")?;
             return Ok(LlmRequestInfo {
                 id: request_id,
@@ -805,14 +859,15 @@ fn ensure_llm_request(
             });
         }
 
-        if let Some(exec_result) = latest_unprocessed_exec_result(&catalog) {
-            let prompt = prompt_from_exec_result(&mut ws, &catalog, &exec_result, config)?;
+        if let Some(exec_result) = core_index.latest_unprocessed_exec_result() {
+            let prompt =
+                prompt_from_exec_result_with_index(&mut ws, &core_index, &exec_result, config)?;
             let request =
                 create_thought_and_request(repo, branch_id, &prompt, Some(exec_result.id), config)?;
             return Ok(request);
         }
 
-        if !has_pending_command_request(&catalog) {
+        if !core_index.has_pending_command_request() {
             drop(ws);
             let command = orient_bootstrap_command(config);
             ensure_command_request(
@@ -847,10 +902,13 @@ fn create_thought_and_request(
         .pull(branch_id)
         .map_err(|err| anyhow!("pull workspace for thought: {err:?}"))?;
     let catalog = ws.checkout(..).context("checkout workspace")?;
+    let mut core_index = CoreIndex::default();
+    core_index.apply_delta(&catalog, &catalog);
 
     if let Some(exec_result_id) = about_exec_result {
-        if let Some(thought_id) = thought_for_exec_result(&catalog, exec_result_id) {
-            let request_id = create_request_for_thought(&mut ws, &catalog, thought_id, config)?;
+        if let Some(thought_id) = core_index.thought_for_exec_result(exec_result_id) {
+            let request_id =
+                create_request_for_thought_from_index(&mut ws, &core_index, thought_id, config)?;
             push_workspace(repo, &mut ws).context("push llm request")?;
             return Ok(LlmRequestInfo {
                 id: request_id,
@@ -872,7 +930,11 @@ fn create_thought_and_request(
         change += entity! { &thought_id @ playground_cog::about_exec_result: exec_result_id };
     }
 
-    let previous_response_id = latest_llm_response_id(&mut ws, &catalog)?;
+    let previous_response_id = core_index
+        .latest_llm_response_id_handle()
+        .map(|handle| load_text(&mut ws, handle))
+        .transpose()
+        .context("load llm response_id")?;
     let request_id = ufoid();
     change += entity! { &request_id @
         openai_responses::kind: openai_responses::kind_request,
@@ -897,20 +959,26 @@ fn create_thought_and_request(
     })
 }
 
-fn create_request_for_thought(
+fn create_request_for_thought_from_index(
     ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
+    core_index: &CoreIndex,
     thought_id: Id,
     config: &Config,
 ) -> Result<Id> {
-    if let Some(request_id) = request_for_thought(catalog, thought_id) {
+    if let Some(request_id) = core_index.request_for_thought(thought_id) {
         return Ok(request_id);
     }
 
-    let Some(prompt_handle) = thought_prompt_handle(catalog, thought_id) else {
+    let Some(prompt_handle) = core_index.thought_prompt_handle(thought_id) else {
         return Err(anyhow!("thought {thought_id:x} missing prompt"));
     };
-    let previous_response_id = latest_llm_response_id(ws, catalog)?;
+
+    let previous_response_id = core_index
+        .latest_llm_response_id_handle()
+        .map(|handle| load_text(ws, handle))
+        .transpose()
+        .context("load llm response_id")?;
+
     let now = epoch_interval(now_epoch());
     let request_id = ufoid();
     let mut change = TribleSet::new();
@@ -931,176 +999,6 @@ fn create_request_for_thought(
     Ok(*request_id)
 }
 
-fn latest_pending_llm_request(catalog: &TribleSet) -> Option<LlmRequestInfo> {
-    let results = llm_request_results(catalog);
-    for record in list_llm_requests_by_requested(catalog).into_iter().rev() {
-        if results.contains(&record.id) {
-            continue;
-        }
-        let thought_id = request_thought_id(catalog, record.id);
-        return Some(LlmRequestInfo {
-            id: record.id,
-            thought_id,
-        });
-    }
-    None
-}
-
-#[derive(Debug, Clone)]
-struct LlmRequestRecord {
-    id: Id,
-    requested_at_key: i128,
-}
-
-fn list_llm_requests_by_requested(catalog: &TribleSet) -> Vec<LlmRequestRecord> {
-    let mut requests = Vec::new();
-    for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Value<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?request_id @
-            openai_responses::kind: openai_responses::kind_request,
-            openai_responses::requested_at: ?requested_at,
-        }])
-    ) {
-        requests.push(LlmRequestRecord {
-            id: request_id,
-            requested_at_key: interval_key(requested_at),
-        });
-    }
-    requests.sort_by(|left, right| {
-        left.requested_at_key
-            .cmp(&right.requested_at_key)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    requests
-}
-
-fn llm_request_results(catalog: &TribleSet) -> HashSet<Id> {
-    find!(
-        (request_id: Id),
-        pattern!(catalog, [{
-            _?result @
-            openai_responses::kind: openai_responses::kind_result,
-            openai_responses::about_request: ?request_id,
-        }])
-    )
-    .into_iter()
-    .map(|(request_id,)| request_id)
-    .collect()
-}
-
-fn latest_llm_response_id(ws: &mut Workspace<Pile>, catalog: &TribleSet) -> Result<Option<String>> {
-    let mut candidates = Vec::new();
-    for (response_id_handle, finished_at) in find!(
-        (
-            response_id_handle: Value<Handle<Blake3, LongString>>,
-            finished_at: Value<NsTAIInterval>
-        ),
-        pattern!(catalog, [{
-            _?result @
-            openai_responses::kind: openai_responses::kind_result,
-            openai_responses::response_id: ?response_id_handle,
-            openai_responses::finished_at: ?finished_at,
-        }])
-    ) {
-        candidates.push((interval_key(finished_at), response_id_handle));
-    }
-    candidates.sort_by_key(|(finished_at_key, _)| *finished_at_key);
-    let Some((_, response_id_handle)) = candidates.pop() else {
-        return Ok(None);
-    };
-    let response_id = load_text(ws, response_id_handle).context("load llm response_id")?;
-    Ok(Some(response_id))
-}
-
-fn request_thought_id(catalog: &TribleSet, request_id: Id) -> Option<Id> {
-    find!(
-        (request: Id, thought: Id),
-        pattern!(catalog, [{
-            ?request @ openai_responses::about_thought: ?thought
-        }])
-    )
-    .into_iter()
-    .find_map(|(request, thought)| (request == request_id).then_some(thought))
-}
-
-fn request_for_thought(catalog: &TribleSet, thought_id: Id) -> Option<Id> {
-    find!(
-        (request: Id, thought: Id),
-        pattern!(catalog, [{
-            ?request @ openai_responses::about_thought: ?thought
-        }])
-    )
-    .into_iter()
-    .find_map(|(request, thought)| (thought == thought_id).then_some(request))
-}
-
-fn thought_prompt_handle(
-    catalog: &TribleSet,
-    thought_id: Id,
-) -> Option<Value<Handle<Blake3, LongString>>> {
-    find!(
-        (thought: Id, prompt: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{
-            ?thought @ playground_cog::prompt: ?prompt
-        }])
-    )
-    .into_iter()
-    .find_map(|(thought, prompt)| (thought == thought_id).then_some(prompt))
-}
-
-fn list_thoughts_by_created(catalog: &TribleSet) -> Vec<ThoughtRecord> {
-    let mut thoughts = Vec::new();
-    for (thought_id, created_at) in find!(
-        (thought_id: Id, created_at: Value<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?thought_id @
-            playground_cog::kind: playground_cog::kind_thought,
-            playground_cog::created_at: ?created_at,
-        }])
-    ) {
-        thoughts.push(ThoughtRecord {
-            id: thought_id,
-            created_at_key: interval_key(created_at),
-        });
-    }
-    thoughts.sort_by(|left, right| {
-        left.created_at_key
-            .cmp(&right.created_at_key)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    thoughts
-}
-
-fn latest_unrequested_thought(catalog: &TribleSet) -> Option<Id> {
-    let requested: HashSet<Id> = find!(
-        (thought: Id),
-        pattern!(catalog, [{
-            _?request @ openai_responses::about_thought: ?thought
-        }])
-    )
-    .into_iter()
-    .map(|(thought,)| thought)
-    .collect();
-
-    list_thoughts_by_created(catalog)
-        .into_iter()
-        .rev()
-        .find(|record| !requested.contains(&record.id))
-        .map(|record| record.id)
-}
-
-fn thought_for_exec_result(catalog: &TribleSet, exec_result_id: Id) -> Option<Id> {
-    find!(
-        (thought: Id, exec_result: Id),
-        pattern!(catalog, [{
-            ?thought @ playground_cog::about_exec_result: ?exec_result
-        }])
-    )
-    .into_iter()
-    .find_map(|(thought, exec_result)| (exec_result == exec_result_id).then_some(thought))
-}
-
 #[derive(Debug)]
 struct LlmResult {
     output_text: String,
@@ -1109,8 +1007,6 @@ struct LlmResult {
 
 #[derive(Debug, Clone)]
 struct LlmResultInfo {
-    finished_at: Option<Value<NsTAIInterval>>,
-    attempt: Option<Value<U256BE>>,
     output_text: Option<Value<Handle<Blake3, LongString>>>,
     error: Option<Value<Handle<Blake3, LongString>>>,
 }
@@ -1121,97 +1017,30 @@ fn wait_for_llm_result(
     request_id: Id,
     poll_ms: u64,
 ) -> Result<LlmResult> {
+    let mut cached_head = None;
+    let mut cached_catalog = TribleSet::new();
+    let mut core_index = CoreIndex::default();
     loop {
+        let branch_head = current_branch_head(repo, branch_id)?;
+        if branch_head == cached_head {
+            sleep(Duration::from_millis(poll_ms));
+            continue;
+        }
+
         let mut ws = repo
             .pull(branch_id)
             .map_err(|err| anyhow!("pull workspace for llm result: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout workspace")?;
-        if let Some(result) = latest_llm_result(&catalog, request_id) {
+        let delta = refresh_cached_checkout(&mut ws, &mut cached_head, &mut cached_catalog)?;
+        core_index.apply_delta(&cached_catalog, &delta);
+        if !delta_has_llm_result(&cached_catalog, &delta, request_id) {
+            sleep(Duration::from_millis(poll_ms));
+            continue;
+        }
+        if let Some(result) = core_index.latest_llm_result(request_id) {
             return load_llm_result(&mut ws, result);
         }
         sleep(Duration::from_millis(poll_ms));
     }
-}
-
-fn latest_llm_result(catalog: &TribleSet, request_id: Id) -> Option<LlmResultInfo> {
-    let mut results: HashMap<Id, LlmResultInfo> = HashMap::new();
-    for (result_id, about_request) in find!(
-        (result_id: Id, about_request: Id),
-        pattern!(catalog, [{
-            ?result_id @
-            openai_responses::kind: openai_responses::kind_result,
-            openai_responses::about_request: ?about_request,
-        }])
-    ) {
-        if about_request != request_id {
-            continue;
-        }
-        results.insert(
-            result_id,
-            LlmResultInfo {
-                finished_at: None,
-                attempt: None,
-                output_text: None,
-                error: None,
-            },
-        );
-    }
-
-    if results.is_empty() {
-        return None;
-    }
-
-    for (result_id, finished_at) in find!(
-        (result_id: Id, finished_at: Value<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?result_id @ openai_responses::finished_at: ?finished_at
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.finished_at = Some(finished_at);
-        }
-    }
-
-    for (result_id, attempt) in find!(
-        (result_id: Id, attempt: Value<U256BE>),
-        pattern!(catalog, [{
-            ?result_id @ openai_responses::attempt: ?attempt
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.attempt = Some(attempt);
-        }
-    }
-
-    for (result_id, output_text) in find!(
-        (result_id: Id, output_text: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{
-            ?result_id @ openai_responses::output_text: ?output_text
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.output_text = Some(output_text);
-        }
-    }
-
-    for (result_id, error) in find!(
-        (result_id: Id, error: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{
-            ?result_id @ openai_responses::error: ?error
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.error = Some(error);
-        }
-    }
-
-    let mut candidates: Vec<LlmResultInfo> = results.into_values().collect();
-    candidates.sort_by_key(|res| {
-        let attempt = res.attempt.and_then(u256be_to_u64).unwrap_or_default();
-        let finished_at = res.finished_at.map(interval_key).unwrap_or(i128::MIN);
-        (attempt, finished_at)
-    });
-    candidates.pop()
 }
 
 fn load_llm_result(ws: &mut Workspace<Pile>, result: LlmResultInfo) -> Result<LlmResult> {
@@ -1258,6 +1087,454 @@ struct CommandResultOutput {
     result: ExecResult,
 }
 
+impl CoreIndex {
+    fn apply_delta(&mut self, updated: &TribleSet, delta: &TribleSet) {
+        if delta.is_empty() {
+            return;
+        }
+
+        for (request_id,) in find!(
+            (request_id: Id),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ openai_responses::kind: openai_responses::kind_request
+            }])
+        ) {
+            self.llm_requests
+                .entry(request_id)
+                .or_insert(CoreLlmRequest {
+                    id: request_id,
+                    requested_at: None,
+                    thought_id: None,
+                });
+        }
+
+        for (request_id, requested_at) in find!(
+            (request_id: Id, requested_at: Value<NsTAIInterval>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ openai_responses::requested_at: ?requested_at
+            }])
+        ) {
+            if let Some(entry) = self.llm_requests.get_mut(&request_id) {
+                entry.requested_at = Some(requested_at);
+            }
+        }
+
+        for (request_id, thought_id) in find!(
+            (request_id: Id, thought_id: Id),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ openai_responses::about_thought: ?thought_id
+            }])
+        ) {
+            if let Some(entry) = self.llm_requests.get_mut(&request_id) {
+                entry.thought_id = Some(thought_id);
+            }
+            self.request_for_thought.insert(thought_id, request_id);
+            self.requested_thoughts.insert(thought_id);
+        }
+
+        for (thought_id,) in find!(
+            (thought_id: Id),
+            pattern_changes!(updated, delta, [{
+                ?thought_id @ playground_cog::kind: playground_cog::kind_thought
+            }])
+        ) {
+            self.thoughts.entry(thought_id).or_insert(CoreThought {
+                id: thought_id,
+                created_at: None,
+                prompt: None,
+            });
+        }
+
+        for (thought_id, created_at) in find!(
+            (thought_id: Id, created_at: Value<NsTAIInterval>),
+            pattern_changes!(updated, delta, [{
+                ?thought_id @ playground_cog::created_at: ?created_at
+            }])
+        ) {
+            if let Some(entry) = self.thoughts.get_mut(&thought_id) {
+                entry.created_at = Some(created_at);
+            }
+        }
+
+        for (thought_id, prompt) in find!(
+            (thought_id: Id, prompt: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?thought_id @ playground_cog::prompt: ?prompt
+            }])
+        ) {
+            if let Some(entry) = self.thoughts.get_mut(&thought_id) {
+                entry.prompt = Some(prompt);
+            }
+        }
+
+        for (thought_id, exec_result_id) in find!(
+            (thought_id: Id, exec_result_id: Id),
+            pattern_changes!(updated, delta, [{
+                ?thought_id @ playground_cog::about_exec_result: ?exec_result_id
+            }])
+        ) {
+            self.thought_for_exec_result
+                .insert(exec_result_id, thought_id);
+            self.used_exec_results.insert(exec_result_id);
+        }
+
+        for (result_id, about_request) in find!(
+            (result_id: Id, about_request: Id),
+            pattern_changes!(updated, delta, [{
+                ?result_id @
+                openai_responses::kind: openai_responses::kind_result,
+                openai_responses::about_request: ?about_request,
+            }])
+        ) {
+            self.llm_done_requests.insert(about_request);
+            let entry = self.llm_results.entry(result_id).or_insert(LlmResultEntry {
+                about_request: None,
+                finished_at: None,
+                attempt: None,
+                output_text: None,
+                error: None,
+                response_id: None,
+            });
+            entry.about_request = Some(about_request);
+        }
+
+        for (result_id, finished_at) in find!(
+            (result_id: Id, finished_at: Value<NsTAIInterval>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ openai_responses::finished_at: ?finished_at
+            }])
+        ) {
+            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+                entry.finished_at = Some(finished_at);
+            }
+        }
+
+        for (result_id, attempt) in find!(
+            (result_id: Id, attempt: Value<U256BE>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ openai_responses::attempt: ?attempt
+            }])
+        ) {
+            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+                entry.attempt = Some(attempt);
+            }
+        }
+
+        for (result_id, output_text) in find!(
+            (result_id: Id, output_text: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ openai_responses::output_text: ?output_text
+            }])
+        ) {
+            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+                entry.output_text = Some(output_text);
+            }
+        }
+
+        for (result_id, error) in find!(
+            (result_id: Id, error: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ openai_responses::error: ?error
+            }])
+        ) {
+            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+                entry.error = Some(error);
+            }
+        }
+
+        for (result_id, response_id) in find!(
+            (
+                result_id: Id,
+                response_id: Value<Handle<Blake3, LongString>>
+            ),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ openai_responses::response_id: ?response_id
+            }])
+        ) {
+            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+                entry.response_id = Some(response_id);
+            }
+        }
+
+        for (request_id,) in find!(
+            (request_id: Id),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ playground_exec::kind: playground_exec::kind_command_request
+            }])
+        ) {
+            self.command_requests
+                .entry(request_id)
+                .or_insert(CoreCommandRequest {
+                    id: request_id,
+                    requested_at: None,
+                    about_thought: None,
+                    command: None,
+                });
+        }
+
+        for (request_id, requested_at) in find!(
+            (request_id: Id, requested_at: Value<NsTAIInterval>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ playground_exec::requested_at: ?requested_at
+            }])
+        ) {
+            if let Some(entry) = self.command_requests.get_mut(&request_id) {
+                entry.requested_at = Some(requested_at);
+            }
+        }
+
+        for (request_id, about_thought) in find!(
+            (request_id: Id, about_thought: Id),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ playground_exec::about_thought: ?about_thought
+            }])
+        ) {
+            if let Some(entry) = self.command_requests.get_mut(&request_id) {
+                entry.about_thought = Some(about_thought);
+            }
+        }
+
+        for (request_id, command) in find!(
+            (request_id: Id, command: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?request_id @ playground_exec::command_text: ?command
+            }])
+        ) {
+            if let Some(entry) = self.command_requests.get_mut(&request_id) {
+                entry.command = Some(command);
+            }
+        }
+
+        for (result_id, about_request) in find!(
+            (result_id: Id, about_request: Id),
+            pattern_changes!(updated, delta, [{
+                ?result_id @
+                playground_exec::kind: playground_exec::kind_command_result,
+                playground_exec::about_request: ?about_request,
+            }])
+        ) {
+            self.command_done_requests.insert(about_request);
+            self.command_results
+                .entry(result_id)
+                .or_insert(CommandResultInfo {
+                    id: result_id,
+                    about_request,
+                    finished_at: None,
+                    attempt: None,
+                    stdout: None,
+                    stderr: None,
+                    stdout_text: None,
+                    stderr_text: None,
+                    exit_code: None,
+                    error: None,
+                });
+        }
+
+        for (result_id, finished_at) in find!(
+            (result_id: Id, finished_at: Value<NsTAIInterval>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ playground_exec::finished_at: ?finished_at
+            }])
+        ) {
+            if let Some(entry) = self.command_results.get_mut(&result_id) {
+                entry.finished_at = Some(finished_at);
+            }
+        }
+
+        for (result_id, attempt) in find!(
+            (result_id: Id, attempt: Value<U256BE>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ playground_exec::attempt: ?attempt
+            }])
+        ) {
+            if let Some(entry) = self.command_results.get_mut(&result_id) {
+                entry.attempt = Some(attempt);
+            }
+        }
+
+        for (result_id, stdout) in find!(
+            (result_id: Id, stdout: Value<Handle<Blake3, UnknownBlob>>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ playground_exec::stdout: ?stdout
+            }])
+        ) {
+            if let Some(entry) = self.command_results.get_mut(&result_id) {
+                entry.stdout = Some(stdout);
+            }
+        }
+
+        for (result_id, stderr) in find!(
+            (result_id: Id, stderr: Value<Handle<Blake3, UnknownBlob>>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ playground_exec::stderr: ?stderr
+            }])
+        ) {
+            if let Some(entry) = self.command_results.get_mut(&result_id) {
+                entry.stderr = Some(stderr);
+            }
+        }
+
+        for (result_id, stdout_text) in find!(
+            (result_id: Id, stdout_text: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ playground_exec::stdout_text: ?stdout_text
+            }])
+        ) {
+            if let Some(entry) = self.command_results.get_mut(&result_id) {
+                entry.stdout_text = Some(stdout_text);
+            }
+        }
+
+        for (result_id, stderr_text) in find!(
+            (result_id: Id, stderr_text: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ playground_exec::stderr_text: ?stderr_text
+            }])
+        ) {
+            if let Some(entry) = self.command_results.get_mut(&result_id) {
+                entry.stderr_text = Some(stderr_text);
+            }
+        }
+
+        for (result_id, exit_code) in find!(
+            (result_id: Id, exit_code: Value<U256BE>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ playground_exec::exit_code: ?exit_code
+            }])
+        ) {
+            if let Some(entry) = self.command_results.get_mut(&result_id) {
+                entry.exit_code = Some(exit_code);
+            }
+        }
+
+        for (result_id, error) in find!(
+            (result_id: Id, error: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ playground_exec::error: ?error
+            }])
+        ) {
+            if let Some(entry) = self.command_results.get_mut(&result_id) {
+                entry.error = Some(error);
+            }
+        }
+    }
+
+    fn latest_pending_llm_request(&self) -> Option<LlmRequestInfo> {
+        let mut candidates: Vec<CoreLlmRequest> = self
+            .llm_requests
+            .values()
+            .filter(|request| !self.llm_done_requests.contains(&request.id))
+            .cloned()
+            .collect();
+        candidates.sort_by_key(|request| {
+            (
+                request.requested_at.map(interval_key).unwrap_or(i128::MIN),
+                request.id,
+            )
+        });
+        candidates.pop().map(|request| LlmRequestInfo {
+            id: request.id,
+            thought_id: request.thought_id,
+        })
+    }
+
+    fn latest_unrequested_thought(&self) -> Option<Id> {
+        let mut candidates: Vec<CoreThought> = self
+            .thoughts
+            .values()
+            .filter(|thought| !self.requested_thoughts.contains(&thought.id))
+            .cloned()
+            .collect();
+        candidates.sort_by_key(|thought| (thought.created_at.map(interval_key), thought.id));
+        candidates.pop().map(|thought| thought.id)
+    }
+
+    fn request_for_thought(&self, thought_id: Id) -> Option<Id> {
+        self.request_for_thought.get(&thought_id).copied()
+    }
+
+    fn thought_for_exec_result(&self, exec_result_id: Id) -> Option<Id> {
+        self.thought_for_exec_result.get(&exec_result_id).copied()
+    }
+
+    fn thought_prompt_handle(&self, thought_id: Id) -> Option<Value<Handle<Blake3, LongString>>> {
+        self.thoughts
+            .get(&thought_id)
+            .and_then(|thought| thought.prompt)
+    }
+
+    fn latest_llm_response_id_handle(&self) -> Option<Value<Handle<Blake3, LongString>>> {
+        self.llm_results
+            .values()
+            .filter_map(|result| {
+                result
+                    .response_id
+                    .map(|handle| (result.finished_at.map(interval_key), handle))
+            })
+            .max_by_key(|(finished_at, _)| *finished_at)
+            .map(|(_, handle)| handle)
+    }
+
+    fn latest_llm_result(&self, request_id: Id) -> Option<LlmResultInfo> {
+        self.llm_results
+            .values()
+            .filter(|result| result.about_request == Some(request_id))
+            .max_by_key(|result| llm_result_rank(result.attempt, result.finished_at))
+            .map(|result| LlmResultInfo {
+                output_text: result.output_text,
+                error: result.error,
+            })
+    }
+
+    fn has_pending_command_request(&self) -> bool {
+        self.command_requests
+            .values()
+            .any(|request| !self.command_done_requests.contains(&request.id))
+    }
+
+    fn command_request_command_handle(
+        &self,
+        request_id: Id,
+    ) -> Option<Value<Handle<Blake3, LongString>>> {
+        self.command_requests
+            .get(&request_id)
+            .and_then(|request| request.command)
+    }
+
+    fn latest_command_result(&self, request_id: Id) -> Option<CommandResultInfo> {
+        self.command_results
+            .values()
+            .filter(|result| result.about_request == request_id)
+            .cloned()
+            .max_by_key(command_result_rank)
+    }
+
+    fn latest_unprocessed_exec_result(&self) -> Option<CommandResultInfo> {
+        self.command_results
+            .values()
+            .filter(|result| !self.used_exec_results.contains(&result.id))
+            .cloned()
+            .max_by_key(|result| result.finished_at.map(interval_key).unwrap_or(i128::MIN))
+    }
+}
+
+fn llm_result_rank(
+    attempt: Option<Value<U256BE>>,
+    finished_at: Option<Value<NsTAIInterval>>,
+) -> (u64, i128) {
+    (
+        attempt.and_then(u256be_to_u64).unwrap_or_default(),
+        finished_at.map(interval_key).unwrap_or(i128::MIN),
+    )
+}
+
+fn command_result_rank(result: &CommandResultInfo) -> (u64, i128) {
+    (
+        result.attempt.and_then(u256be_to_u64).unwrap_or_default(),
+        result.finished_at.map(interval_key).unwrap_or(i128::MIN),
+    )
+}
+
 fn ensure_command_request(
     repo: &mut Repository<Pile>,
     branch_id: Id,
@@ -1266,65 +1543,43 @@ fn ensure_command_request(
     default_cwd: Option<&str>,
     sandbox_profile: Option<Id>,
 ) -> Result<Id> {
-    loop {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull workspace for command request: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout workspace")?;
-        if let Some(thought_id) = thought_id {
-            if let Some(existing) = command_request_for_thought(&catalog, thought_id) {
-                return Ok(existing);
-            }
-        }
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|err| anyhow!("pull workspace for command request: {err:?}"))?;
+    let mut cached_head = None;
+    let mut cached_catalog = TribleSet::new();
+    let mut core_index = CoreIndex::default();
+    let delta = refresh_cached_checkout(&mut ws, &mut cached_head, &mut cached_catalog)?;
+    core_index.apply_delta(&cached_catalog, &delta);
 
-        let request_id = ufoid();
-        let now = epoch_interval(now_epoch());
-        let command_handle = ws.put(command.to_owned());
-        let mut change = TribleSet::new();
-        change += entity! { &request_id @
-            playground_exec::kind: playground_exec::kind_command_request,
-            playground_exec::command_text: command_handle,
-            playground_exec::requested_at: now,
-        };
-        if let Some(thought_id) = thought_id {
-            change += entity! { &request_id @ playground_exec::about_thought: thought_id };
+    if let Some(thought_id) = thought_id {
+        if let Some(existing) = core_index.request_for_thought(thought_id) {
+            return Ok(existing);
         }
-        if let Some(cwd) = default_cwd {
-            let handle = ws.put(cwd.to_owned());
-            change += entity! { &request_id @ playground_exec::cwd: handle };
-        }
-        if let Some(profile) = sandbox_profile {
-            change += entity! { &request_id @ playground_exec::sandbox_profile: profile };
-        }
-        ws.commit(change, None, Some("playground_exec request"));
-        push_workspace(repo, &mut ws).context("push command request")?;
-        return Ok(*request_id);
     }
-}
 
-fn command_request_for_thought(catalog: &TribleSet, thought_id: Id) -> Option<Id> {
-    find!(
-        (request_id: Id, about_thought: Id),
-        pattern!(catalog, [{
-            ?request_id @
-            playground_exec::kind: playground_exec::kind_command_request,
-            playground_exec::about_thought: ?about_thought,
-        }])
-    )
-    .into_iter()
-    .find_map(|(request_id, about_thought)| (about_thought == thought_id).then_some(request_id))
-}
-
-fn command_request_command_handle(
-    catalog: &TribleSet,
-    request_id: Id,
-) -> Option<Value<Handle<Blake3, LongString>>> {
-    find!(
-        (request: Id, command: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{ ?request @ playground_exec::command_text: ?command }])
-    )
-    .into_iter()
-    .find_map(|(request, command)| (request == request_id).then_some(command))
+    let request_id = ufoid();
+    let now = epoch_interval(now_epoch());
+    let command_handle = ws.put(command.to_owned());
+    let mut change = TribleSet::new();
+    change += entity! { &request_id @
+        playground_exec::kind: playground_exec::kind_command_request,
+        playground_exec::command_text: command_handle,
+        playground_exec::requested_at: now,
+    };
+    if let Some(thought_id) = thought_id {
+        change += entity! { &request_id @ playground_exec::about_thought: thought_id };
+    }
+    if let Some(cwd) = default_cwd {
+        let handle = ws.put(cwd.to_owned());
+        change += entity! { &request_id @ playground_exec::cwd: handle };
+    }
+    if let Some(profile) = sandbox_profile {
+        change += entity! { &request_id @ playground_exec::sandbox_profile: profile };
+    }
+    ws.commit(change, None, Some("playground_exec request"));
+    push_workspace(repo, &mut ws).context("push command request")?;
+    Ok(*request_id)
 }
 
 fn wait_for_command_result(
@@ -1333,12 +1588,26 @@ fn wait_for_command_result(
     request_id: Id,
     poll_ms: u64,
 ) -> Result<CommandResultOutput> {
+    let mut cached_head = None;
+    let mut cached_catalog = TribleSet::new();
+    let mut core_index = CoreIndex::default();
     loop {
+        let branch_head = current_branch_head(repo, branch_id)?;
+        if branch_head == cached_head {
+            sleep(Duration::from_millis(poll_ms));
+            continue;
+        }
+
         let mut ws = repo
             .pull(branch_id)
             .map_err(|err| anyhow!("pull workspace for command result: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout workspace")?;
-        if let Some(result) = latest_command_result(&catalog, request_id) {
+        let delta = refresh_cached_checkout(&mut ws, &mut cached_head, &mut cached_catalog)?;
+        core_index.apply_delta(&cached_catalog, &delta);
+        if !delta_has_command_result(&cached_catalog, &delta, request_id) {
+            sleep(Duration::from_millis(poll_ms));
+            continue;
+        }
+        if let Some(result) = core_index.latest_command_result(request_id) {
             let exec_result = load_exec_result(&mut ws, result.clone())?;
             return Ok(CommandResultOutput {
                 id: result.id,
@@ -1349,191 +1618,39 @@ fn wait_for_command_result(
     }
 }
 
-fn collect_command_results(catalog: &TribleSet) -> Vec<CommandResultInfo> {
-    let mut results: HashMap<Id, CommandResultInfo> = HashMap::new();
-    for (result_id, about_request) in find!(
-        (result_id: Id, about_request: Id),
-        pattern!(catalog, [{
-            ?result_id @
+fn delta_has_llm_result(updated: &TribleSet, delta: &TribleSet, request_id: Id) -> bool {
+    find!(
+        (about_request: Id),
+        pattern_changes!(updated, delta, [{
+            _?event @
+            openai_responses::kind: openai_responses::kind_result,
+            openai_responses::about_request: ?about_request,
+        }])
+    )
+    .into_iter()
+    .any(|(about_request,)| about_request == request_id)
+}
+
+fn delta_has_command_result(updated: &TribleSet, delta: &TribleSet, request_id: Id) -> bool {
+    find!(
+        (about_request: Id),
+        pattern_changes!(updated, delta, [{
+            _?event @
             playground_exec::kind: playground_exec::kind_command_result,
             playground_exec::about_request: ?about_request,
         }])
-    ) {
-        results.insert(
-            result_id,
-            CommandResultInfo {
-                id: result_id,
-                about_request,
-                finished_at: None,
-                attempt: None,
-                stdout: None,
-                stderr: None,
-                stdout_text: None,
-                stderr_text: None,
-                exit_code: None,
-                error: None,
-            },
-        );
-    }
-
-    if results.is_empty() {
-        return Vec::new();
-    }
-
-    for (result_id, finished_at) in find!(
-        (result_id: Id, finished_at: Value<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?result_id @ playground_exec::finished_at: ?finished_at
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.finished_at = Some(finished_at);
-        }
-    }
-
-    for (result_id, attempt) in find!(
-        (result_id: Id, attempt: Value<U256BE>),
-        pattern!(catalog, [{
-            ?result_id @ playground_exec::attempt: ?attempt
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.attempt = Some(attempt);
-        }
-    }
-
-    for (result_id, stdout) in find!(
-        (result_id: Id, stdout: Value<Handle<Blake3, UnknownBlob>>),
-        pattern!(catalog, [{
-            ?result_id @ playground_exec::stdout: ?stdout
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.stdout = Some(stdout);
-        }
-    }
-
-    for (result_id, stderr) in find!(
-        (result_id: Id, stderr: Value<Handle<Blake3, UnknownBlob>>),
-        pattern!(catalog, [{
-            ?result_id @ playground_exec::stderr: ?stderr
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.stderr = Some(stderr);
-        }
-    }
-
-    for (result_id, stdout_text) in find!(
-        (result_id: Id, stdout_text: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{
-            ?result_id @ playground_exec::stdout_text: ?stdout_text
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.stdout_text = Some(stdout_text);
-        }
-    }
-
-    for (result_id, stderr_text) in find!(
-        (result_id: Id, stderr_text: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{
-            ?result_id @ playground_exec::stderr_text: ?stderr_text
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.stderr_text = Some(stderr_text);
-        }
-    }
-
-    for (result_id, exit_code) in find!(
-        (result_id: Id, exit_code: Value<U256BE>),
-        pattern!(catalog, [{
-            ?result_id @ playground_exec::exit_code: ?exit_code
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.exit_code = Some(exit_code);
-        }
-    }
-
-    for (result_id, error) in find!(
-        (result_id: Id, error: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{
-            ?result_id @ playground_exec::error: ?error
-        }])
-    ) {
-        if let Some(entry) = results.get_mut(&result_id) {
-            entry.error = Some(error);
-        }
-    }
-
-    results.into_values().collect()
-}
-
-fn collect_command_requests(catalog: &TribleSet) -> Vec<Id> {
-    find!(
-        (request_id: Id),
-        pattern!(catalog, [{
-            ?request_id @ playground_exec::kind: playground_exec::kind_command_request
-        }])
     )
     .into_iter()
-    .map(|(request_id,)| request_id)
-    .collect()
+    .any(|(about_request,)| about_request == request_id)
 }
 
-fn has_pending_command_request(catalog: &TribleSet) -> bool {
-    let requests = collect_command_requests(catalog);
-    if requests.is_empty() {
-        return false;
-    }
-    let completed: HashSet<Id> = collect_command_results(catalog)
-        .into_iter()
-        .map(|result| result.about_request)
-        .collect();
-    requests.iter().any(|id| !completed.contains(id))
-}
-
-fn latest_command_result(catalog: &TribleSet, request_id: Id) -> Option<CommandResultInfo> {
-    let mut candidates: Vec<CommandResultInfo> = collect_command_results(catalog)
-        .into_iter()
-        .filter(|result| result.about_request == request_id)
-        .collect();
-    candidates.sort_by_key(|res| {
-        let attempt = res.attempt.and_then(u256be_to_u64).unwrap_or_default();
-        let finished_at = res.finished_at.map(interval_key).unwrap_or(i128::MIN);
-        (attempt, finished_at)
-    });
-    candidates.pop()
-}
-
-fn latest_unprocessed_exec_result(catalog: &TribleSet) -> Option<CommandResultInfo> {
-    let used: HashSet<Id> = find!(
-        (result_id: Id),
-        pattern!(catalog, [{
-            _?thought @ playground_cog::about_exec_result: ?result_id
-        }])
-    )
-    .into_iter()
-    .map(|(result_id,)| result_id)
-    .collect();
-
-    let mut candidates: Vec<CommandResultInfo> = collect_command_results(catalog)
-        .into_iter()
-        .filter(|result| !used.contains(&result.id))
-        .collect();
-    candidates.sort_by_key(|res| res.finished_at.map(interval_key).unwrap_or(i128::MIN));
-    candidates.pop()
-}
-
-fn prompt_from_exec_result(
+fn prompt_from_exec_result_with_index(
     ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
+    core_index: &CoreIndex,
     exec_result: &CommandResultInfo,
     config: &Config,
 ) -> Result<String> {
-    let Some(command_handle) = command_request_command_handle(catalog, exec_result.about_request)
+    let Some(command_handle) = core_index.command_request_command_handle(exec_result.about_request)
     else {
         return Err(anyhow!(
             "command request {id:x} missing command text",

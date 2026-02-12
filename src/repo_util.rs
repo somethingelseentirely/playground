@@ -3,6 +3,7 @@ use std::fs;
 use anyhow::{Context, Result, anyhow};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::id::ExclusiveId;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
@@ -35,6 +36,38 @@ pub(crate) fn init_repo(config: &Config) -> Result<(Repository<Pile>, Id)> {
 
 pub(crate) fn close_repo(repo: Repository<Pile>) -> Result<()> {
     repo.into_storage().close().context("close pile")
+}
+
+pub(crate) type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
+
+pub(crate) fn current_branch_head(
+    repo: &mut Repository<Pile>,
+    branch_id: Id,
+) -> Result<Option<CommitHandle>> {
+    repo.storage_mut()
+        .head(branch_id)
+        .map_err(|err| anyhow!("read branch head {branch_id:x}: {err:?}"))
+}
+
+pub(crate) fn refresh_cached_checkout(
+    ws: &mut Workspace<Pile>,
+    cached_head: &mut Option<CommitHandle>,
+    cached_catalog: &mut TribleSet,
+) -> Result<TribleSet> {
+    let head = ws.head();
+    if *cached_head == head {
+        return Ok(TribleSet::new());
+    }
+
+    let delta = ws
+        .checkout(*cached_head..head)
+        .context("checkout from cached head to current head")?;
+    let mut data = cached_catalog.clone();
+    data.union(delta.clone());
+
+    *cached_catalog = data;
+    *cached_head = head;
+    Ok(delta)
 }
 
 pub(crate) fn seed_metadata(repo: &mut Repository<Pile>) -> Result<()> {
