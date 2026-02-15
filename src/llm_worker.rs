@@ -236,7 +236,8 @@ pub(crate) fn run_llm_loop(
                         Ok(fragment) => {
                             let metadata = importer
                                 .metadata()
-                                .context("build response import metadata")?;
+                                .context("build response import metadata")?
+                                .into_facts();
                             let import_reader = import_blobs
                                 .reader()
                                 .context("read response import blobs")?;
