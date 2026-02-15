@@ -250,7 +250,7 @@ pub(crate) fn run_llm_loop(
                                 };
                             }
 
-                            import_data = Some(fragment.into_facts());
+                            import_data = Some(fragment);
                             import_metadata = Some(metadata);
                         }
                         Err(err) => {

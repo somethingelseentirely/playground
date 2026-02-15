@@ -173,7 +173,8 @@ where
     B: BlobStore<Blake3>,
     S: ValueSchema,
 {
-    let mut tribles = metadata::Describe::describe(attribute, blobs)?.into_facts();
+    let mut tribles = TribleSet::new();
+    tribles += metadata::Describe::describe(attribute, blobs)?;
     let attribute_id = attribute.id();
     tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
         metadata::tag: openai_responses::tag_attribute,
