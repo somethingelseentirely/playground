@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde_json::Value as JsonValue;
 use triblespace::core::blob::Bytes;
@@ -94,18 +95,75 @@ impl ResponsesClient {
     }
 
     fn send_payload_once(&self, payload: &JsonValue) -> Result<OpenAIResult> {
+        let response = self
+            .send_request(payload)
+            .context("send request")?;
+        if response.status().is_success() {
+            return self.parse_response(response);
+        }
+
+        let status = response.status();
+        // Best-effort body capture for debugging; don't assume it's JSON.
+        let body = response
+            .text()
+            .unwrap_or_else(|_| "<failed to read error body>".to_string());
+
+        // `previous_response_id` is an optional continuity hint. If the server
+        // no longer recognizes it (or it came from another provider/base_url),
+        // retry once without it so the agent can continue.
+        if payload.get("previous_response_id").is_some()
+            && status == StatusCode::BAD_REQUEST
+            && is_previous_response_not_found(body.as_str())
+        {
+            let mut repaired = payload.clone();
+            if let Some(obj) = repaired.as_object_mut() {
+                obj.remove("previous_response_id");
+            }
+            eprintln!("warning: previous_response_id not found; retrying without continuity hint");
+            let response = self
+                .send_request(&repaired)
+                .context("send request (retry without previous_response_id)")?;
+            if response.status().is_success() {
+                return self.parse_response(response);
+            }
+
+            let status = response.status();
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<failed to read error body>".to_string());
+            bail!(
+                "request failed: HTTP {} for url ({}){}",
+                status,
+                self.base_url,
+                if body.trim().is_empty() {
+                    "".to_string()
+                } else {
+                    format!(": {}", body.trim())
+                }
+            );
+        }
+
+        bail!(
+            "request failed: HTTP {} for url ({}){}",
+            status,
+            self.base_url,
+            if body.trim().is_empty() {
+                "".to_string()
+            } else {
+                format!(": {}", body.trim())
+            }
+        );
+    }
+
+    fn send_request(&self, payload: &JsonValue) -> Result<reqwest::blocking::Response> {
         let mut request = self.client.post(&self.base_url);
         if let Some(api_key) = self.api_key.as_ref() {
             request = request.bearer_auth(api_key);
         }
+        request.json(payload).send().context("send http request")
+    }
 
-        let response = request
-            .json(payload)
-            .send()
-            .context("send request")?
-            .error_for_status()
-            .context("request failed")?;
-
+    fn parse_response(&self, response: reqwest::blocking::Response) -> Result<OpenAIResult> {
         if self.stream {
             parse_stream(response)
         } else {
@@ -120,6 +178,16 @@ impl ResponsesClient {
             })
         }
     }
+}
+
+fn is_previous_response_not_found(body: &str) -> bool {
+    let Ok(json) = serde_json::from_str::<JsonValue>(body) else {
+        return false;
+    };
+    json.get("error")
+        .and_then(|err| err.get("code"))
+        .and_then(JsonValue::as_str)
+        == Some("previous_response_not_found")
 }
 
 pub(crate) fn run_llm_loop(
