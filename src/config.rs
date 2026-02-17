@@ -113,13 +113,23 @@ impl Config {
     #[allow(dead_code)]
     pub fn store(&self) -> Result<()> {
         let (mut repo, branch_id) = open_config_repo(&self.pile_path)?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        store_config(&mut ws, self).context("store config")?;
-        push_workspace(&mut repo, &mut ws).context("push config")?;
-        close_repo(repo).context("close config pile")?;
-        Ok(())
+        let result = (|| -> Result<()> {
+            let mut ws = repo
+                .pull(branch_id)
+                .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
+            store_config(&mut ws, self).context("store config")?;
+            push_workspace(&mut repo, &mut ws).context("push config")?;
+            Ok(())
+        })();
+
+        if let Err(err) = close_repo(repo).context("close config pile") {
+            if result.is_ok() {
+                return Err(err);
+            }
+            eprintln!("warning: failed to close pile cleanly: {err:#}");
+        }
+
+        result
     }
 }
 
@@ -151,26 +161,35 @@ fn default_config(pile_path: PathBuf) -> Config {
 
 fn load_from_pile(pile_path: &Path) -> Result<Config> {
     let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-    let catalog = ws.checkout(..).context("checkout config workspace")?;
+    let result = (|| -> Result<Config> {
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
+        let catalog = ws.checkout(..).context("checkout config workspace")?;
 
-    let mut config = if let Some(config) = load_latest_config(&mut ws, &catalog, pile_path)? {
-        config
-    } else {
-        default_config(pile_path.to_path_buf())
-    };
+        let mut config = if let Some(config) = load_latest_config(&mut ws, &catalog, pile_path)? {
+            config
+        } else {
+            default_config(pile_path.to_path_buf())
+        };
 
-    let ids_changed = ensure_registered_branch_ids(&mut config);
-    if ids_changed {
-        store_config(&mut ws, &config).context("store config with branch ids")?;
-        push_workspace(&mut repo, &mut ws).context("push config with branch ids")?;
+        let ids_changed = ensure_registered_branch_ids(&mut config);
+        if ids_changed {
+            store_config(&mut ws, &config).context("store config with branch ids")?;
+            push_workspace(&mut repo, &mut ws).context("push config with branch ids")?;
+        }
+        ensure_registered_branches_exist(&mut repo, &config)?;
+        Ok(config)
+    })();
+
+    if let Err(err) = close_repo(repo).context("close config pile") {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
     }
-    ensure_registered_branches_exist(&mut repo, &config)?;
 
-    close_repo(repo).context("close config pile")?;
-    Ok(config)
+    result
 }
 
 fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile>, Id)> {
@@ -178,10 +197,25 @@ fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile>, Id)> {
         fs::create_dir_all(parent).context("create pile directory")?;
     }
     let mut pile = Pile::open(pile_path).context("open pile")?;
-    pile.restore().context("restore pile")?;
+    if let Err(err) = pile.restore().context("restore pile") {
+        let close_res = pile.close().context("close pile after restore failure");
+        if let Err(close_err) = close_res {
+            eprintln!("warning: failed to close pile cleanly: {close_err:#}");
+        }
+        return Err(err);
+    }
 
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
-    let branch_id = ensure_config_branch(&mut repo)?;
+    let branch_id = match ensure_config_branch(&mut repo) {
+        Ok(branch_id) => branch_id,
+        Err(err) => {
+            let close_res = repo.close().context("close pile after init failure");
+            if let Err(close_err) = close_res {
+                eprintln!("warning: failed to close pile cleanly: {close_err:#}");
+            }
+            return Err(err);
+        }
+    };
     Ok((repo, branch_id))
 }
 

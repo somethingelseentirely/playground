@@ -212,7 +212,9 @@ impl Drop for DashboardState {
     fn drop(&mut self) {
         if let Some(repo) = self.repo.take() {
             let pile = repo.into_storage();
-            let _ = pile.close();
+            if let Err(err) = pile.close() {
+                eprintln!("warning: failed to close pile cleanly: {err:?}");
+            }
         }
     }
 }
@@ -865,10 +867,17 @@ fn ensure_repo_open(state: &mut DashboardState) -> Result<(), String> {
     if path_changed || state.repo.is_none() {
         if let Some(repo) = state.repo.take() {
             let pile = repo.into_storage();
-            let _ = pile.close();
+            if let Err(err) = pile.close() {
+                eprintln!("warning: failed to close pile cleanly: {err:?}");
+            }
         }
         let mut pile = Pile::open(&open_path).map_err(|err| err.to_string())?;
-        pile.restore().map_err(|err| err.to_string())?;
+        if let Err(err) = pile.restore() {
+            if let Err(close_err) = pile.close() {
+                eprintln!("warning: failed to close pile cleanly: {close_err:?}");
+            }
+            return Err(err.to_string());
+        }
         let repo = Repository::new(pile, state.signing_key.clone());
         state.repo = Some(repo);
         state.repo_open_path = Some(open_path);

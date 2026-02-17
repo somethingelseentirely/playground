@@ -18,19 +18,36 @@ pub(crate) use crate::repo_ops::push_workspace;
 use crate::schema::build_playground_metadata;
 
 pub(crate) fn init_repo(config: &Config) -> Result<(Repository<Pile>, Id)> {
+    let branch_id = config.branch_id.ok_or_else(|| {
+        anyhow!("config is missing branch_id; run `playground config set branch-id <ID>`")
+    })?;
     if let Some(parent) = config.pile_path.parent() {
         fs::create_dir_all(parent).context("create pile directory")?;
     }
     let mut pile = Pile::open(&config.pile_path).context("open pile")?;
-    pile.restore().context("restore pile")?;
+    if let Err(err) = pile.restore().context("restore pile") {
+        let close_res = pile.close().context("close pile after restore failure");
+        if let Err(close_err) = close_res {
+            eprintln!("warning: failed to close pile cleanly: {close_err:#}");
+        }
+        return Err(err);
+    }
 
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
-    let branch_id = config.branch_id.ok_or_else(|| {
-        anyhow!("config is missing branch_id; run `playground config set branch-id <ID>`")
-    })?;
-    ensure_branch(&mut repo, branch_id, config.branch.as_str())
-        .with_context(|| format!("materialize core branch {branch_id:x}"))?;
-    pull_workspace(&mut repo, branch_id, &format!("pull branch {branch_id:x}"))?;
+    let result = (|| -> Result<()> {
+        ensure_branch(&mut repo, branch_id, config.branch.as_str())
+            .with_context(|| format!("materialize core branch {branch_id:x}"))?;
+        pull_workspace(&mut repo, branch_id, &format!("pull branch {branch_id:x}"))?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let close_res = close_repo(repo).context("close pile after init failure");
+        if let Err(close_err) = close_res {
+            eprintln!("warning: failed to close pile cleanly: {close_err:#}");
+        }
+        return Err(err);
+    }
 
     Ok((repo, branch_id))
 }
