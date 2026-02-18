@@ -154,6 +154,10 @@ enum ConfigField {
     ExaApiKey,
     LlmReasoningEffort,
     LlmStream,
+    LlmContextWindowTokens,
+    LlmMaxOutputTokens,
+    LlmPromptSafetyMarginTokens,
+    LlmPromptCharsPerToken,
     ExecDefaultCwd,
     ExecSandboxProfile,
 }
@@ -360,6 +364,22 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
         }
         ConfigField::LlmStream => {
             config.llm.stream = parse_bool(args.value.as_str(), "llm_stream")?;
+        }
+        ConfigField::LlmContextWindowTokens => {
+            config.llm.context_window_tokens =
+                parse_u64(args.value.as_str(), "llm_context_window_tokens")?;
+        }
+        ConfigField::LlmMaxOutputTokens => {
+            config.llm.max_output_tokens =
+                parse_u64(args.value.as_str(), "llm_max_output_tokens")?;
+        }
+        ConfigField::LlmPromptSafetyMarginTokens => {
+            config.llm.prompt_safety_margin_tokens =
+                parse_u64(args.value.as_str(), "llm_prompt_safety_margin_tokens")?;
+        }
+        ConfigField::LlmPromptCharsPerToken => {
+            config.llm.prompt_chars_per_token =
+                parse_u64(args.value.as_str(), "llm_prompt_chars_per_token")?;
         }
         ConfigField::ExecDefaultCwd => {
             config.exec.default_cwd = parse_optional_path(args.value.as_str());
@@ -738,6 +758,13 @@ fn print_config(config: &Config, show_secrets: bool) {
             .unwrap_or_else(|| "null".to_string())
     );
     println!("stream = {}", config.llm.stream);
+    println!("context_window_tokens = {}", config.llm.context_window_tokens);
+    println!("max_output_tokens = {}", config.llm.max_output_tokens);
+    println!(
+        "prompt_safety_margin_tokens = {}",
+        config.llm.prompt_safety_margin_tokens
+    );
+    println!("prompt_chars_per_token = {}", config.llm.prompt_chars_per_token);
 
     println!("\n[integrations]");
     match (&config.tavily_api_key, show_secrets) {
@@ -1639,7 +1666,7 @@ fn delta_has_command_result(updated: &TribleSet, delta: &TribleSet, request_id: 
     .any(|(about_request,)| about_request == request_id)
 }
 
-const PROMPT_RECENT_TURN_COUNT: usize = 8;
+const PROMPT_RECENT_TURN_CAP: usize = 64;
 const PROMPT_RECENT_STDOUT_MAX_CHARS: usize = 4000;
 const PROMPT_RECENT_STDERR_MAX_CHARS: usize = 2000;
 const PROMPT_COMPACT_STDOUT_MAX_CHARS: usize = 1200;
@@ -1673,7 +1700,7 @@ fn prompt_for_exec_result_with_history(
     config: &Config,
 ) -> Result<(String, TribleSet)> {
     let (body, compact_change) =
-        build_prompt_body_with_compaction(ws, core_index, catalog, exec_result_id)?;
+        build_prompt_body_with_compaction(ws, core_index, catalog, exec_result_id, config)?;
     Ok((compose_prompt(&config.system_prompt, &body), compact_change))
 }
 
@@ -1682,8 +1709,10 @@ fn build_prompt_body_with_compaction(
     core_index: &CoreIndex,
     catalog: &TribleSet,
     exec_result_id: Id,
+    config: &Config,
 ) -> Result<(String, TribleSet)> {
     let mut index = load_context_chunks(catalog);
+    let body_budget_chars = prompt_body_budget_chars(config);
 
     // Sort all command results in chronological order (oldest -> newest).
     let mut results: Vec<CommandResultInfo> =
@@ -1699,52 +1728,111 @@ fn build_prompt_body_with_compaction(
     };
     let results = results[..=current_pos].to_vec();
 
-    let cutoff = results.len().saturating_sub(PROMPT_RECENT_TURN_COUNT);
     let mut compact_change = TribleSet::new();
+    let mut cutoff = 0usize;
+    let mut compacted_section = String::new();
+    let mut recent_section = String::new();
 
-    for result in results.iter().take(cutoff) {
-        if index.chunk_for_exec_result.contains_key(&result.id) {
-            continue;
+    // Iterate until the budget-derived cutoff stabilizes. Each iteration may compact additional
+    // older turns into the LSM frontier, which can slightly change the compacted section size.
+    for _ in 0..8 {
+        for result in results.iter().take(cutoff) {
+            if index.chunk_for_exec_result.contains_key(&result.id) {
+                continue;
+            }
+            let finished_at = result
+                .finished_at
+                .context("command result missing finished_at")?;
+            let command = load_command_for_result(ws, core_index, result)?;
+            let exec_output = load_exec_result(ws, result.clone())?;
+            let leaf_summary = format_exec_output_limited(
+                command.as_str(),
+                exec_output,
+                PROMPT_COMPACT_STDOUT_MAX_CHARS,
+                PROMPT_COMPACT_STDERR_MAX_CHARS,
+            );
+            let leaf_summary = compact_text(leaf_summary.as_str(), PROMPT_COMPACT_MAX_CHARS);
+            let leaf_summary_handle = ws.put(leaf_summary);
+            let now = epoch_interval(now_epoch());
+            let chunk_id = ufoid();
+
+            compact_change += entity! { &chunk_id @
+                playground_context::kind: playground_context::kind_chunk,
+                playground_context::level: 0u64,
+                playground_context::summary: leaf_summary_handle,
+                playground_context::created_at: now,
+                playground_context::start_at: finished_at,
+                playground_context::end_at: finished_at,
+                playground_context::about_exec_result: result.id,
+            };
+
+            let chunk = ContextChunk {
+                id: *chunk_id,
+                level: 0,
+                summary: leaf_summary_handle,
+                start_at: finished_at,
+                end_at: finished_at,
+            };
+            index.chunk_for_exec_result.insert(result.id, chunk.id);
+            insert_chunk_with_carry(ws, &mut index, &mut compact_change, chunk)?;
         }
-        let finished_at = result
-            .finished_at
-            .context("command result missing finished_at")?;
-        let command = load_command_for_result(ws, core_index, result)?;
-        let exec_output = load_exec_result(ws, result.clone())?;
-        let leaf_summary = format_exec_output_limited(
-            command.as_str(),
-            exec_output,
-            PROMPT_COMPACT_STDOUT_MAX_CHARS,
-            PROMPT_COMPACT_STDERR_MAX_CHARS,
-        );
-        let leaf_summary = compact_text(leaf_summary.as_str(), PROMPT_COMPACT_MAX_CHARS);
-        let leaf_summary_handle = ws.put(leaf_summary);
-        let now = epoch_interval(now_epoch());
-        let chunk_id = ufoid();
 
-        compact_change += entity! { &chunk_id @
-            playground_context::kind: playground_context::kind_chunk,
-            playground_context::level: 0u64,
-            playground_context::summary: leaf_summary_handle,
-            playground_context::created_at: now,
-            playground_context::start_at: finished_at,
-            playground_context::end_at: finished_at,
-            playground_context::about_exec_result: result.id,
-        };
+        compacted_section = build_history_compacted_section(ws, &index, body_budget_chars)?;
+        let raw_budget_chars = body_budget_chars.saturating_sub(compacted_section.chars().count());
+        let (next_recent_section, recent_count) = build_recent_section(
+            ws,
+            core_index,
+            &results,
+            &index,
+            raw_budget_chars,
+        )?;
+        recent_section = next_recent_section;
 
-        let chunk = ContextChunk {
-            id: *chunk_id,
-            level: 0,
-            summary: leaf_summary_handle,
-            start_at: finished_at,
-            end_at: finished_at,
-        };
-        index.chunk_for_exec_result.insert(result.id, chunk.id);
-        insert_chunk_with_carry(ws, &mut index, &mut compact_change, chunk)?;
+        let new_cutoff = results.len().saturating_sub(recent_count);
+        if new_cutoff == cutoff {
+            break;
+        }
+        cutoff = new_cutoff;
     }
 
-    // Build the prompt body from the LSM frontier + the last N raw turns.
     let mut body = String::new();
+    body.push_str(compacted_section.as_str());
+    body.push_str(recent_section.as_str());
+    if body_budget_chars > 0 && body.chars().count() > body_budget_chars {
+        body = compact_text(body.as_str(), body_budget_chars);
+    }
+
+    Ok((body, compact_change))
+}
+
+fn prompt_body_budget_chars(config: &Config) -> usize {
+    // This is an intentionally cheap heuristic: we approximate tokens->chars and reserve space
+    // for model output plus a small safety margin.
+    let reserved = config
+        .llm
+        .max_output_tokens
+        .saturating_add(config.llm.prompt_safety_margin_tokens);
+    let input_tokens = config.llm.context_window_tokens.saturating_sub(reserved);
+    let chars_per_token = config.llm.prompt_chars_per_token.max(1);
+
+    let input_chars = u128_to_usize_saturating((input_tokens as u128) * (chars_per_token as u128));
+    let system_chars = config.system_prompt.chars().count();
+    let separator_chars = if config.system_prompt.trim().is_empty() { 0 } else { 2 };
+    input_chars.saturating_sub(system_chars + separator_chars)
+}
+
+fn u128_to_usize_saturating(value: u128) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn build_history_compacted_section(
+    ws: &mut Workspace<Pile>,
+    index: &ContextChunkIndex,
+    body_budget_chars: usize,
+) -> Result<String> {
+    if body_budget_chars == 0 {
+        return Ok(String::new());
+    }
 
     let mut roots: Vec<ContextChunk> = index
         .root_by_level
@@ -1752,38 +1840,134 @@ fn build_prompt_body_with_compaction(
         .filter_map(|id| index.chunks.get(id).cloned())
         .collect();
     roots.sort_by_key(|chunk| interval_key(chunk.start_at));
+    if roots.is_empty() {
+        return Ok(String::new());
+    }
 
-    if !roots.is_empty() {
-        body.push_str("history_compacted:\n\n");
-        for chunk in roots {
-            let summary = load_text(ws, chunk.summary).context("load compacted history chunk")?;
-            body.push_str(summary.trim_end());
-            body.push_str("\n\n");
+    let header = "history_compacted:\n\n";
+    let mut remaining = body_budget_chars / 2;
+    if remaining == 0 {
+        return Ok(String::new());
+    }
+
+    let header_len = header.chars().count();
+    if header_len >= remaining {
+        return Ok(compact_text(header, remaining));
+    }
+
+    let mut text = String::new();
+    text.push_str(header);
+    remaining -= header_len;
+
+    for chunk in roots {
+        if remaining == 0 {
+            break;
+        }
+        let shift = chunk.level.saturating_add(2);
+        let level_budget = if shift >= u64::from(usize::BITS) {
+            0
+        } else {
+            body_budget_chars >> (shift as usize)
+        };
+        let allowed = level_budget.min(remaining);
+        if allowed == 0 {
+            continue;
+        }
+        let summary = load_text(ws, chunk.summary).context("load compacted history chunk")?;
+        let summary = compact_text(summary.trim_end(), allowed);
+        let summary_len = summary.chars().count();
+        if summary_len == 0 {
+            continue;
+        }
+        text.push_str(summary.trim_end());
+        text.push_str("\n\n");
+        remaining = remaining.saturating_sub(summary_len.saturating_add(2));
+    }
+
+    Ok(text)
+}
+
+fn build_recent_section(
+    ws: &mut Workspace<Pile>,
+    core_index: &CoreIndex,
+    results: &[CommandResultInfo],
+    index: &ContextChunkIndex,
+    raw_budget_chars: usize,
+) -> Result<(String, usize)> {
+    if raw_budget_chars == 0 || results.is_empty() {
+        return Ok((String::new(), 0));
+    }
+
+    // Prefer raw turns that haven't been compacted yet (monotonic: once compacted, stay compacted).
+    let mut tail_start = 0usize;
+    for (idx, result) in results.iter().enumerate().rev() {
+        if index.chunk_for_exec_result.contains_key(&result.id) {
+            tail_start = idx.saturating_add(1);
+            break;
         }
     }
 
-    let recent_results = results.iter().skip(cutoff).cloned().collect::<Vec<_>>();
-
-    if !recent_results.is_empty() {
-        body.push_str("recent:\n\n");
-        for (idx, result) in recent_results.into_iter().enumerate() {
-            let command = load_command_for_result(ws, core_index, &result)?;
-            let exec_output = load_exec_result(ws, result)?;
-            body.push_str(&format!("turn {}:\n", idx + 1));
-            body.push_str(
-                format_exec_output_limited(
-                    command.as_str(),
-                    exec_output,
-                    PROMPT_RECENT_STDOUT_MAX_CHARS,
-                    PROMPT_RECENT_STDERR_MAX_CHARS,
-                )
-                .trim_end(),
-            );
-            body.push_str("\n\n");
-        }
+    let mut candidates = &results[tail_start..];
+    if candidates.len() > PROMPT_RECENT_TURN_CAP {
+        candidates = &candidates[candidates.len() - PROMPT_RECENT_TURN_CAP..];
     }
 
-    Ok((body, compact_change))
+    let header = "recent:\n\n";
+    let header_len = header.chars().count();
+    let mut use_header = true;
+    let mut remaining = raw_budget_chars;
+    if header_len < remaining {
+        remaining -= header_len;
+    } else {
+        use_header = false;
+    }
+
+    let mut turns: Vec<String> = Vec::new();
+    for result in candidates.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let command = load_command_for_result(ws, core_index, result)?;
+        let exec_output = load_exec_result(ws, result.clone())?;
+        let turn = format_exec_output_limited(
+            command.as_str(),
+            exec_output,
+            PROMPT_RECENT_STDOUT_MAX_CHARS,
+            PROMPT_RECENT_STDERR_MAX_CHARS,
+        );
+        let turn = turn.trim_end().to_string();
+
+        let separator_len = 2usize;
+        let turn_len = turn.chars().count();
+        let needed = turn_len.saturating_add(separator_len);
+        if needed <= remaining {
+            turns.push(turn);
+            remaining -= needed;
+            continue;
+        }
+
+        // Always include the newest turn, even if we have to truncate it hard to fit.
+        if turns.is_empty() {
+            let allowed = remaining.saturating_sub(separator_len);
+            if allowed > 0 {
+                turns.push(compact_text(turn.as_str(), allowed));
+            }
+        }
+        break;
+    }
+
+    if turns.is_empty() {
+        return Ok((String::new(), 0));
+    }
+    turns.reverse();
+
+    let mut text = String::new();
+    if use_header {
+        text.push_str(header);
+    }
+    text.push_str(&turns.join("\n\n"));
+    text.push_str("\n\n");
+    Ok((text, turns.len()))
 }
 
 fn load_command_for_result(

@@ -205,7 +205,12 @@ pub(crate) fn run_llm_loop(
 
             let input_content =
                 build_prompt_input_content(&mut ws, model.as_str(), prompt.as_str());
-            let payload = build_payload(&model, config.llm.stream, input_content);
+            let payload = build_payload(
+                &model,
+                config.llm.stream,
+                config.llm.max_output_tokens,
+                input_content,
+            );
             let request_raw =
                 serde_json::to_string(&payload).context("serialize request payload")?;
 
@@ -414,11 +419,13 @@ impl LlmRequestIndex {
     }
 }
 
-fn build_payload(model: &str, stream: bool, content: Vec<JsonValue>) -> JsonValue {
+fn build_payload(model: &str, stream: bool, max_tokens: u64, content: Vec<JsonValue>) -> JsonValue {
+    let max_tokens = max_tokens.max(1);
     serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": content}],
         "stream": stream,
+        "max_tokens": max_tokens,
     })
 }
 

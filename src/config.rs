@@ -19,6 +19,10 @@ use crate::time_util::{epoch_interval, interval_key, now_epoch};
 const DEFAULT_MODEL: &str = "gpt-oss:120b";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_STREAM: bool = false;
+const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
+const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
+const DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS: u64 = 512;
+const DEFAULT_PROMPT_CHARS_PER_TOKEN: u64 = 4;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a terminal-based agent. Respond with exactly one shell command per turn. Output only raw command text: no markdown fences, no commentary prelude, no channel labels, and no multi-command blocks. Prefer faculties in /workspace/faculties over ad-hoc shell when applicable; run a faculty with no arguments to inspect usage. If unsure what to do next, run `/workspace/faculties/orient.rs show`.";
 // The branch that carries the core cognition loop + exec/LLM request state.
 const DEFAULT_BRANCH: &str = "cognition";
@@ -71,6 +75,10 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     pub reasoning_effort: Option<String>,
     pub stream: bool,
+    pub context_window_tokens: u64,
+    pub max_output_tokens: u64,
+    pub prompt_safety_margin_tokens: u64,
+    pub prompt_chars_per_token: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +104,10 @@ impl Default for LlmConfig {
             api_key: None,
             reasoning_effort: None,
             stream: default_stream(),
+            context_window_tokens: default_context_window_tokens(),
+            max_output_tokens: default_max_output_tokens(),
+            prompt_safety_margin_tokens: default_prompt_safety_margin_tokens(),
+            prompt_chars_per_token: default_prompt_chars_per_token(),
         }
     }
 }
@@ -401,6 +413,36 @@ fn load_latest_config(
     {
         config.llm.stream = stream != 0;
     }
+    if let Some(tokens) = load_u256_attr(
+        catalog,
+        config_id,
+        playground_config::llm_context_window_tokens,
+    )
+    .and_then(u256be_to_u64)
+    {
+        config.llm.context_window_tokens = tokens;
+    }
+    if let Some(tokens) =
+        load_u256_attr(catalog, config_id, playground_config::llm_max_output_tokens)
+            .and_then(u256be_to_u64)
+    {
+        config.llm.max_output_tokens = tokens;
+    }
+    if let Some(tokens) = load_u256_attr(
+        catalog,
+        config_id,
+        playground_config::llm_prompt_safety_margin_tokens,
+    )
+    .and_then(u256be_to_u64)
+    {
+        config.llm.prompt_safety_margin_tokens = tokens;
+    }
+    if let Some(chars) =
+        load_u256_attr(catalog, config_id, playground_config::llm_prompt_chars_per_token)
+            .and_then(u256be_to_u64)
+    {
+        config.llm.prompt_chars_per_token = chars;
+    }
 
     Ok(Some(config))
 }
@@ -417,6 +459,11 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let llm_base_url = ws.put(config.llm.base_url.clone());
     let poll_ms: Value<U256BE> = config.poll_ms.to_value();
     let llm_stream: Value<U256BE> = if config.llm.stream { 1u64 } else { 0u64 }.to_value();
+    let llm_context_window_tokens: Value<U256BE> = config.llm.context_window_tokens.to_value();
+    let llm_max_output_tokens: Value<U256BE> = config.llm.max_output_tokens.to_value();
+    let llm_prompt_safety_margin_tokens: Value<U256BE> =
+        config.llm.prompt_safety_margin_tokens.to_value();
+    let llm_prompt_chars_per_token: Value<U256BE> = config.llm.prompt_chars_per_token.to_value();
 
     let mut change = TribleSet::new();
     change += entity! { &config_id @
@@ -430,6 +477,10 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         playground_config::llm_model: llm_model,
         playground_config::llm_base_url: llm_base_url,
         playground_config::llm_stream: llm_stream,
+        playground_config::llm_context_window_tokens: llm_context_window_tokens,
+        playground_config::llm_max_output_tokens: llm_max_output_tokens,
+        playground_config::llm_prompt_safety_margin_tokens: llm_prompt_safety_margin_tokens,
+        playground_config::llm_prompt_chars_per_token: llm_prompt_chars_per_token,
     };
 
     if let Some(id) = config.branch_id {
@@ -563,6 +614,22 @@ fn default_base_url() -> String {
 
 fn default_stream() -> bool {
     DEFAULT_STREAM
+}
+
+fn default_context_window_tokens() -> u64 {
+    DEFAULT_CONTEXT_WINDOW_TOKENS
+}
+
+fn default_max_output_tokens() -> u64 {
+    DEFAULT_MAX_OUTPUT_TOKENS
+}
+
+fn default_prompt_safety_margin_tokens() -> u64 {
+    DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS
+}
+
+fn default_prompt_chars_per_token() -> u64 {
+    DEFAULT_PROMPT_CHARS_PER_TOKEN
 }
 
 fn default_branch() -> String {

@@ -432,6 +432,10 @@ struct AgentConfigRow {
     llm_base_url: Option<String>,
     llm_reasoning_effort: Option<String>,
     llm_stream: Option<bool>,
+    llm_context_window_tokens: Option<u64>,
+    llm_max_output_tokens: Option<u64>,
+    llm_prompt_safety_margin_tokens: Option<u64>,
+    llm_prompt_chars_per_token: Option<u64>,
     llm_api_key: Option<String>,
     tavily_api_key: Option<String>,
     exa_api_key: Option<String>,
@@ -1407,6 +1411,20 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         load_optional_string_attr(data, ws, config_id, playground_config::llm_reasoning_effort);
     let llm_stream = load_optional_u64_attr(data, config_id, playground_config::llm_stream)
         .map(|value| value != 0);
+    let llm_context_window_tokens = load_optional_u64_attr(
+        data,
+        config_id,
+        playground_config::llm_context_window_tokens,
+    );
+    let llm_max_output_tokens =
+        load_optional_u64_attr(data, config_id, playground_config::llm_max_output_tokens);
+    let llm_prompt_safety_margin_tokens = load_optional_u64_attr(
+        data,
+        config_id,
+        playground_config::llm_prompt_safety_margin_tokens,
+    );
+    let llm_prompt_chars_per_token =
+        load_optional_u64_attr(data, config_id, playground_config::llm_prompt_chars_per_token);
     let llm_api_key =
         load_optional_string_attr(data, ws, config_id, playground_config::llm_api_key);
     let tavily_api_key =
@@ -1442,6 +1460,10 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_base_url,
         llm_reasoning_effort,
         llm_stream,
+        llm_context_window_tokens,
+        llm_max_output_tokens,
+        llm_prompt_safety_margin_tokens,
+        llm_prompt_chars_per_token,
         llm_api_key,
         tavily_api_key,
         exa_api_key,
@@ -3282,6 +3304,42 @@ fn render_agent_config(
             ui.monospace(
                 config
                     .llm_stream
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("llm.context_window_tokens");
+            ui.monospace(
+                config
+                    .llm_context_window_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("llm.max_output_tokens");
+            ui.monospace(
+                config
+                    .llm_max_output_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("llm.prompt_safety_margin_tokens");
+            ui.monospace(
+                config
+                    .llm_prompt_safety_margin_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("llm.prompt_chars_per_token");
+            ui.monospace(
+                config
+                    .llm_prompt_chars_per_token
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );
