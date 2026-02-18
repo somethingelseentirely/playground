@@ -486,6 +486,14 @@ struct AgentConfigRow {
     llm_prompt_safety_margin_tokens: Option<u64>,
     llm_prompt_chars_per_token: Option<u64>,
     llm_api_key: Option<String>,
+    llm_compaction_profile_id: Option<Id>,
+    llm_compaction_profile_name: Option<String>,
+    llm_compaction_model: Option<String>,
+    llm_compaction_base_url: Option<String>,
+    llm_compaction_prompt_chars_per_token: Option<u64>,
+    llm_compaction_api_key: Option<String>,
+    llm_compaction_reduction_factor: Option<u64>,
+    llm_compaction_prompt: Option<String>,
     tavily_api_key: Option<String>,
     exa_api_key: Option<String>,
     exec_default_cwd: Option<String>,
@@ -1560,6 +1568,58 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
     );
     let llm_api_key =
         load_optional_string_attr(data, ws, llm_entity_id, playground_config::llm_api_key);
+    let llm_compaction_profile_id = load_optional_id_attr(
+        data,
+        config_id,
+        playground_config::active_llm_compaction_profile_id,
+    );
+    let (llm_compaction_entity_id, llm_compaction_profile_name) =
+        if let Some(profile_id) = llm_compaction_profile_id {
+            if let Some(entry_id) = latest_llm_profile_entry_id(data, profile_id) {
+                (
+                    entry_id,
+                    load_optional_string_attr(data, ws, entry_id, metadata::name),
+                )
+            } else {
+                (llm_entity_id, None)
+            }
+        } else {
+            (llm_entity_id, llm_profile_name.clone())
+        };
+    let llm_compaction_model = load_optional_string_attr(
+        data,
+        ws,
+        llm_compaction_entity_id,
+        playground_config::llm_model,
+    );
+    let llm_compaction_base_url = load_optional_string_attr(
+        data,
+        ws,
+        llm_compaction_entity_id,
+        playground_config::llm_base_url,
+    );
+    let llm_compaction_prompt_chars_per_token = load_optional_u64_attr(
+        data,
+        llm_compaction_entity_id,
+        playground_config::llm_prompt_chars_per_token,
+    );
+    let llm_compaction_api_key = load_optional_string_attr(
+        data,
+        ws,
+        llm_compaction_entity_id,
+        playground_config::llm_api_key,
+    );
+    let llm_compaction_reduction_factor = load_optional_u64_attr(
+        data,
+        config_id,
+        playground_config::llm_compaction_reduction_factor,
+    );
+    let llm_compaction_prompt = load_optional_string_attr(
+        data,
+        ws,
+        config_id,
+        playground_config::llm_compaction_prompt,
+    );
     let tavily_api_key =
         load_optional_string_attr(data, ws, config_id, playground_config::tavily_api_key);
     let exa_api_key =
@@ -1600,6 +1660,14 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_prompt_safety_margin_tokens,
         llm_prompt_chars_per_token,
         llm_api_key,
+        llm_compaction_profile_id,
+        llm_compaction_profile_name,
+        llm_compaction_model,
+        llm_compaction_base_url,
+        llm_compaction_prompt_chars_per_token,
+        llm_compaction_api_key,
+        llm_compaction_reduction_factor,
+        llm_compaction_prompt,
         tavily_api_key,
         exa_api_key,
         exec_default_cwd,
@@ -3701,6 +3769,73 @@ fn render_agent_config(
             });
             ui.end_row();
 
+            ui.label("llm.compaction.profile");
+            ui.horizontal(|ui| {
+                let label = if config.llm_compaction_profile_id.is_none() {
+                    "inherits llm.profile".to_string()
+                } else {
+                    config
+                        .llm_compaction_profile_name
+                        .as_deref()
+                        .unwrap_or("-")
+                        .to_string()
+                };
+                ui.label(label);
+                if let Some(id) = config.llm_compaction_profile_id {
+                    ui.monospace(format!("({id:x})"));
+                }
+            });
+            ui.end_row();
+
+            ui.label("llm.compaction.model");
+            ui.label(config.llm_compaction_model.as_deref().unwrap_or("-"));
+            ui.end_row();
+
+            ui.label("llm.compaction.base_url");
+            ui.label(config.llm_compaction_base_url.as_deref().unwrap_or("-"));
+            ui.end_row();
+
+            ui.label("llm.compaction.prompt_chars_per_token");
+            ui.monospace(
+                config
+                    .llm_compaction_prompt_chars_per_token
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("llm.compaction.reduction_factor");
+            ui.monospace(
+                config
+                    .llm_compaction_reduction_factor
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("llm.compaction.api_key");
+            ui.horizontal(|ui| {
+                let Some(key) = config.llm_compaction_api_key.as_deref() else {
+                    ui.label("-");
+                    return;
+                };
+                if state.config_reveal_secrets {
+                    ui.monospace(key);
+                } else {
+                    ui.monospace(mask_secret(key));
+                }
+                let button = if state.config_reveal_secrets {
+                    "Hide"
+                } else {
+                    "Reveal"
+                };
+                if ui.add(Button::new(button)).clicked() {
+                    state.config_reveal_secrets = !state.config_reveal_secrets;
+                    ui.ctx().request_repaint();
+                }
+            });
+            ui.end_row();
+
             ui.label("integrations.tavily_api_key");
             ui.horizontal(|ui| {
                 let Some(key) = config.tavily_api_key.as_deref() else {
@@ -3764,6 +3899,21 @@ fn render_agent_config(
     if let Some(prompt) = config.system_prompt.as_deref() {
         ui.add_space(8.0);
         ui.label(egui::RichText::new("System prompt").monospace());
+        egui::Frame::NONE
+            .fill(egui::Color32::from_gray(55))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(prompt).monospace())
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+            });
+    }
+
+    if let Some(prompt) = config.llm_compaction_prompt.as_deref() {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Compaction prompt").monospace());
         egui::Frame::NONE
             .fill(egui::Color32::from_gray(55))
             .corner_radius(egui::CornerRadius::same(6))
