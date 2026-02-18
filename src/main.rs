@@ -125,7 +125,7 @@ struct ConfigSetArgs {
     field: ConfigField,
     #[arg(
         value_name = "VALUE",
-        help = "Value to set. Use @path to read from file; use null/none/empty (or `config unset`) to clear optional fields."
+        help = "Value to set. Use @path to read from file; use `config unset` to clear optional fields."
     )]
     value: String,
 }
@@ -178,16 +178,7 @@ enum ConfigField {
 #[derive(ValueEnum, Debug, Clone, Copy)]
 #[value(rename_all = "kebab-case")]
 enum OptionalConfigField {
-    BranchId,
-    CompassBranchId,
-    ExecBranchId,
-    LocalMessagesBranchId,
-    RelationsBranchId,
     TeamsBranchId,
-    WorkspaceBranchId,
-    ArchiveBranchId,
-    WebBranchId,
-    MediaBranchId,
     PersonaId,
     LlmApiKey,
     TavilyApiKey,
@@ -332,43 +323,38 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
             config.branch = load_value_or_file(args.value.as_str(), "branch")?;
         }
         ConfigField::BranchId => {
-            config.branch_id = parse_optional_hex_id(Some(args.value.as_str()), "branch_id")?;
+            config.branch_id = Some(parse_hex_id(args.value.as_str(), "branch_id")?);
         }
         ConfigField::CompassBranchId => {
-            config.compass_branch_id =
-                parse_optional_hex_id(Some(args.value.as_str()), "compass_branch_id")?;
+            config.compass_branch_id = Some(parse_hex_id(args.value.as_str(), "compass_branch_id")?);
         }
         ConfigField::ExecBranchId => {
-            config.exec_branch_id =
-                parse_optional_hex_id(Some(args.value.as_str()), "exec_branch_id")?;
+            config.exec_branch_id = Some(parse_hex_id(args.value.as_str(), "exec_branch_id")?);
         }
         ConfigField::LocalMessagesBranchId => {
             config.local_messages_branch_id =
-                parse_optional_hex_id(Some(args.value.as_str()), "local_messages_branch_id")?;
+                Some(parse_hex_id(args.value.as_str(), "local_messages_branch_id")?);
         }
         ConfigField::RelationsBranchId => {
             config.relations_branch_id =
-                parse_optional_hex_id(Some(args.value.as_str()), "relations_branch_id")?;
+                Some(parse_hex_id(args.value.as_str(), "relations_branch_id")?);
         }
         ConfigField::TeamsBranchId => {
-            config.teams_branch_id =
-                parse_optional_hex_id(Some(args.value.as_str()), "teams_branch_id")?;
+            config.teams_branch_id = Some(parse_hex_id(args.value.as_str(), "teams_branch_id")?);
         }
         ConfigField::WorkspaceBranchId => {
             config.workspace_branch_id =
-                parse_optional_hex_id(Some(args.value.as_str()), "workspace_branch_id")?;
+                Some(parse_hex_id(args.value.as_str(), "workspace_branch_id")?);
         }
         ConfigField::ArchiveBranchId => {
             config.archive_branch_id =
-                parse_optional_hex_id(Some(args.value.as_str()), "archive_branch_id")?;
+                Some(parse_hex_id(args.value.as_str(), "archive_branch_id")?);
         }
         ConfigField::WebBranchId => {
-            config.web_branch_id =
-                parse_optional_hex_id(Some(args.value.as_str()), "web_branch_id")?;
+            config.web_branch_id = Some(parse_hex_id(args.value.as_str(), "web_branch_id")?);
         }
         ConfigField::MediaBranchId => {
-            config.media_branch_id =
-                parse_optional_hex_id(Some(args.value.as_str()), "media_branch_id")?;
+            config.media_branch_id = Some(parse_hex_id(args.value.as_str(), "media_branch_id")?);
         }
         ConfigField::Author => {
             config.author = load_value_or_file(args.value.as_str(), "author")?;
@@ -377,7 +363,7 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
             config.author_role = load_value_or_file(args.value.as_str(), "author_role")?;
         }
         ConfigField::PersonaId => {
-            config.persona_id = parse_optional_hex_id(Some(args.value.as_str()), "persona_id")?;
+            config.persona_id = Some(parse_hex_id(args.value.as_str(), "persona_id")?);
         }
         ConfigField::PollMs => {
             config.poll_ms = parse_u64(args.value.as_str(), "poll_ms")?;
@@ -389,18 +375,17 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
             config.llm.base_url = load_value_or_file(args.value.as_str(), "llm_base_url")?;
         }
         ConfigField::LlmApiKey => {
-            config.llm.api_key = load_optional_string_or_file(args.value.as_str(), "llm_api_key")?;
+            config.llm.api_key = Some(load_value_or_file_trimmed(args.value.as_str(), "llm_api_key")?);
         }
         ConfigField::TavilyApiKey => {
-            config.tavily_api_key =
-                load_optional_string_or_file(args.value.as_str(), "tavily_api_key")?;
+            config.tavily_api_key = Some(load_value_or_file_trimmed(args.value.as_str(), "tavily_api_key")?);
         }
         ConfigField::ExaApiKey => {
-            config.exa_api_key = load_optional_string_or_file(args.value.as_str(), "exa_api_key")?;
+            config.exa_api_key = Some(load_value_or_file_trimmed(args.value.as_str(), "exa_api_key")?);
         }
         ConfigField::LlmReasoningEffort => {
             config.llm.reasoning_effort =
-                load_optional_string_or_file(args.value.as_str(), "llm_reasoning_effort")?;
+                Some(load_value_or_file_trimmed(args.value.as_str(), "llm_reasoning_effort")?);
         }
         ConfigField::LlmStream => {
             config.llm.stream = parse_bool(args.value.as_str(), "llm_stream")?;
@@ -422,11 +407,12 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
                 parse_u64(args.value.as_str(), "llm_prompt_chars_per_token")?;
         }
         ConfigField::ExecDefaultCwd => {
-            config.exec.default_cwd = parse_optional_path(args.value.as_str());
+            let value = load_value_or_file(args.value.as_str(), "exec_default_cwd")?;
+            config.exec.default_cwd = Some(PathBuf::from(value.trim()));
         }
         ConfigField::ExecSandboxProfile => {
             config.exec.sandbox_profile =
-                parse_optional_hex_id(Some(args.value.as_str()), "exec_sandbox_profile")?;
+                Some(parse_hex_id(args.value.as_str(), "exec_sandbox_profile")?);
         }
     }
     Ok(())
@@ -434,16 +420,7 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
 
 fn apply_config_unset(config: &mut Config, field: OptionalConfigField) -> Result<()> {
     match field {
-        OptionalConfigField::BranchId => config.branch_id = None,
-        OptionalConfigField::CompassBranchId => config.compass_branch_id = None,
-        OptionalConfigField::ExecBranchId => config.exec_branch_id = None,
-        OptionalConfigField::LocalMessagesBranchId => config.local_messages_branch_id = None,
-        OptionalConfigField::RelationsBranchId => config.relations_branch_id = None,
         OptionalConfigField::TeamsBranchId => config.teams_branch_id = None,
-        OptionalConfigField::WorkspaceBranchId => config.workspace_branch_id = None,
-        OptionalConfigField::ArchiveBranchId => config.archive_branch_id = None,
-        OptionalConfigField::WebBranchId => config.web_branch_id = None,
-        OptionalConfigField::MediaBranchId => config.media_branch_id = None,
         OptionalConfigField::PersonaId => config.persona_id = None,
         OptionalConfigField::LlmApiKey => config.llm.api_key = None,
         OptionalConfigField::TavilyApiKey => config.tavily_api_key = None,
@@ -455,21 +432,9 @@ fn apply_config_unset(config: &mut Config, field: OptionalConfigField) -> Result
     Ok(())
 }
 
-fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
+fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
     let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    // Keep CLI ergonomics aligned with `config set` help text.
-    let lowered = raw.to_ascii_lowercase();
-    if lowered == "null" || lowered == "none" || lowered == "empty" {
-        return Ok(None);
-    }
-    let id = Id::from_hex(raw).ok_or_else(|| anyhow!("invalid {label} {raw}"))?;
-    Ok(Some(id))
+    Id::from_hex(raw).ok_or_else(|| anyhow!("invalid {label} {raw}"))
 }
 
 fn parse_worker_id(raw: Option<String>) -> Result<Id> {
@@ -683,14 +648,8 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-fn load_optional_string_or_file(raw: &str, label: &str) -> Result<Option<String>> {
-    let value = load_value_or_file(raw, label)?;
-    let trimmed = value.trim();
-    if is_nullish(trimmed) {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed.to_string()))
-    }
+fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
+    Ok(load_value_or_file(raw, label)?.trim().to_string())
 }
 
 fn parse_u64(raw: &str, label: &str) -> Result<u64> {
@@ -704,19 +663,6 @@ fn parse_bool(raw: &str, label: &str) -> Result<bool> {
         "false" | "0" | "no" => Ok(false),
         _ => Err(anyhow!("invalid {label} {raw} (expected true/false)")),
     }
-}
-
-fn parse_optional_path(raw: &str) -> Option<PathBuf> {
-    if is_nullish(raw) {
-        None
-    } else {
-        Some(PathBuf::from(raw))
-    }
-}
-
-fn is_nullish(raw: &str) -> bool {
-    let value = raw.trim().to_ascii_lowercase();
-    value.is_empty() || value == "null" || value == "none" || value == "empty"
 }
 
 fn print_config(config: &Config, show_secrets: bool) {
