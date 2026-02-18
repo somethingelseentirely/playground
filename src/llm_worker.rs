@@ -204,8 +204,27 @@ pub(crate) fn run_llm_loop(
                 .map(|value| String::from_value(&value))
                 .unwrap_or_else(|| config.llm.model.clone());
 
-            let messages: Vec<ChatMessage> =
-                serde_json::from_str(prompt.as_str()).context("parse chat prompt")?;
+            let attempt: u64 = 1;
+            let messages: Vec<ChatMessage> = match serde_json::from_str(prompt.as_str()) {
+                Ok(messages) => messages,
+                Err(err) => {
+                    let finished_at = epoch_interval(now_epoch());
+                    let result_id = ufoid();
+                    let handle = ws.put(format!("parse chat prompt: {err}"));
+                    let mut change = TribleSet::new();
+                    change += entity! { &result_id @
+                        llm_chat::kind: llm_chat::kind_result,
+                        llm_chat::about_request: request.id,
+                        llm_chat::finished_at: finished_at,
+                        llm_chat::attempt: attempt,
+                        llm_chat::error: handle,
+                    };
+                    ws.commit(change, None, Some("llm_chat result (prompt parse error)"));
+                    push_workspace(&mut repo, &mut ws).context("push prompt parse error")?;
+                    sleep(Duration::from_millis(poll_ms));
+                    continue;
+                }
+            };
             let payload_messages = build_payload_messages(&mut ws, model.as_str(), &messages);
             let payload = build_payload(
                 &model,
@@ -218,7 +237,6 @@ pub(crate) fn run_llm_loop(
 
             let started_at = epoch_interval(now_epoch());
             let in_progress_id = ufoid();
-            let attempt: u64 = 1;
             let request_raw_handle = ws.put(request_raw);
 
             let mut change = TribleSet::new();
