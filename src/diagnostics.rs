@@ -210,6 +210,8 @@ struct DashboardState {
     teams_selected_chat: Option<Id>,
     workspace_selected_snapshot: Option<Id>,
     context_selected_chunk: Option<Id>,
+    context_selection_stack: Vec<Id>,
+    context_show_children: bool,
     context_show_origins: bool,
 }
 
@@ -242,6 +244,8 @@ impl Default for DashboardState {
             teams_selected_chat: None,
             workspace_selected_snapshot: None,
             context_selected_chunk: None,
+            context_selection_stack: Vec::new(),
+            context_show_children: false,
             context_show_origins: false,
         }
     }
@@ -339,8 +343,16 @@ struct ContextLeafOriginRow {
 struct ContextSelectedRow {
     chunk_id: Id,
     summary: Option<String>,
+    children: Vec<ContextChildRow>,
     origins_total: usize,
     origins: Vec<ContextLeafOriginRow>,
+}
+
+#[derive(Debug, Clone)]
+struct ContextChildRow {
+    side: &'static str,
+    chunk_id: Id,
+    summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -959,6 +971,7 @@ fn refresh_snapshot(state: &mut DashboardState) {
     let config = state.config.clone();
     let workspace_selected = state.workspace_selected_snapshot;
     let context_selected = state.context_selected_chunk;
+    let context_show_children = state.context_show_children;
     let context_show_origins = state.context_show_origins;
     let repo = match state.repo.as_mut() {
         Some(repo) => repo,
@@ -973,6 +986,7 @@ fn refresh_snapshot(state: &mut DashboardState) {
         previous,
         workspace_selected,
         context_selected,
+        context_show_children,
         context_show_origins,
     );
     if let Ok(snapshot) = &result {
@@ -1017,6 +1031,7 @@ fn load_snapshot(
     previous: Option<DashboardSnapshot>,
     workspace_selected_snapshot: Option<Id>,
     context_selected_chunk: Option<Id>,
+    context_show_children: bool,
     context_show_origins: bool,
 ) -> Result<DashboardSnapshot, String> {
     let pile_path = PathBuf::from(&config.pile_path);
@@ -1146,6 +1161,7 @@ fn load_snapshot(
         &mut reader_ws,
         workspace_selected_snapshot,
         context_selected_chunk,
+        context_show_children,
         context_show_origins,
     ))
 }
@@ -1172,6 +1188,7 @@ fn build_snapshot(
     ws: &mut Workspace<Pile>,
     workspace_selected_snapshot: Option<Id>,
     context_selected_chunk: Option<Id>,
+    context_show_children: bool,
     context_show_origins: bool,
 ) -> DashboardSnapshot {
     let now_key = epoch_key(now_epoch());
@@ -1184,7 +1201,13 @@ fn build_snapshot(
     let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
     let context_chunks = collect_context_chunks(&exec_data);
     let context_selected =
-        build_context_selected(ws, &context_chunks, context_selected_chunk, context_show_origins);
+        build_context_selected(
+            ws,
+            &context_chunks,
+            context_selected_chunk,
+            context_show_children,
+            context_show_origins,
+        );
     let compass_rows = collect_compass_rows(&compass_data, ws);
     let compass_status_rows = collect_compass_status_rows(&compass_data);
     let compass_notes = collect_compass_notes(&compass_data, ws);
@@ -2283,6 +2306,7 @@ fn build_context_selected(
     ws: &mut Workspace<Pile>,
     chunks: &[ContextChunkRow],
     selected_chunk: Option<Id>,
+    show_children: bool,
     show_origins: bool,
 ) -> Option<ContextSelectedRow> {
     let selected_chunk = selected_chunk?;
@@ -2290,6 +2314,27 @@ fn build_context_selected(
     let row = by_id.get(&selected_chunk)?;
 
     let summary = load_text(ws, row.summary);
+    let mut children = Vec::new();
+    if show_children {
+        if let Some(left) = row.left {
+            children.push(ContextChildRow {
+                side: "left",
+                chunk_id: left,
+                summary: by_id
+                    .get(&left)
+                    .and_then(|child| load_text(ws, child.summary)),
+            });
+        }
+        if let Some(right) = row.right {
+            children.push(ContextChildRow {
+                side: "right",
+                chunk_id: right,
+                summary: by_id
+                    .get(&right)
+                    .and_then(|child| load_text(ws, child.summary)),
+            });
+        }
+    }
 
     let mut origins = Vec::new();
     let mut origins_total = 0usize;
@@ -2342,6 +2387,7 @@ fn build_context_selected(
     Some(ContextSelectedRow {
         chunk_id: selected_chunk,
         summary,
+        children,
         origins_total,
         origins,
     })
@@ -3753,6 +3799,7 @@ fn render_context_compaction(
             let count = context_leaf_count(root.id, &by_id, &mut leaf_counts);
             let label = format!("L{} {} ({})", root.level, id_prefix(root.id), count);
             if ui.add(Button::new(label)).clicked() {
+                state.context_selection_stack.clear();
                 state.context_selected_chunk = Some(root.id);
                 state.context_show_origins = false;
                 ui.ctx().request_repaint();
@@ -3855,6 +3902,7 @@ fn render_context_chunk_node(
         });
 
     if response.header_response.clicked() {
+        state.context_selection_stack.clear();
         state.context_selected_chunk = Some(node_id);
         state.context_show_origins = false;
         ui.ctx().request_repaint();
@@ -3892,10 +3940,30 @@ fn render_context_selected_details(
     ));
 
     ui.horizontal(|ui| {
-        let button = if state.context_show_origins {
-            "Hide origins"
+        if !state.context_selection_stack.is_empty() {
+            if ui.add(Button::new("Back")).clicked() {
+                if let Some(prev) = state.context_selection_stack.pop() {
+                    state.context_selected_chunk = Some(prev);
+                    state.context_show_origins = false;
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
+        let children_button = if state.context_show_children {
+            "Hide split"
         } else {
-            "Show origins"
+            "Split"
+        };
+        if ui.add(Button::new(children_button)).clicked() {
+            state.context_show_children = !state.context_show_children;
+            ui.ctx().request_repaint();
+        }
+
+        let button = if state.context_show_origins {
+            "Hide leaves"
+        } else {
+            "List leaves"
         };
         if ui.add(Button::new(button)).clicked() {
             state.context_show_origins = !state.context_show_origins;
@@ -3903,6 +3971,8 @@ fn render_context_selected_details(
         }
         if ui.add(Button::new("Clear selection")).clicked() {
             state.context_selected_chunk = None;
+            state.context_selection_stack.clear();
+            state.context_show_children = false;
             state.context_show_origins = false;
             ui.ctx().request_repaint();
         }
@@ -3923,17 +3993,71 @@ fn render_context_selected_details(
         ui.small("<no summary loaded>");
     }
 
+    if state.context_show_children {
+        ui.add_space(8.0);
+        let Some(selected) = selected else {
+            ui.small("Loading split…");
+            return;
+        };
+        if selected.children.is_empty() {
+            ui.small("No children (leaf chunk).");
+        }
+        for child in &selected.children {
+            let Some(child_node) = by_id.get(&child.chunk_id) else {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    format!("missing {} child {}", child.side, id_prefix(child.chunk_id)),
+                );
+                continue;
+            };
+            let child_count = context_leaf_count(child.chunk_id, by_id, leaf_counts);
+            let child_start = format_age(now_key, child_node.start_at);
+            let child_end = format_age(now_key, child_node.end_at);
+
+            egui::Frame::NONE
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 210, 210)))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.monospace(format!(
+                            "{}: L{} {}  {child_start}..{child_end}  leaves:{child_count}",
+                            child.side,
+                            child_node.level,
+                            id_prefix(child.chunk_id),
+                        ));
+                        if ui.add(Button::new("Focus")).clicked() {
+                            state.context_selection_stack.push(selected_id);
+                            state.context_selected_chunk = Some(child.chunk_id);
+                            state.context_show_origins = false;
+                            ui.ctx().request_repaint();
+                        }
+                    });
+
+                    let summary = child
+                        .summary
+                        .as_deref()
+                        .unwrap_or("<missing child summary>");
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(summary).monospace())
+                            .wrap()
+                            .selectable(false),
+                    );
+                });
+            ui.add_space(6.0);
+        }
+    }
+
     if !state.context_show_origins {
         return;
     }
 
     let Some(selected) = selected else {
-        ui.small("Loading origins…");
+        ui.small("Loading leaves…");
         return;
     };
     ui.add_space(8.0);
     ui.small(format!(
-        "origins: {} leaf chunk(s) (showing up to {})",
+        "leaves: {} leaf chunk(s) (showing up to {})",
         selected.origins_total,
         CONTEXT_ORIGIN_LIMIT
     ));
@@ -3949,6 +4073,11 @@ fn render_context_selected_details(
             .id_salt(format!("context_origin::{:x}", origin.chunk_id))
             .default_open(false)
             .show(ui, |ui| {
+                if ui.add(Button::new("Focus")).clicked() {
+                    state.context_selection_stack.push(selected_id);
+                    state.context_selected_chunk = Some(origin.chunk_id);
+                    ui.ctx().request_repaint();
+                }
                 let summary = origin
                     .summary
                     .as_deref()
