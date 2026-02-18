@@ -80,6 +80,12 @@ cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pil
 cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set relations-branch-id <hex-id>
 ```
 
+Clear an optional config field:
+
+```bash
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config unset llm-api-key
+```
+
 ## Workspace snapshots (in the pile)
 
 Capture a curated snapshot of the workspace into the pile (branch `workspace` by default):

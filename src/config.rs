@@ -245,7 +245,6 @@ fn ensure_registered_branch_ids(config: &mut Config) -> bool {
     changed |= ensure_registered_branch_id(&mut config.compass_branch_id);
     changed |= ensure_registered_branch_id(&mut config.local_messages_branch_id);
     changed |= ensure_registered_branch_id(&mut config.relations_branch_id);
-    changed |= ensure_registered_branch_id(&mut config.teams_branch_id);
     changed |= ensure_registered_branch_id(&mut config.workspace_branch_id);
     changed |= ensure_registered_branch_id(&mut config.archive_branch_id);
     changed |= ensure_registered_branch_id(&mut config.web_branch_id);
@@ -272,7 +271,6 @@ fn ensure_registered_branches_exist(repo: &mut Repository<Pile>, config: &Config
             DEFAULT_LOCAL_MESSAGES_BRANCH,
         ),
         (config.relations_branch_id, DEFAULT_RELATIONS_BRANCH),
-        (config.teams_branch_id, DEFAULT_TEAMS_BRANCH),
         (config.workspace_branch_id, DEFAULT_WORKSPACE_BRANCH),
         (config.archive_branch_id, DEFAULT_ARCHIVE_BRANCH),
         (config.web_branch_id, DEFAULT_WEB_BRANCH),
@@ -283,6 +281,12 @@ fn ensure_registered_branches_exist(repo: &mut Repository<Pile>, config: &Config
         let id = id.ok_or_else(|| anyhow!("config missing id for branch '{name}'"))?;
         ensure_branch(repo, id, name)
             .with_context(|| format!("materialize branch '{name}' ({id:x})"))?;
+    }
+
+    // Optional integrations: allow a persona to omit the branch id to disable the facility.
+    if let Some(id) = config.teams_branch_id {
+        ensure_branch(repo, id, DEFAULT_TEAMS_BRANCH)
+            .with_context(|| format!("materialize branch '{name}' ({id:x})", name = DEFAULT_TEAMS_BRANCH))?;
     }
     Ok(())
 }

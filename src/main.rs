@@ -64,6 +64,8 @@ enum ConfigCommand {
         show_secrets: bool,
     },
     Set(ConfigSetArgs),
+    #[command(about = "Clear an optional config field in the pile")]
+    Unset(ConfigUnsetArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -123,9 +125,20 @@ struct ConfigSetArgs {
     field: ConfigField,
     #[arg(
         value_name = "VALUE",
-        help = "Value to set. Use @path to read from file; use null/none/empty to clear optional fields."
+        help = "Value to set. Use @path to read from file; use null/none/empty (or `config unset`) to clear optional fields."
     )]
     value: String,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(about = "Clear an optional config field in the pile")]
+struct ConfigUnsetArgs {
+    #[arg(
+        value_enum,
+        value_name = "FIELD",
+        help = "Optional config field to clear (see possible values below)."
+    )]
+    field: OptionalConfigField,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -158,6 +171,28 @@ enum ConfigField {
     LlmMaxOutputTokens,
     LlmPromptSafetyMarginTokens,
     LlmPromptCharsPerToken,
+    ExecDefaultCwd,
+    ExecSandboxProfile,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[value(rename_all = "kebab-case")]
+enum OptionalConfigField {
+    BranchId,
+    CompassBranchId,
+    ExecBranchId,
+    LocalMessagesBranchId,
+    RelationsBranchId,
+    TeamsBranchId,
+    WorkspaceBranchId,
+    ArchiveBranchId,
+    WebBranchId,
+    MediaBranchId,
+    PersonaId,
+    LlmApiKey,
+    TavilyApiKey,
+    ExaApiKey,
+    LlmReasoningEffort,
     ExecDefaultCwd,
     ExecSandboxProfile,
 }
@@ -279,6 +314,11 @@ fn handle_config(pile: Option<&Path>, command: ConfigCommand) -> Result<()> {
             config.store().context("store config")?;
             print_config(&config, false);
         }
+        ConfigCommand::Unset(args) => {
+            apply_config_unset(&mut config, args.field)?;
+            config.store().context("store config")?;
+            print_config(&config, false);
+        }
     }
     Ok(())
 }
@@ -392,11 +432,40 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
     Ok(())
 }
 
+fn apply_config_unset(config: &mut Config, field: OptionalConfigField) -> Result<()> {
+    match field {
+        OptionalConfigField::BranchId => config.branch_id = None,
+        OptionalConfigField::CompassBranchId => config.compass_branch_id = None,
+        OptionalConfigField::ExecBranchId => config.exec_branch_id = None,
+        OptionalConfigField::LocalMessagesBranchId => config.local_messages_branch_id = None,
+        OptionalConfigField::RelationsBranchId => config.relations_branch_id = None,
+        OptionalConfigField::TeamsBranchId => config.teams_branch_id = None,
+        OptionalConfigField::WorkspaceBranchId => config.workspace_branch_id = None,
+        OptionalConfigField::ArchiveBranchId => config.archive_branch_id = None,
+        OptionalConfigField::WebBranchId => config.web_branch_id = None,
+        OptionalConfigField::MediaBranchId => config.media_branch_id = None,
+        OptionalConfigField::PersonaId => config.persona_id = None,
+        OptionalConfigField::LlmApiKey => config.llm.api_key = None,
+        OptionalConfigField::TavilyApiKey => config.tavily_api_key = None,
+        OptionalConfigField::ExaApiKey => config.exa_api_key = None,
+        OptionalConfigField::LlmReasoningEffort => config.llm.reasoning_effort = None,
+        OptionalConfigField::ExecDefaultCwd => config.exec.default_cwd = None,
+        OptionalConfigField::ExecSandboxProfile => config.exec.sandbox_profile = None,
+    }
+    Ok(())
+}
+
 fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
     let Some(raw) = raw else {
         return Ok(None);
     };
+    let raw = raw.trim();
     if raw.is_empty() {
+        return Ok(None);
+    }
+    // Keep CLI ergonomics aligned with `config set` help text.
+    let lowered = raw.to_ascii_lowercase();
+    if lowered == "null" || lowered == "none" || lowered == "empty" {
         return Ok(None);
     }
     let id = Id::from_hex(raw).ok_or_else(|| anyhow!("invalid {label} {raw}"))?;
@@ -647,7 +716,7 @@ fn parse_optional_path(raw: &str) -> Option<PathBuf> {
 
 fn is_nullish(raw: &str) -> bool {
     let value = raw.trim().to_ascii_lowercase();
-    value.is_empty() || value == "null" || value == "none"
+    value.is_empty() || value == "null" || value == "none" || value == "empty"
 }
 
 fn print_config(config: &Config, show_secrets: bool) {
