@@ -34,6 +34,7 @@ use GORBIE::widgets::{Button, TextField};
 use crate::blob_refs::{PromptChunk, split_blob_refs};
 use crate::schema::llm_chat;
 use crate::schema::playground_config;
+use crate::schema::playground_context;
 use crate::schema::playground_exec;
 use crate::schema::playground_workspace;
 
@@ -86,6 +87,8 @@ mod compass {
 
 type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 const ACTIVITY_TIMELINE_HEIGHT: f32 = 980.0;
+const CONTEXT_TREE_HEIGHT: f32 = 720.0;
+const CONTEXT_ORIGIN_LIMIT: usize = 64;
 const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
 const RELATIONS_SCROLL_HEIGHT: f32 = 260.0;
 const TEAMS_SCROLL_HEIGHT: f32 = 520.0;
@@ -206,6 +209,8 @@ struct DashboardState {
     compass_expanded_goal: Option<Id>,
     teams_selected_chat: Option<Id>,
     workspace_selected_snapshot: Option<Id>,
+    context_selected_chunk: Option<Id>,
+    context_show_origins: bool,
 }
 
 impl Drop for DashboardState {
@@ -236,6 +241,8 @@ impl Default for DashboardState {
             compass_expanded_goal: None,
             teams_selected_chat: None,
             workspace_selected_snapshot: None,
+            context_selected_chunk: None,
+            context_show_origins: false,
         }
     }
 }
@@ -306,6 +313,34 @@ struct TeamsChatRow {
 struct ReasoningSummaryRow {
     created_at: Option<i128>,
     summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct ContextChunkRow {
+    id: Id,
+    level: u64,
+    summary: Value<Handle<Blake3, LongString>>,
+    start_at: Option<i128>,
+    end_at: Option<i128>,
+    left: Option<Id>,
+    right: Option<Id>,
+    about_exec_result: Option<Id>,
+}
+
+#[derive(Debug, Clone)]
+struct ContextLeafOriginRow {
+    chunk_id: Id,
+    exec_result_id: Option<Id>,
+    end_at: Option<i128>,
+    summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ContextSelectedRow {
+    chunk_id: Id,
+    summary: Option<String>,
+    origins_total: usize,
+    origins: Vec<ContextLeafOriginRow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,6 +487,8 @@ struct DashboardSnapshot {
     exec_error: Option<String>,
     agent_config: Option<AgentConfigRow>,
     agent_config_error: Option<String>,
+    context_chunks: Vec<ContextChunkRow>,
+    context_selected: Option<ContextSelectedRow>,
     timeline_rows: Vec<TimelineRow>,
     compass_rows: Vec<(CompassTaskRow, usize)>,
     compass_notes: HashMap<Id, Vec<CompassNoteRow>>,
@@ -742,6 +779,30 @@ _Live view of the agent pile, exec queue, and message activity._"
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
         with_padding(ui, padding, |ui| {
+            ui.heading("Context compaction");
+            let snapshot = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                snapshot.clone()
+            };
+            if snapshot.context_chunks.is_empty() {
+                ui.label("No context chunks yet.");
+                return;
+            }
+            render_context_compaction(
+                ui,
+                &mut state,
+                snapshot.now_key,
+                &snapshot.context_chunks,
+                snapshot.context_selected.as_ref(),
+            );
+        });
+    });
+
+    nb.view(move |ui| {
+        let mut state = dashboard.read_mut(ui);
+        with_padding(ui, padding, |ui| {
             ui.heading("Local message composer");
             let snapshot = {
                 let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
@@ -897,6 +958,8 @@ fn refresh_snapshot(state: &mut DashboardState) {
         .cloned();
     let config = state.config.clone();
     let workspace_selected = state.workspace_selected_snapshot;
+    let context_selected = state.context_selected_chunk;
+    let context_show_origins = state.context_show_origins;
     let repo = match state.repo.as_mut() {
         Some(repo) => repo,
         None => {
@@ -904,7 +967,14 @@ fn refresh_snapshot(state: &mut DashboardState) {
             return;
         }
     };
-    let result = load_snapshot(repo, &config, previous, workspace_selected);
+    let result = load_snapshot(
+        repo,
+        &config,
+        previous,
+        workspace_selected,
+        context_selected,
+        context_show_origins,
+    );
     if let Ok(snapshot) = &result {
         if let Some(agent_config) = snapshot.agent_config.as_ref() {
             apply_branch_defaults_from_agent_config(state, agent_config);
@@ -946,6 +1016,8 @@ fn load_snapshot(
     config: &DashboardConfig,
     previous: Option<DashboardSnapshot>,
     workspace_selected_snapshot: Option<Id>,
+    context_selected_chunk: Option<Id>,
+    context_show_origins: bool,
 ) -> Result<DashboardSnapshot, String> {
     let pile_path = PathBuf::from(&config.pile_path);
     let branches = list_branches(repo.storage_mut())?;
@@ -1030,6 +1102,8 @@ fn load_snapshot(
             exec_error,
             agent_config: None,
             agent_config_error,
+            context_chunks: Vec::new(),
+            context_selected: None,
             timeline_rows: Vec::new(),
             compass_rows: Vec::new(),
             compass_notes: HashMap::new(),
@@ -1071,6 +1145,8 @@ fn load_snapshot(
         config,
         &mut reader_ws,
         workspace_selected_snapshot,
+        context_selected_chunk,
+        context_show_origins,
     ))
 }
 
@@ -1095,6 +1171,8 @@ fn build_snapshot(
     config: &DashboardConfig,
     ws: &mut Workspace<Pile>,
     workspace_selected_snapshot: Option<Id>,
+    context_selected_chunk: Option<Id>,
+    context_show_origins: bool,
 ) -> DashboardSnapshot {
     let now_key = epoch_key(now_epoch());
     let relations_people = collect_relations_people(&relations_data, ws);
@@ -1104,6 +1182,9 @@ fn build_snapshot(
     let agent_config = collect_agent_config(&config_data, ws);
     let exec_rows = collect_exec_rows(&exec_data, ws);
     let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
+    let context_chunks = collect_context_chunks(&exec_data);
+    let context_selected =
+        build_context_selected(ws, &context_chunks, context_selected_chunk, context_show_origins);
     let compass_rows = collect_compass_rows(&compass_data, ws);
     let compass_status_rows = collect_compass_status_rows(&compass_data);
     let compass_notes = collect_compass_notes(&compass_data, ws);
@@ -1135,6 +1216,8 @@ fn build_snapshot(
         exec_error,
         agent_config,
         agent_config_error,
+        context_chunks,
+        context_selected,
         timeline_rows,
         compass_rows,
         compass_notes,
@@ -2115,6 +2198,153 @@ fn collect_reasoning_summaries(
     rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
     rows.reverse();
     rows
+}
+
+fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
+    let mut rows: HashMap<Id, ContextChunkRow> = HashMap::new();
+
+    for (chunk_id, level, summary, start_at, end_at) in find!(
+        (
+            chunk_id: Id,
+            level: Value<U256BE>,
+            summary: Value<Handle<Blake3, LongString>>,
+            start_at: Value<NsTAIInterval>,
+            end_at: Value<NsTAIInterval>
+        ),
+        pattern!(data, [{
+            ?chunk_id @
+            playground_context::kind: playground_context::kind_chunk,
+            playground_context::level: ?level,
+            playground_context::summary: ?summary,
+            playground_context::start_at: ?start_at,
+            playground_context::end_at: ?end_at,
+        }])
+    ) {
+        rows.insert(
+            chunk_id,
+            ContextChunkRow {
+                id: chunk_id,
+                level: u256be_to_u64(level).unwrap_or_default(),
+                summary,
+                start_at: Some(interval_key(start_at)),
+                end_at: Some(interval_key(end_at)),
+                left: None,
+                right: None,
+                about_exec_result: None,
+            },
+        );
+    }
+
+    for (chunk_id, child_id) in find!(
+        (chunk_id: Id, child_id: Id),
+        pattern!(data, [{
+            ?chunk_id @
+            playground_context::kind: playground_context::kind_chunk,
+            playground_context::left: ?child_id,
+        }])
+    ) {
+        if let Some(row) = rows.get_mut(&chunk_id) {
+            row.left = Some(child_id);
+        }
+    }
+
+    for (chunk_id, child_id) in find!(
+        (chunk_id: Id, child_id: Id),
+        pattern!(data, [{
+            ?chunk_id @
+            playground_context::kind: playground_context::kind_chunk,
+            playground_context::right: ?child_id,
+        }])
+    ) {
+        if let Some(row) = rows.get_mut(&chunk_id) {
+            row.right = Some(child_id);
+        }
+    }
+
+    for (chunk_id, exec_result_id) in find!(
+        (chunk_id: Id, exec_result_id: Id),
+        pattern!(data, [{
+            ?chunk_id @
+            playground_context::kind: playground_context::kind_chunk,
+            playground_context::about_exec_result: ?exec_result_id,
+        }])
+    ) {
+        if let Some(row) = rows.get_mut(&chunk_id) {
+            row.about_exec_result = Some(exec_result_id);
+        }
+    }
+
+    let mut list: Vec<ContextChunkRow> = rows.into_values().collect();
+    list.sort_by_key(|row| (row.level, row.start_at.unwrap_or(i128::MIN)));
+    list
+}
+
+fn build_context_selected(
+    ws: &mut Workspace<Pile>,
+    chunks: &[ContextChunkRow],
+    selected_chunk: Option<Id>,
+    show_origins: bool,
+) -> Option<ContextSelectedRow> {
+    let selected_chunk = selected_chunk?;
+    let by_id: HashMap<Id, &ContextChunkRow> = chunks.iter().map(|row| (row.id, row)).collect();
+    let row = by_id.get(&selected_chunk)?;
+
+    let summary = load_text(ws, row.summary);
+
+    let mut origins = Vec::new();
+    let mut origins_total = 0usize;
+    if show_origins {
+        let mut stack = vec![selected_chunk];
+        let mut seen = HashSet::new();
+        let mut leaves: Vec<Id> = Vec::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(node) = by_id.get(&id) else {
+                continue;
+            };
+            let is_leaf =
+                node.about_exec_result.is_some() || (node.left.is_none() && node.right.is_none());
+            if is_leaf {
+                leaves.push(id);
+                continue;
+            }
+            if let Some(left) = node.left {
+                stack.push(left);
+            }
+            if let Some(right) = node.right {
+                stack.push(right);
+            }
+        }
+
+        leaves.sort_by_key(|id| {
+            by_id
+                .get(id)
+                .and_then(|row| row.start_at)
+                .unwrap_or(i128::MIN)
+        });
+        origins_total = leaves.len();
+
+        for leaf_id in leaves.into_iter().take(CONTEXT_ORIGIN_LIMIT) {
+            let Some(leaf) = by_id.get(&leaf_id) else {
+                continue;
+            };
+            origins.push(ContextLeafOriginRow {
+                chunk_id: leaf_id,
+                exec_result_id: leaf.about_exec_result,
+                end_at: leaf.end_at,
+                summary: load_text(ws, leaf.summary),
+            });
+        }
+    }
+
+    Some(ContextSelectedRow {
+        chunk_id: selected_chunk,
+        summary,
+        origins_total,
+        origins,
+    })
 }
 
 fn build_activity_timeline(
@@ -3488,6 +3718,248 @@ fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRo
         .min_scrolled_height(min_scrolled_height)
         .max_height(max_height)
         .show(ui, |ui| render_rows(ui));
+}
+
+fn render_context_compaction(
+    ui: &mut egui::Ui,
+    state: &mut DashboardState,
+    now_key: i128,
+    chunks: &[ContextChunkRow],
+    selected: Option<&ContextSelectedRow>,
+) {
+    let by_id: HashMap<Id, &ContextChunkRow> = chunks.iter().map(|row| (row.id, row)).collect();
+
+    let mut children: HashSet<Id> = HashSet::new();
+    for row in chunks {
+        if let Some(left) = row.left {
+            children.insert(left);
+        }
+        if let Some(right) = row.right {
+            children.insert(right);
+        }
+    }
+
+    let mut roots: Vec<&ContextChunkRow> = chunks
+        .iter()
+        .filter(|row| !children.contains(&row.id))
+        .collect();
+    roots.sort_by_key(|row| (row.level, row.start_at.unwrap_or(i128::MIN)));
+
+    let mut leaf_counts: HashMap<Id, usize> = HashMap::new();
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Frontier:");
+        for root in &roots {
+            let count = context_leaf_count(root.id, &by_id, &mut leaf_counts);
+            let label = format!("L{} {} ({})", root.level, id_prefix(root.id), count);
+            if ui.add(Button::new(label)).clicked() {
+                state.context_selected_chunk = Some(root.id);
+                state.context_show_origins = false;
+                ui.ctx().request_repaint();
+            }
+        }
+    });
+    ui.add_space(8.0);
+
+    let max_height = if diagnostics_is_headless() {
+        1200.0
+    } else {
+        CONTEXT_TREE_HEIGHT
+    };
+    egui::ScrollArea::vertical()
+        .id_salt("context_compaction_scroll")
+        .auto_shrink([false, false])
+        .max_height(max_height)
+        .show(ui, |ui| {
+            for root in roots {
+                render_context_chunk_node(
+                    ui,
+                    state,
+                    now_key,
+                    &by_id,
+                    root.id,
+                    &mut leaf_counts,
+                );
+                ui.add_space(6.0);
+            }
+        });
+
+    ui.add_space(8.0);
+    render_context_selected_details(ui, state, now_key, &by_id, &mut leaf_counts, selected);
+}
+
+fn context_leaf_count(
+    node_id: Id,
+    by_id: &HashMap<Id, &ContextChunkRow>,
+    memo: &mut HashMap<Id, usize>,
+) -> usize {
+    if let Some(count) = memo.get(&node_id) {
+        return *count;
+    }
+    let Some(node) = by_id.get(&node_id) else {
+        memo.insert(node_id, 0);
+        return 0;
+    };
+    let is_leaf = node.about_exec_result.is_some() || (node.left.is_none() && node.right.is_none());
+    if is_leaf {
+        memo.insert(node_id, 1);
+        return 1;
+    }
+
+    let left = node.left.map(|id| context_leaf_count(id, by_id, memo)).unwrap_or(0);
+    let right = node
+        .right
+        .map(|id| context_leaf_count(id, by_id, memo))
+        .unwrap_or(0);
+    let count = left.saturating_add(right);
+    memo.insert(node_id, count);
+    count
+}
+
+fn render_context_chunk_node(
+    ui: &mut egui::Ui,
+    state: &mut DashboardState,
+    now_key: i128,
+    by_id: &HashMap<Id, &ContextChunkRow>,
+    node_id: Id,
+    leaf_counts: &mut HashMap<Id, usize>,
+) {
+    let Some(node) = by_id.get(&node_id) else {
+        ui.monospace(format!("<missing chunk {}>", id_prefix(node_id)));
+        return;
+    };
+    let selected = state.context_selected_chunk == Some(node_id);
+    let count = context_leaf_count(node_id, by_id, leaf_counts);
+    let start = format_age(now_key, node.start_at);
+    let end = format_age(now_key, node.end_at);
+
+    let mut label = format!(
+        "{}L{} {}  {start}..{end}  leaves:{count}",
+        if selected { "*" } else { " " },
+        node.level,
+        id_prefix(node.id),
+    );
+    if let Some(exec_id) = node.about_exec_result {
+        label.push_str(&format!("  exec:{}", id_prefix(exec_id)));
+    }
+
+    let response = egui::CollapsingHeader::new(egui::RichText::new(label).monospace())
+        .id_salt(format!("context_chunk::{node_id:x}"))
+        .show(ui, |ui| {
+            if let Some(left) = node.left {
+                render_context_chunk_node(ui, state, now_key, by_id, left, leaf_counts);
+            }
+            if let Some(right) = node.right {
+                render_context_chunk_node(ui, state, now_key, by_id, right, leaf_counts);
+            }
+        });
+
+    if response.header_response.clicked() {
+        state.context_selected_chunk = Some(node_id);
+        state.context_show_origins = false;
+        ui.ctx().request_repaint();
+    }
+}
+
+fn render_context_selected_details(
+    ui: &mut egui::Ui,
+    state: &mut DashboardState,
+    now_key: i128,
+    by_id: &HashMap<Id, &ContextChunkRow>,
+    leaf_counts: &mut HashMap<Id, usize>,
+    selected: Option<&ContextSelectedRow>,
+) {
+    let Some(selected_id) = state.context_selected_chunk else {
+        ui.small("Tip: click a chunk header to inspect its summary and leaf origins.");
+        return;
+    };
+
+    let Some(node) = by_id.get(&selected_id) else {
+        ui.colored_label(
+            egui::Color32::RED,
+            format!("Selected chunk {} is missing from catalog.", id_prefix(selected_id)),
+        );
+        return;
+    };
+
+    let count = context_leaf_count(selected_id, by_id, leaf_counts);
+    let start = format_age(now_key, node.start_at);
+    let end = format_age(now_key, node.end_at);
+    ui.monospace(format!(
+        "selected: L{} {}  {start}..{end}  leaves:{count}",
+        node.level,
+        id_prefix(node.id)
+    ));
+
+    ui.horizontal(|ui| {
+        let button = if state.context_show_origins {
+            "Hide origins"
+        } else {
+            "Show origins"
+        };
+        if ui.add(Button::new(button)).clicked() {
+            state.context_show_origins = !state.context_show_origins;
+            ui.ctx().request_repaint();
+        }
+        if ui.add(Button::new("Clear selection")).clicked() {
+            state.context_selected_chunk = None;
+            state.context_show_origins = false;
+            ui.ctx().request_repaint();
+        }
+    });
+
+    let selected = match selected {
+        Some(row) if row.chunk_id == selected_id => Some(row),
+        _ => None,
+    };
+
+    if let Some(summary) = selected.and_then(|row| row.summary.as_deref()) {
+        ui.add(
+            egui::Label::new(egui::RichText::new(summary).monospace())
+                .wrap()
+                .selectable(false),
+        );
+    } else {
+        ui.small("<no summary loaded>");
+    }
+
+    if !state.context_show_origins {
+        return;
+    }
+
+    let Some(selected) = selected else {
+        ui.small("Loading origins…");
+        return;
+    };
+    ui.add_space(8.0);
+    ui.small(format!(
+        "origins: {} leaf chunk(s) (showing up to {})",
+        selected.origins_total,
+        CONTEXT_ORIGIN_LIMIT
+    ));
+
+    for origin in &selected.origins {
+        let age = format_age(now_key, origin.end_at);
+        let exec = origin
+            .exec_result_id
+            .map(id_prefix)
+            .unwrap_or_else(|| "-".to_string());
+        let title = format!("{age}  leaf {}  exec:{exec}", id_prefix(origin.chunk_id));
+        egui::CollapsingHeader::new(egui::RichText::new(title).monospace())
+            .id_salt(format!("context_origin::{:x}", origin.chunk_id))
+            .default_open(false)
+            .show(ui, |ui| {
+                let summary = origin
+                    .summary
+                    .as_deref()
+                    .unwrap_or("<missing leaf summary>");
+                ui.add(
+                    egui::Label::new(egui::RichText::new(summary).monospace())
+                        .wrap()
+                        .selectable(false),
+                );
+            });
+    }
 }
 
 fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) {
