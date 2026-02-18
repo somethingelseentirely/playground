@@ -1049,6 +1049,7 @@ struct LlmResultEntry {
     finished_at: Option<Value<NsTAIInterval>>,
     attempt: Option<Value<U256BE>>,
     output_text: Option<Value<Handle<Blake3, LongString>>>,
+    reasoning_text: Option<Value<Handle<Blake3, LongString>>>,
     error: Option<Value<Handle<Blake3, LongString>>>,
 }
 
@@ -1231,6 +1232,7 @@ struct LlmResult {
 #[derive(Debug, Clone)]
 struct LlmResultInfo {
     output_text: Option<Value<Handle<Blake3, LongString>>>,
+    reasoning_text: Option<Value<Handle<Blake3, LongString>>>,
     error: Option<Value<Handle<Blake3, LongString>>>,
 }
 
@@ -1407,6 +1409,7 @@ impl CoreIndex {
                 finished_at: None,
                 attempt: None,
                 output_text: None,
+                reasoning_text: None,
                 error: None,
             });
             entry.about_request = Some(about_request);
@@ -1442,6 +1445,17 @@ impl CoreIndex {
         ) {
             if let Some(entry) = self.llm_results.get_mut(&result_id) {
                 entry.output_text = Some(output_text);
+            }
+        }
+
+        for (result_id, reasoning_text) in find!(
+            (result_id: Id, reasoning_text: Value<Handle<Blake3, LongString>>),
+            pattern_changes!(updated, delta, [{
+                ?result_id @ llm_chat::reasoning_text: ?reasoning_text
+            }])
+        ) {
+            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+                entry.reasoning_text = Some(reasoning_text);
             }
         }
 
@@ -1672,6 +1686,7 @@ impl CoreIndex {
             .max_by_key(|result| llm_result_rank(result.attempt, result.finished_at))
             .map(|result| LlmResultInfo {
                 output_text: result.output_text,
+                reasoning_text: result.reasoning_text,
                 error: result.error,
             })
     }
@@ -1693,6 +1708,12 @@ impl CoreIndex {
 
     fn command_request_for_thought(&self, thought_id: Id) -> Option<Id> {
         self.command_request_for_thought.get(&thought_id).copied()
+    }
+
+    fn thought_for_command_request(&self, command_request_id: Id) -> Option<Id> {
+        self.command_requests
+            .get(&command_request_id)
+            .and_then(|request| request.about_thought)
     }
 
     fn latest_command_result(&self, request_id: Id) -> Option<CommandResultInfo> {
@@ -1911,8 +1932,10 @@ fn build_prompt_messages_with_compaction(
                 .finished_at
                 .context("command result missing finished_at")?;
             let command = load_command_for_result(ws, core_index, result)?;
+            let reasoning_text = load_reasoning_for_exec_result(ws, core_index, result)?;
             let exec_output = load_exec_result(ws, result.clone())?;
-            let leaf_summary = format_exec_output(command.as_str(), exec_output);
+            let leaf_summary =
+                format_exec_output(command.as_str(), exec_output, reasoning_text.as_deref());
             let leaf_summary_handle = ws.put(leaf_summary);
             let now = epoch_interval(now_epoch());
             let chunk_id = ufoid();
@@ -2056,8 +2079,9 @@ fn build_recent_messages(
             break;
         }
         let command = load_command_for_result(ws, core_index, result)?;
+        let reasoning_text = load_reasoning_for_exec_result(ws, core_index, result)?;
         let exec_output = load_exec_result(ws, result.clone())?;
-        let turn_output = format_exec_result_output(exec_output);
+        let turn_output = format_exec_result_output(exec_output, reasoning_text.as_deref());
 
         let command_len = command.chars().count();
         let output_len = turn_output.chars().count();
@@ -2108,8 +2132,11 @@ fn format_memory_output(ws: &mut Workspace<Pile>, chunk: &ContextChunk) -> Resul
     Ok(format!("{header}\n{}\n", summary.trim_end()))
 }
 
-fn format_exec_result_output(result: ExecResult) -> String {
+fn format_exec_result_output(result: ExecResult, reasoning_text: Option<&str>) -> String {
     let mut text = String::new();
+    if let Some(reasoning_text) = reasoning_text {
+        append_section(&mut text, "reasoning", reasoning_text);
+    }
     let stdout = format_output_text(result.stdout_text, result.stdout);
     append_section(&mut text, "stdout", stdout.as_str());
     let stderr = format_output_text(result.stderr_text, result.stderr);
@@ -2149,6 +2176,30 @@ fn load_command_for_result(
         ));
     };
     load_text(ws, command_handle).context("load command for exec result")
+}
+
+fn load_reasoning_for_exec_result(
+    ws: &mut Workspace<Pile>,
+    core_index: &CoreIndex,
+    exec_result: &CommandResultInfo,
+) -> Result<Option<String>> {
+    let Some(thought_id) = core_index.thought_for_command_request(exec_result.about_request) else {
+        return Ok(None);
+    };
+    let Some(request_id) = core_index.request_for_thought(thought_id) else {
+        return Ok(None);
+    };
+    let Some(llm_result) = core_index.latest_llm_result(request_id) else {
+        return Ok(None);
+    };
+    let Some(reasoning_handle) = llm_result.reasoning_text else {
+        return Ok(None);
+    };
+    let reasoning_text = load_text(ws, reasoning_handle).context("load reasoning text")?;
+    if reasoning_text.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(reasoning_text))
 }
 
 fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
@@ -2541,9 +2592,12 @@ fn load_exec_result(ws: &mut Workspace<Pile>, result: CommandResultInfo) -> Resu
     })
 }
 
-fn format_exec_output(command: &str, result: ExecResult) -> String {
+fn format_exec_output(command: &str, result: ExecResult, reasoning_text: Option<&str>) -> String {
     let mut text = String::new();
     append_section(&mut text, "command", command);
+    if let Some(reasoning_text) = reasoning_text {
+        append_section(&mut text, "reasoning", reasoning_text);
+    }
     let stdout = format_output_text(result.stdout_text, result.stdout);
     append_section(&mut text, "stdout", stdout.as_str());
     let stderr = format_output_text(result.stderr_text, result.stderr);

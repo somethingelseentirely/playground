@@ -45,7 +45,7 @@ struct LlmRequestIndex {
 #[derive(Debug)]
 struct OpenAIResult {
     output_text: String,
-    intent_text: Option<String>,
+    reasoning_text: Option<String>,
     raw: String,
     response_id: Option<String>,
 }
@@ -144,12 +144,12 @@ impl ChatCompletionsClient {
         } else {
             let json: JsonValue = response.json().context("read response json")?;
             let output_text = extract_output_text(&json);
-            let intent_text = extract_intent_text(&json);
+            let reasoning_text = extract_reasoning_text(&json);
             let raw = serde_json::to_string(&json).context("serialize response")?;
             let response_id = extract_response_id(&json);
             Ok(OpenAIResult {
                 output_text,
-                intent_text,
+                reasoning_text,
                 raw,
                 response_id,
             })
@@ -281,10 +281,10 @@ pub(crate) fn run_llm_loop(
                         llm_chat::output_text: output_handle,
                         llm_chat::response_raw: raw_handle,
                     };
-                    if let Some(intent_text) = result.intent_text {
-                        let handle = ws.put(intent_text);
+                    if let Some(reasoning_text) = result.reasoning_text {
+                        let handle = ws.put(reasoning_text);
                         change += entity! { &result_id @
-                            llm_chat::intent_text: handle,
+                            llm_chat::reasoning_text: handle,
                         };
                     }
                     if let Some(response_id) = response_id {
@@ -627,7 +627,7 @@ fn parse_stream(response: reqwest::blocking::Response) -> Result<OpenAIResult> {
     let mut output_text = String::new();
     let mut raw_events = Vec::new();
     let mut response_id = None;
-    let mut intent_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
 
     let reader = BufReader::new(response);
     for line in reader.lines() {
@@ -655,17 +655,17 @@ fn parse_stream(response: reqwest::blocking::Response) -> Result<OpenAIResult> {
                     if let Some(content) = delta.get("content").and_then(JsonValue::as_str) {
                         output_text.push_str(content);
                     }
-                    collect_chat_intent_chunks(delta, &mut intent_parts);
+                    collect_chat_reasoning_chunks(delta, &mut reasoning_parts);
                 }
             }
         }
     }
 
     let raw = raw_events.join("\n");
-    let intent_text = normalized_join(intent_parts);
+    let reasoning_text = normalized_join(reasoning_parts);
     Ok(OpenAIResult {
         output_text,
-        intent_text,
+        reasoning_text,
         raw,
         response_id,
     })
@@ -715,7 +715,7 @@ fn extract_output_text(response: &JsonValue) -> String {
         .to_string()
 }
 
-fn extract_intent_text(response: &JsonValue) -> Option<String> {
+fn extract_reasoning_text(response: &JsonValue) -> Option<String> {
     let mut out = Vec::new();
 
     // OpenAI responses-style reasoning summaries.
@@ -740,10 +740,10 @@ fn extract_intent_text(response: &JsonValue) -> Option<String> {
     if let Some(choices) = response.get("choices").and_then(JsonValue::as_array) {
         for choice in choices {
             if let Some(message) = choice.get("message") {
-                collect_chat_intent_chunks(message, &mut out);
+                collect_chat_reasoning_chunks(message, &mut out);
             }
             if let Some(delta) = choice.get("delta") {
-                collect_chat_intent_chunks(delta, &mut out);
+                collect_chat_reasoning_chunks(delta, &mut out);
             }
         }
     }
@@ -751,7 +751,7 @@ fn extract_intent_text(response: &JsonValue) -> Option<String> {
     normalized_join(out)
 }
 
-fn collect_chat_intent_chunks(node: &JsonValue, out: &mut Vec<String>) {
+fn collect_chat_reasoning_chunks(node: &JsonValue, out: &mut Vec<String>) {
     for key in ["thinking", "reasoning", "reasoning_content"] {
         if let Some(text) = node.get(key).and_then(JsonValue::as_str) {
             push_clean(out, text);
@@ -823,7 +823,7 @@ fn id_prefix(id: Id) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::extract_intent_text;
+    use super::extract_reasoning_text;
 
     #[test]
     fn extracts_openai_reasoning_summary() {
@@ -837,8 +837,8 @@ mod tests {
                 }
             ]
         });
-        let intent = extract_intent_text(&response).expect("intent");
-        assert!(intent.contains("Investigating branch mismatch"));
+        let reasoning = extract_reasoning_text(&response).expect("reasoning");
+        assert!(reasoning.contains("Investigating branch mismatch"));
     }
 
     #[test]
@@ -855,8 +855,8 @@ mod tests {
                 }
             ]
         });
-        let intent = extract_intent_text(&response).expect("intent");
-        assert_eq!(intent, "Need to inspect config first");
+        let reasoning = extract_reasoning_text(&response).expect("reasoning");
+        assert_eq!(reasoning, "Need to inspect config first");
     }
 
     #[test]
@@ -870,6 +870,6 @@ mod tests {
                 }
             ]
         });
-        assert!(extract_intent_text(&response).is_none());
+        assert!(extract_reasoning_text(&response).is_none());
     }
 }

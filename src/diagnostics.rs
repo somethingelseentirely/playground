@@ -2307,19 +2307,19 @@ fn collect_reasoning_summaries(
     ws: &mut Workspace<Pile>,
 ) -> Vec<ReasoningSummaryRow> {
     let mut rows = Vec::new();
-    let mut intent_by_result: HashMap<Id, Value<Handle<Blake3, LongString>>> = HashMap::new();
-    for (result_id, intent_handle) in find!(
+    let mut reasoning_by_result: HashMap<Id, Value<Handle<Blake3, LongString>>> = HashMap::new();
+    for (result_id, reasoning_handle) in find!(
         (
             result_id: Id,
-            intent_handle: Value<Handle<Blake3, LongString>>
+            reasoning_handle: Value<Handle<Blake3, LongString>>
         ),
         pattern!(data, [{
             ?result_id @
             llm_chat::kind: llm_chat::kind_result,
-            llm_chat::intent_text: ?intent_handle,
+            llm_chat::reasoning_text: ?reasoning_handle,
         }])
     ) {
-        intent_by_result.insert(result_id, intent_handle);
+        reasoning_by_result.insert(result_id, reasoning_handle);
     }
 
     let mut raw_by_result: HashMap<Id, Value<Handle<Blake3, LongString>>> = HashMap::new();
@@ -2345,7 +2345,7 @@ fn collect_reasoning_summaries(
             llm_chat::finished_at: ?finished_at,
         }])
     ) {
-        let summary = if let Some(handle) = intent_by_result.get(&result_id).copied() {
+        let summary = if let Some(handle) = reasoning_by_result.get(&result_id).copied() {
             load_text(ws, handle).unwrap_or_default()
         } else if let Some(handle) = raw_by_result.get(&result_id).copied() {
             let raw = load_text(ws, handle).unwrap_or_default();
