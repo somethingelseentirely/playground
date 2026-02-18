@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use reqwest::blocking::Client;
 use triblespace::core::blob::Bytes;
 use triblespace::core::blob::schemas::UnknownBlob;
 use triblespace::core::repo::pile::Pile;
@@ -1838,6 +1839,7 @@ fn build_prompt_messages_with_compaction(
 ) -> Result<(Vec<ChatMessage>, TribleSet)> {
     let mut index = load_context_chunks(catalog);
     let body_budget_chars = prompt_body_budget_chars(config);
+    let semantic_compactor = SemanticCompactor::new(config).ok();
 
     // Sort all command results in chronological order (oldest -> newest).
     let mut results: Vec<CommandResultInfo> =
@@ -1902,7 +1904,13 @@ fn build_prompt_messages_with_compaction(
                 about_exec_result: Some(result.id),
             };
             index.chunk_for_exec_result.insert(result.id, chunk.id);
-            insert_chunk_with_carry(ws, &mut index, &mut compact_change, chunk)?;
+            insert_chunk_with_carry(
+                ws,
+                &mut index,
+                &mut compact_change,
+                chunk,
+                semantic_compactor.as_ref(),
+            )?;
         }
 
         let compact_budget = body_budget_chars / 2;
@@ -2248,6 +2256,7 @@ fn insert_chunk_with_carry(
     index: &mut ContextChunkIndex,
     change: &mut TribleSet,
     mut carry: ContextChunk,
+    semantic: Option<&SemanticCompactor>,
 ) -> Result<()> {
     let mut level = carry.level;
     loop {
@@ -2267,7 +2276,26 @@ fn insert_chunk_with_carry(
 
             let left_text = load_text(ws, left.summary).context("load left chunk summary")?;
             let right_text = load_text(ws, right.summary).context("load right chunk summary")?;
-            let merged_text = format!("{left_text}\n\n{right_text}");
+            let merged_text = match semantic {
+                Some(compactor) => compactor
+                    .merge(
+                        left_text.as_str(),
+                        right_text.as_str(),
+                        PROMPT_COMPACT_MAX_CHARS,
+                    )
+                    .unwrap_or_else(|_| {
+                        merge_text_fallback(
+                            left_text.as_str(),
+                            right_text.as_str(),
+                            PROMPT_COMPACT_MAX_CHARS,
+                        )
+                    }),
+                None => merge_text_fallback(
+                    left_text.as_str(),
+                    right_text.as_str(),
+                    PROMPT_COMPACT_MAX_CHARS,
+                ),
+            };
             let merged_text = compact_text(merged_text.as_str(), PROMPT_COMPACT_MAX_CHARS);
             let merged_handle = ws.put(merged_text);
 
@@ -2309,6 +2337,152 @@ fn insert_chunk_with_carry(
         index.chunks.insert(carry.id, carry);
         return Ok(());
     }
+}
+
+struct SemanticCompactor {
+    client: Client,
+    endpoint_url: String,
+    api_key: Option<String>,
+    model: String,
+}
+
+impl SemanticCompactor {
+    fn new(config: &Config) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .context("build semantic compaction http client")?;
+        Ok(Self {
+            client,
+            endpoint_url: chat_completions_url(config.llm.base_url.as_str()),
+            api_key: config.llm.api_key.clone(),
+            model: config.llm.model.clone(),
+        })
+    }
+
+    fn merge(&self, left: &str, right: &str, max_chars: usize) -> Result<String> {
+        let system = "You are a context compaction module.\n\nGiven two prior memory chunks from a terminal-based agent, write a concise merged summary that preserves:\n- key actions taken\n- important results/outputs\n- errors and their causes\n- paths/ids that matter for follow-up\n\nOutput plain text only (no markdown), no code fences, no tool calls.\n";
+        let user = format!(
+            "CHUNK A:\n{left}\n\nCHUNK B:\n{right}\n\nWrite a merged summary (preferably <= {max_chars} chars)."
+        );
+
+        let max_tokens = ((max_chars as u64) / 4).clamp(64, 1024);
+        let payload = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": false,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+        });
+
+        let mut last_err = None;
+        for attempt in 1..=3usize {
+            match self.send_once(&payload) {
+                Ok(text) => return Ok(text),
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt < 3 {
+                        let backoff = 250_u64.saturating_mul(1_u64 << (attempt - 1));
+                        sleep(Duration::from_millis(backoff));
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow!("semantic compaction failed without error detail")))
+    }
+
+    fn send_once(&self, payload: &serde_json::Value) -> Result<String> {
+        let mut request = self.client.post(&self.endpoint_url);
+        if let Some(api_key) = self.api_key.as_ref() {
+            request = request.bearer_auth(api_key);
+        }
+
+        let response = request.json(payload).send().context("send http request")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<failed to read error body>".to_string());
+            return Err(anyhow!(
+                "semantic compaction request failed: HTTP {} for url ({}){}",
+                status,
+                self.endpoint_url,
+                if body.trim().is_empty() {
+                    "".to_string()
+                } else {
+                    format!(": {}", body.trim())
+                }
+            ));
+        }
+
+        let json: serde_json::Value = response.json().context("read response json")?;
+        let text = extract_output_text(&json);
+        Ok(text.trim().to_string())
+    }
+}
+
+fn chat_completions_url(api_base_url: &str) -> String {
+    let base = api_base_url.trim().trim_end_matches('/');
+    if base.ends_with("/chat/completions") || base.ends_with("/completions") {
+        return base.to_string();
+    }
+    if let Some(base) = base.strip_suffix("/responses") {
+        return format!("{base}/chat/completions");
+    }
+    format!("{base}/chat/completions")
+}
+
+fn extract_output_text(json: &serde_json::Value) -> String {
+    // Chat-completions style: choices[0].message.content
+    if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
+        if let Some(first) = choices.first() {
+            if let Some(message) = first.get("message") {
+                let content = message.get("content");
+                if let Some(text) = content.and_then(|v| v.as_str()) {
+                    return text.to_string();
+                }
+                if let Some(parts) = content.and_then(|v| v.as_array()) {
+                    let mut out = String::new();
+                    for part in parts {
+                        if part.get("type").and_then(|v| v.as_str()) == Some("text") {
+                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                out.push_str(text);
+                            }
+                        }
+                    }
+                    if !out.is_empty() {
+                        return out;
+                    }
+                }
+            }
+
+            // Legacy completions-style fallback: choices[0].text
+            if let Some(text) = first.get("text").and_then(|v| v.as_str()) {
+                return text.to_string();
+            }
+        }
+    }
+
+    String::new()
+}
+
+fn merge_text_fallback(left: &str, right: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let sep = "\n\n...\n\n";
+    let sep_len = sep.chars().count();
+    if max_chars <= sep_len + 2 {
+        return compact_text(format!("{left}{sep}{right}").as_str(), max_chars);
+    }
+    let half = (max_chars - sep_len) / 2;
+    let left = compact_text(left, half);
+    let right = compact_text(right, max_chars - sep_len - left.chars().count());
+    format!("{left}{sep}{right}")
 }
 
 fn load_exec_result(ws: &mut Workspace<Pile>, result: CommandResultInfo) -> Result<ExecResult> {
