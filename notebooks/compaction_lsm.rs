@@ -1272,13 +1272,19 @@ fn select_cover(
 
     let (moment_cover, moment_start_leaf, moment_used, reserved_moment_budget) =
         select_moment_leaves(sim, &by_id, budget_chars, params.moment_ratio);
-    let history_budget = budget_chars.saturating_sub(moment_used);
-    let history_end_leaf = moment_start_leaf.and_then(|start| start.checked_sub(1));
+    let global_newest_leaf = leaf_count.saturating_sub(1);
+    // Keep history budget stable turn-to-turn: reserve a fixed slice for moment, independent of
+    // how much the newest raw leaves happened to consume this step.
+    let history_budget = budget_chars.saturating_sub(reserved_moment_budget);
+    let history_end_leaf = match moment_start_leaf {
+        Some(start) => start.checked_sub(1),
+        None => leaf_count.checked_sub(1),
+    };
     let history_seed = build_history_seed_cover(sim, &by_id, history_end_leaf);
 
     let mut history = match policy {
         SelectionPolicy::DistributionAware => {
-            select_cover_distribution(sim, history_budget, history_seed, history_end_leaf)
+            select_cover_distribution(sim, history_budget, history_seed, global_newest_leaf)
         }
         SelectionPolicy::DeterministicSuffix => {
             select_cover_deterministic(sim, history_budget, history_seed)
@@ -1288,10 +1294,10 @@ fn select_cover(
             history_budget,
             params,
             history_seed,
-            history_end_leaf,
+            global_newest_leaf,
         ),
         SelectionPolicy::CurveHistory => {
-            select_cover_curve_history(sim, history_budget, history_seed, history_end_leaf)
+            select_cover_curve_history(sim, history_budget, history_seed, global_newest_leaf)
         }
     };
 
@@ -1464,7 +1470,7 @@ fn select_moment_leaves(
         if cost > budget_chars {
             continue;
         }
-        if !moment.is_empty() && used.saturating_add(cost) > moment_budget {
+        if used.saturating_add(cost) > moment_budget {
             break;
         }
         moment.push(leaf_id);
@@ -1490,8 +1496,8 @@ fn allowed_span(age: usize, scale: f32) -> f64 {
     (dyadic_base_span(age) as f64) * (scale as f64)
 }
 
-fn node_violates_curve(node: &SimNode, history_newest_leaf: usize, scale: f32) -> bool {
-    let age_end = history_newest_leaf.saturating_sub(node.end_leaf);
+fn node_violates_curve(node: &SimNode, global_newest_leaf: usize, scale: f32) -> bool {
+    let age_end = global_newest_leaf.saturating_sub(node.end_leaf);
     let span = node_span(node) as f64;
     span > allowed_span(age_end, scale) + f64::EPSILON
 }
@@ -1499,7 +1505,7 @@ fn node_violates_curve(node: &SimNode, history_newest_leaf: usize, scale: f32) -
 fn apply_curve_constraint(
     mut cover: Vec<u64>,
     by_id: &HashMap<u64, &SimNode>,
-    history_newest_leaf: usize,
+    global_newest_leaf: usize,
     scale: f32,
     mut steps: Option<&mut Vec<String>>,
     trace_prefix: &str,
@@ -1512,7 +1518,7 @@ fn apply_curve_constraint(
             let Some(node) = by_id.get(&node_id).copied() else {
                 continue;
             };
-            if !node_violates_curve(node, history_newest_leaf, scale) {
+            if !node_violates_curve(node, global_newest_leaf, scale) {
                 continue;
             }
             let (Some(left), Some(right)) = (node.left, node.right) else {
@@ -1540,7 +1546,7 @@ fn apply_curve_constraint(
 fn refine_history_suffix(
     cover: &mut Vec<u64>,
     by_id: &HashMap<u64, &SimNode>,
-    history_newest_leaf: usize,
+    global_newest_leaf: usize,
     scale: f32,
     history_budget: usize,
     used_chars: &mut usize,
@@ -1568,8 +1574,8 @@ fn refine_history_suffix(
             let Some(right_node) = by_id.get(&right).copied() else {
                 continue;
             };
-            if node_violates_curve(left_node, history_newest_leaf, scale)
-                || node_violates_curve(right_node, history_newest_leaf, scale)
+            if node_violates_curve(left_node, global_newest_leaf, scale)
+                || node_violates_curve(right_node, global_newest_leaf, scale)
             {
                 continue;
             }
@@ -1600,15 +1606,12 @@ fn select_cover_curve_history(
     sim: &Simulation,
     budget_chars: usize,
     mut cover: Vec<u64>,
-    history_newest_leaf: Option<usize>,
+    global_newest_leaf: usize,
 ) -> CoverSelection {
     let by_id = sim.node_map();
     if budget_chars == 0 {
         return empty_history_selection("history budget is zero");
     }
-    let Some(history_newest_leaf) = history_newest_leaf else {
-        return empty_history_selection("history is empty");
-    };
     if cover.is_empty() {
         return empty_history_selection("history seed cover is empty");
     }
@@ -1624,35 +1627,10 @@ fn select_cover_curve_history(
         budget_chars,
     ));
 
-    while used_chars > budget_chars && !cover.is_empty() {
-        let dropped_id = cover.remove(0);
-        if let Some(node) = by_id.get(&dropped_id).copied() {
-            let cost = cover_turn_cost(node);
-            used_chars = used_chars.saturating_sub(cost);
-            dropped_roots = dropped_roots.saturating_add(1);
-            steps.push(format!(
-                "drop oldest history node #{:04} [{}..{}], -{} chars => {} / {}",
-                node.id, node.start_leaf, node.end_leaf, cost, used_chars, budget_chars
-            ));
-        }
-    }
-    if cover.is_empty() {
-        steps.push("history cover empty after drops".to_string());
-        return CoverSelection {
-            cover,
-            history_len: 0,
-            moment_len: 0,
-            used_chars,
-            dropped_roots,
-            splits,
-            steps,
-        };
-    }
-
     let mut chosen_scale = CURVE_SCALE_LADDER.last().copied().unwrap_or(1.0);
     for scale in CURVE_SCALE_LADDER {
         let (candidate_cover, _) =
-            apply_curve_constraint(cover.clone(), &by_id, history_newest_leaf, scale, None, "");
+            apply_curve_constraint(cover.clone(), &by_id, global_newest_leaf, scale, None, "");
         let candidate_cost = cover_cost(&candidate_cover, &by_id);
         steps.push(format!(
             "scale {:.2}: history cost {} / {}",
@@ -1667,7 +1645,7 @@ fn select_cover_curve_history(
     let (curve_cover, curve_splits) = apply_curve_constraint(
         cover,
         &by_id,
-        history_newest_leaf,
+        global_newest_leaf,
         chosen_scale,
         Some(&mut steps),
         "",
@@ -1683,13 +1661,29 @@ fn select_cover_curve_history(
     let refine_splits = refine_history_suffix(
         &mut cover,
         &by_id,
-        history_newest_leaf,
+        global_newest_leaf,
         chosen_scale,
         budget_chars,
         &mut used_chars,
         &mut steps,
     );
     splits = splits.saturating_add(refine_splits);
+
+    while used_chars > budget_chars && !cover.is_empty() {
+        let dropped_id = cover.remove(0);
+        if let Some(node) = by_id.get(&dropped_id).copied() {
+            let cost = cover_turn_cost(node);
+            used_chars = used_chars.saturating_sub(cost);
+            dropped_roots = dropped_roots.saturating_add(1);
+            steps.push(format!(
+                "drop oldest history node #{:04} [{}..{}], -{} chars => {} / {}",
+                node.id, node.start_leaf, node.end_leaf, cost, used_chars, budget_chars
+            ));
+        }
+    }
+    if cover.is_empty() {
+        steps.push("history cover empty after drops".to_string());
+    }
 
     CoverSelection {
         cover,
@@ -1706,13 +1700,11 @@ fn select_cover_distribution(
     sim: &Simulation,
     budget_chars: usize,
     mut cover: Vec<u64>,
-    history_newest_leaf: Option<usize>,
+    global_newest_leaf: usize,
 ) -> CoverSelection {
     let by_id = sim.node_map();
-    let Some((newest_leaf, leaf_count, bucket_count)) = history_leaf_metrics(history_newest_leaf)
-    else {
-        return empty_history_selection("history is empty");
-    };
+    let (newest_leaf, leaf_count, bucket_count) =
+        history_leaf_metrics(Some(global_newest_leaf)).expect("global newest leaf is always set");
     if cover.is_empty() {
         return empty_history_selection("history seed cover is empty");
     }
@@ -2118,16 +2110,14 @@ fn select_cover_deterministic_quota(
     budget_chars: usize,
     params: CoverPolicyParams,
     mut cover: Vec<u64>,
-    history_newest_leaf: Option<usize>,
+    global_newest_leaf: usize,
 ) -> CoverSelection {
     let by_id = sim.node_map();
     if budget_chars == 0 {
         return empty_history_selection("history budget is zero");
     }
-    let Some((newest_leaf, leaf_count, bucket_count)) = history_leaf_metrics(history_newest_leaf)
-    else {
-        return empty_history_selection("history is empty");
-    };
+    let (newest_leaf, leaf_count, bucket_count) =
+        history_leaf_metrics(Some(global_newest_leaf)).expect("global newest leaf is always set");
     if cover.is_empty() {
         return empty_history_selection("history seed cover is empty");
     }
