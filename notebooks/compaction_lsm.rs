@@ -1747,7 +1747,7 @@ fn select_cover_curve_history(
     }
 
     let mut steps = Vec::new();
-    let mut dropped_roots = 0usize;
+    let dropped_roots = 0usize;
     let mut splits = 0usize;
     let mut used_chars = cover_cost(&cover, &by_id);
     steps.push(initial_history_step(
@@ -1806,20 +1806,11 @@ fn select_cover_curve_history(
     );
     splits = splits.saturating_add(refine_splits);
 
-    while used_chars > budget_chars && !cover.is_empty() {
-        let dropped_id = cover.remove(0);
-        if let Some(node) = by_id.get(&dropped_id).copied() {
-            let cost = cover_turn_cost(node);
-            used_chars = used_chars.saturating_sub(cost);
-            dropped_roots = dropped_roots.saturating_add(1);
-            steps.push(format!(
-                "drop oldest history node #{:04} [{}..{}], -{} chars => {} / {}",
-                node.id, node.start_leaf, node.end_leaf, cost, used_chars, budget_chars
-            ));
-        }
-    }
-    if cover.is_empty() {
-        steps.push("history cover empty after drops".to_string());
+    if used_chars > budget_chars {
+        steps.push(format!(
+            "over budget after curve selection: {} / {} (no root dropping)",
+            used_chars, budget_chars
+        ));
     }
 
     CoverSelection {
@@ -1865,7 +1856,7 @@ fn select_cover_distribution(
         target_weight_sum,
     );
 
-    let mut dropped_roots = 0usize;
+    let dropped_roots = 0usize;
     let mut splits = 0usize;
     let mut steps = Vec::new();
     steps.push(initial_history_step(
@@ -1999,35 +1990,11 @@ fn select_cover_distribution(
         ));
     }
 
-    while used_chars > budget_chars && !cover.is_empty() {
-        let dropped = cover.remove(0);
-        if let Some(node) = by_id.get(&dropped).copied() {
-            let cost = cover_turn_cost(node);
-            used_chars = used_chars.saturating_sub(cost);
-            let bucket =
-                age_bucket_for_end_leaf(node.end_leaf, newest_leaf, leaf_count, bucket_count);
-            bucket_chars[bucket] = bucket_chars[bucket].saturating_sub(cost);
-            current_error = distribution_error(
-                &bucket_chars,
-                used_chars,
-                &target_weights,
-                target_weight_sum,
-            );
-            dropped_roots = dropped_roots.saturating_add(1);
-            steps.push(format!(
-                "drop oldest root #{:04} [{}..{}], -{} chars => {} / {} (error {:.4})",
-                node.id,
-                node.start_leaf,
-                node.end_leaf,
-                cost,
-                used_chars,
-                budget_chars,
-                current_error
-            ));
-        }
-    }
-    if cover.is_empty() {
-        steps.push("cover is empty after drops".to_string());
+    if used_chars > budget_chars {
+        steps.push(format!(
+            "over budget after distribution selection: {} / {} (no root dropping)",
+            used_chars, budget_chars
+        ));
     }
 
     if steps.len() == 1 {
@@ -2056,7 +2023,7 @@ fn select_cover_deterministic(
     }
     let mut used_chars = cover_cost(&cover, &by_id);
 
-    let mut dropped_roots = 0usize;
+    let dropped_roots = 0usize;
     let mut splits = 0usize;
     let mut steps = Vec::new();
     steps.push(initial_history_step(
@@ -2127,20 +2094,11 @@ fn select_cover_deterministic(
         ));
     }
 
-    while used_chars > budget_chars && !cover.is_empty() {
-        let dropped = cover.remove(0);
-        if let Some(node) = by_id.get(&dropped).copied() {
-            let cost = cover_turn_cost(node);
-            used_chars = used_chars.saturating_sub(cost);
-            dropped_roots = dropped_roots.saturating_add(1);
-            steps.push(format!(
-                "drop oldest root #{:04} [{}..{}], -{} chars => {} / {}",
-                node.id, node.start_leaf, node.end_leaf, cost, used_chars, budget_chars
-            ));
-        }
-    }
-    if cover.is_empty() {
-        steps.push("cover is empty after drops".to_string());
+    if used_chars > budget_chars {
+        steps.push(format!(
+            "over budget after deterministic selection: {} / {} (no root dropping)",
+            used_chars, budget_chars
+        ));
     }
 
     if steps.len() == 1 {
@@ -2258,7 +2216,7 @@ fn select_cover_deterministic_quota(
         slot_counts[bucket] = slot_counts[bucket].saturating_add(1);
     }
 
-    let mut dropped_roots = 0usize;
+    let dropped_roots = 0usize;
     let mut splits = 0usize;
     let mut steps = Vec::new();
     steps.push(initial_history_step(
@@ -2385,23 +2343,11 @@ fn select_cover_deterministic_quota(
         ));
     }
 
-    while used_chars > effective_budget && !cover.is_empty() {
-        let dropped = cover.remove(0);
-        if let Some(node) = by_id.get(&dropped).copied() {
-            let cost = cover_turn_cost(node);
-            used_chars = used_chars.saturating_sub(cost);
-            let bucket =
-                age_bucket_for_end_leaf(node.end_leaf, newest_leaf, leaf_count, bucket_count);
-            slot_counts[bucket] = slot_counts[bucket].saturating_sub(1);
-            dropped_roots = dropped_roots.saturating_add(1);
-            steps.push(format!(
-                "drop oldest root #{:04} [{}..{}], -{} chars => {} / {}",
-                node.id, node.start_leaf, node.end_leaf, cost, used_chars, effective_budget
-            ));
-        }
-    }
-    if cover.is_empty() {
-        steps.push("cover is empty after drops".to_string());
+    if used_chars > effective_budget {
+        steps.push(format!(
+            "over effective budget after detq selection: {} / {} (no root dropping)",
+            used_chars, effective_budget
+        ));
     }
 
     if steps.len() == 1 {
@@ -3872,14 +3818,14 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 \n\
 **Algorithm (detailed):**\n\
 1. Build initial cover from frontier roots ordered oldest -> newest.\n\
-2. Keep roots as-is; use oldest-drop only as a last-resort fallback.\n\
+2. Keep roots as-is (never drop roots).\n\
 3. Enumerate every eligible split candidate:\n\
    - candidate must have two children,\n\
    - extra cost must fit remaining budget.\n\
 4. For each candidate, project bucket chars and evaluate `Δerror = current_error - projected_error`.\n\
 5. Select max `Δerror` (tie-break by recency, then cost, then index/id).\n\
 6. Apply split, update bucket counts and repeat until no improving split fits.\n\
-7. If still over budget, drop oldest roots as fallback.\n\
+7. If still over budget, report over-budget state (no structural pruning).\n\
 \n\
 **Properties:**\n\
 - Best age-share fit among current options.\n\
@@ -3907,14 +3853,14 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 \n\
 **Algorithm (detailed):**\n\
 1. Build initial cover from frontier roots ordered oldest -> newest.\n\
-2. Keep roots as-is; use oldest-drop only as a last-resort fallback.\n\
+2. Keep roots as-is (never drop roots).\n\
 3. While budget headroom exists:\n\
    - scan cover from right to left,\n\
    - take the first split that is valid (children exist, cost fits),\n\
    - apply immediately,\n\
    - restart right-to-left scan.\n\
 4. Stop when no valid split remains.\n\
-5. If still over budget, drop oldest roots as fallback.\n\
+5. If still over budget, report over-budget state (no structural pruning).\n\
 \n\
 **Why this yields stable prefixes:**\n\
 - Edits are concentrated at rightmost splittable nodes,\n\
@@ -3946,13 +3892,13 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 2. Estimate `safe_cost = quantile(node_costs, q)`.\n\
 3. Derive `target_slots = floor(effective_budget / safe_cost)`.\n\
 4. Map age-weight targets to integer slot quotas.\n\
-5. Start with frontier cover; use oldest-drop only as a last-resort fallback.\n\
+5. Start with frontier cover (never drop roots).\n\
 6. Consider right-to-left split candidates; a split is accepted only if:\n\
    - candidate is within the newest suffix window,\n\
    - cost fits remaining headroom,\n\
    - projected slot deficit strictly improves.\n\
 7. Choose the newest improving split (recency-first), then repeat.\n\
-8. If still over budget, drop oldest roots as fallback.\n\
+8. If still over budget, report over-budget state (no structural pruning).\n\
 \n\
 **Properties:**\n\
 - Deterministic under fixed inputs,\n\
@@ -3983,7 +3929,7 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 3. Enforce curve constraint by splitting violating history nodes:\n\
    `span(node) <= s * 2^floor(log2(age(node)+1))`.\n\
 4. Use remaining history headroom for deterministic newest-first refinement splits.\n\
-5. If still over budget (rare), drop oldest history nodes as a last resort.\n\
+5. If still over budget (rare), report over-budget state (no structural pruning).\n\
 \n\
 **Properties:**\n\
 - deterministic replay,\n\
