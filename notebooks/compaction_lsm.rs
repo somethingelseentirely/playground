@@ -48,6 +48,7 @@ const STEADY_STATE_START_RATIO: f32 = 0.9;
 const MIN_RELEVANT_INSERTS: usize = 100_000;
 const MAX_RELEVANT_INSERTS: usize = 1_000_000;
 const TRACE_RENDER_LIMIT: usize = 256;
+const DEFAULT_DETQ_SUFFIX_WINDOW_RATIO: f32 = 0.05;
 const CURVE_SCALE_LADDER: [f32; 14] = [
     0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0,
 ];
@@ -66,6 +67,13 @@ struct NotebookArgs {
     tokenizer_path: Option<PathBuf>,
     tokenizer_sample_limit: usize,
     inserts: Option<usize>,
+    det_fill_ratio: Option<f32>,
+    det_safe_quantile: Option<f32>,
+    moment_ratio: Option<f32>,
+    detq_suffix_window_ratio: Option<f32>,
+    reduction_factor: Option<u32>,
+    context_budget: Option<usize>,
+    churn_sample_count: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +190,13 @@ fn parse_notebook_args() -> Result<NotebookArgs> {
         tokenizer_path: None,
         tokenizer_sample_limit: 2048,
         inserts: None,
+        det_fill_ratio: None,
+        det_safe_quantile: None,
+        moment_ratio: None,
+        detq_suffix_window_ratio: None,
+        reduction_factor: None,
+        context_budget: None,
+        churn_sample_count: None,
     };
 
     let mut it = std::env::args().skip(1);
@@ -219,6 +234,74 @@ fn parse_notebook_args() -> Result<NotebookArgs> {
                         .with_context(|| format!("invalid --inserts value '{value}'"))?,
                 );
             }
+            "--det-fill-ratio" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--det-fill-ratio expects a float"))?;
+                args.det_fill_ratio = Some(
+                    value
+                        .parse::<f32>()
+                        .with_context(|| format!("invalid --det-fill-ratio value '{value}'"))?,
+                );
+            }
+            "--det-safe-quantile" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--det-safe-quantile expects a float"))?;
+                args.det_safe_quantile = Some(
+                    value
+                        .parse::<f32>()
+                        .with_context(|| format!("invalid --det-safe-quantile value '{value}'"))?,
+                );
+            }
+            "--moment-ratio" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--moment-ratio expects a float"))?;
+                args.moment_ratio = Some(
+                    value
+                        .parse::<f32>()
+                        .with_context(|| format!("invalid --moment-ratio value '{value}'"))?,
+                );
+            }
+            "--detq-suffix-window-ratio" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--detq-suffix-window-ratio expects a float"))?;
+                args.detq_suffix_window_ratio = Some(value.parse::<f32>().with_context(|| {
+                    format!("invalid --detq-suffix-window-ratio value '{value}'")
+                })?);
+            }
+            "--reduction-factor" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--reduction-factor expects an integer"))?;
+                args.reduction_factor = Some(
+                    value
+                        .parse::<u32>()
+                        .with_context(|| format!("invalid --reduction-factor value '{value}'"))?,
+                );
+            }
+            "--context-budget" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--context-budget expects an integer"))?;
+                args.context_budget = Some(
+                    value
+                        .parse::<usize>()
+                        .with_context(|| format!("invalid --context-budget value '{value}'"))?,
+                );
+            }
+            "--churn-samples" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--churn-samples expects an integer"))?;
+                args.churn_sample_count = Some(
+                    value
+                        .parse::<usize>()
+                        .with_context(|| format!("invalid --churn-samples value '{value}'"))?,
+                );
+            }
             // Notebook macro handles these too; consume values so our parser stays aligned.
             "--out-dir" | "--scale" | "--pixels-per-point" | "--headless-wait-ms" => {
                 if it.next().is_none() {
@@ -243,6 +326,27 @@ fn initial_state_from_bootstrap(bootstrap: &NotebookBootstrap) -> ViewState {
     }
     if let Some(inserts) = bootstrap.args.inserts {
         state.set_total_inserted(inserts.clamp(1, MAX_RELEVANT_INSERTS));
+    }
+    if let Some(value) = bootstrap.args.det_fill_ratio {
+        state.det_fill_ratio = value.clamp(0.5, 0.98);
+    }
+    if let Some(value) = bootstrap.args.det_safe_quantile {
+        state.det_safe_quantile = value.clamp(0.5, 0.999);
+    }
+    if let Some(value) = bootstrap.args.moment_ratio {
+        state.moment_ratio = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = bootstrap.args.detq_suffix_window_ratio {
+        state.detq_suffix_window_ratio = value.clamp(0.01, 1.0);
+    }
+    if let Some(value) = bootstrap.args.reduction_factor {
+        state.reduction_factor = value.max(2);
+    }
+    if let Some(value) = bootstrap.args.context_budget {
+        state.context_budget = value.max(1);
+    }
+    if let Some(value) = bootstrap.args.churn_sample_count {
+        state.churn_sample_count = value.max(2);
     }
     state
 }
@@ -744,6 +848,13 @@ fn run_text_report(bootstrap: &NotebookBootstrap) -> Result<()> {
         state.churn_sample_count
     );
     println!(
+        "- policy params: moment_ratio={:.2} det_fill={:.2} det_safe_q={:.3} detq_suffix_window={:.2}",
+        state.moment_ratio,
+        state.det_fill_ratio,
+        state.det_safe_quantile,
+        state.detq_suffix_window_ratio
+    );
+    println!(
         "- tree stats: nodes={} merges={} frontier_roots={} frontier_chars={}",
         sim.nodes.len(),
         sim.merges,
@@ -952,6 +1063,7 @@ struct ViewState {
     det_fill_ratio: f32,
     det_safe_quantile: f32,
     moment_ratio: f32,
+    detq_suffix_window_ratio: f32,
     show_advanced_controls: bool,
     churn_sample_count: usize,
     churn_sampling_mode: TraceSamplingMode,
@@ -972,6 +1084,7 @@ impl Default for ViewState {
             det_fill_ratio: 0.85,
             det_safe_quantile: 0.9,
             moment_ratio: 0.25,
+            detq_suffix_window_ratio: DEFAULT_DETQ_SUFFIX_WINDOW_RATIO,
             show_advanced_controls: false,
             churn_sample_count: 512,
             churn_sampling_mode: TraceSamplingMode::Uniform,
@@ -1178,6 +1291,7 @@ struct CoverPolicyParams {
     det_fill_ratio: f32,
     det_safe_quantile: f32,
     moment_ratio: f32,
+    detq_suffix_window_ratio: f32,
 }
 
 impl CoverPolicyParams {
@@ -1186,6 +1300,7 @@ impl CoverPolicyParams {
             det_fill_ratio: state.det_fill_ratio.clamp(0.5, 0.98),
             det_safe_quantile: state.det_safe_quantile.clamp(0.5, 0.999),
             moment_ratio: state.moment_ratio.clamp(0.05, 0.8),
+            detq_suffix_window_ratio: state.detq_suffix_window_ratio.clamp(0.01, 1.0),
         }
     }
 }
@@ -1249,35 +1364,6 @@ fn distribution_error(
         error += diff * diff;
     }
     error
-}
-
-fn split_preserves_level_monotonicity(
-    cover: &[u64],
-    by_id: &HashMap<u64, &SimNode>,
-    split_index: usize,
-    child_level: u32,
-) -> bool {
-    let prev_ok = if split_index == 0 {
-        true
-    } else {
-        by_id
-            .get(&cover[split_index - 1])
-            .map(|prev| prev.level >= child_level)
-            .unwrap_or(false)
-    };
-    if !prev_ok {
-        return false;
-    }
-
-    let next_ok = if split_index + 1 >= cover.len() {
-        true
-    } else {
-        by_id
-            .get(&cover[split_index + 1])
-            .map(|next| child_level >= next.level)
-            .unwrap_or(false)
-    };
-    next_ok
 }
 
 fn select_cover(
@@ -1796,10 +1882,6 @@ fn select_cover_distribution(
             if extra_cost > remaining {
                 continue;
             }
-            let child_level = parent.level.saturating_sub(1);
-            if !split_preserves_level_monotonicity(&cover, &by_id, idx, child_level) {
-                continue;
-            }
             let candidate = Candidate {
                 index: idx,
                 parent_id: *parent_id,
@@ -1991,10 +2073,6 @@ fn select_cover_deterministic(
             if extra_cost > remaining {
                 continue;
             }
-            let child_level = parent.level.saturating_sub(1);
-            if !split_preserves_level_monotonicity(&cover, &by_id, idx, child_level) {
-                continue;
-            }
             chosen = Some(Candidate {
                 index: idx,
                 parent_id,
@@ -2169,12 +2247,13 @@ fn select_cover_deterministic_quota(
         budget_chars,
     ));
     steps.push(format!(
-        "fill={:.0}%, eff_budget={}, q={:.2}, safe_cost={}, target_slots={}",
+        "fill={:.0}%, eff_budget={}, q={:.2}, safe_cost={}, target_slots={}, suffix_window={:.0}%",
         params.det_fill_ratio * 100.0,
         effective_budget,
         params.det_safe_quantile,
         safe_cost,
-        target_slots
+        target_slots,
+        params.detq_suffix_window_ratio * 100.0
     ));
 
     loop {
@@ -2187,9 +2266,12 @@ fn select_cover_deterministic_quota(
         }
 
         let current_deficit = slot_deficit(&slot_counts, &target_slot_quotas);
-        let mut best: Option<Candidate> = None;
-        let mut best_deficit = current_deficit;
-        for idx in (0..cover.len()).rev() {
+        let suffix_span = ((cover.len() as f32) * params.detq_suffix_window_ratio)
+            .ceil()
+            .max(1.0) as usize;
+        let min_index = cover.len().saturating_sub(suffix_span);
+        let mut chosen: Option<Candidate> = None;
+        for idx in (min_index..cover.len()).rev() {
             let parent_id = cover[idx];
             let Some(parent) = by_id.get(&parent_id).copied() else {
                 continue;
@@ -2212,10 +2294,6 @@ fn select_cover_deterministic_quota(
             if extra_cost > remaining {
                 continue;
             }
-            let child_level = parent.level.saturating_sub(1);
-            if !split_preserves_level_monotonicity(&cover, &by_id, idx, child_level) {
-                continue;
-            }
             let parent_bucket =
                 age_bucket_for_end_leaf(parent.end_leaf, newest_leaf, leaf_count, bucket_count);
             let left_bucket =
@@ -2228,7 +2306,11 @@ fn select_cover_deterministic_quota(
             projected_counts[right_bucket] = projected_counts[right_bucket].saturating_add(1);
             let projected_deficit = slot_deficit(&projected_counts, &target_slot_quotas);
             let deficit_improvement = (current_deficit - projected_deficit) as f64;
-            let candidate = Candidate {
+            if deficit_improvement <= 0.0 {
+                continue;
+            }
+            // Recency-first refinement: pick the newest beneficial split (right-to-left scan).
+            chosen = Some(Candidate {
                 index: idx,
                 parent_id,
                 left_id,
@@ -2236,24 +2318,13 @@ fn select_cover_deterministic_quota(
                 extra_cost,
                 recency_key: parent.end_leaf,
                 distribution_improvement: deficit_improvement,
-            };
-
-            if projected_deficit < best_deficit {
-                best_deficit = projected_deficit;
-                best = Some(candidate);
-                continue;
-            }
-            if projected_deficit == best_deficit && better_candidate(candidate, best) {
-                best = Some(candidate);
-            }
+            });
+            break;
         }
 
-        let Some(chosen) = best else {
+        let Some(chosen) = chosen else {
             break;
         };
-        if chosen.distribution_improvement <= 0.0 {
-            break;
-        }
 
         cover.splice(
             chosen.index..=chosen.index,
@@ -3253,6 +3324,7 @@ fn run_policy_sweep(state: &ViewState, cfg: &SweepConfig) -> SweepResults {
             det_fill_ratio: state.det_fill_ratio,
             det_safe_quantile: state.det_safe_quantile,
             moment_ratio: state.moment_ratio,
+            detq_suffix_window_ratio: state.detq_suffix_window_ratio,
         },
         visible_leaves,
         sweep_sample_count,
@@ -3270,6 +3342,7 @@ fn run_policy_sweep(state: &ViewState, cfg: &SweepConfig) -> SweepResults {
             det_fill_ratio: state.det_fill_ratio,
             det_safe_quantile: state.det_safe_quantile,
             moment_ratio: state.moment_ratio,
+            detq_suffix_window_ratio: state.detq_suffix_window_ratio,
         },
         visible_leaves,
         sweep_sample_count,
@@ -3287,6 +3360,7 @@ fn run_policy_sweep(state: &ViewState, cfg: &SweepConfig) -> SweepResults {
             det_fill_ratio: state.det_fill_ratio,
             det_safe_quantile: state.det_safe_quantile,
             moment_ratio: state.moment_ratio,
+            detq_suffix_window_ratio: state.detq_suffix_window_ratio,
         },
         visible_leaves,
         sweep_sample_count,
@@ -3311,6 +3385,7 @@ fn run_policy_sweep(state: &ViewState, cfg: &SweepConfig) -> SweepResults {
                 det_fill_ratio: fill,
                 det_safe_quantile: *quantile,
                 moment_ratio: state.moment_ratio,
+                detq_suffix_window_ratio: state.detq_suffix_window_ratio,
             };
             if let Some(row) = evaluate_sweep_row(
                 state,
@@ -3776,14 +3851,14 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 \n\
 **Algorithm (detailed):**\n\
 1. Build initial cover from frontier roots ordered oldest -> newest.\n\
-2. Compute `used_chars`; while over budget, drop oldest roots.\n\
+2. Keep roots as-is; use oldest-drop only as a last-resort fallback.\n\
 3. Enumerate every eligible split candidate:\n\
    - candidate must have two children,\n\
-   - extra cost must fit remaining budget,\n\
-   - split must preserve level monotonicity in cover order.\n\
+   - extra cost must fit remaining budget.\n\
 4. For each candidate, project bucket chars and evaluate `Δerror = current_error - projected_error`.\n\
 5. Select max `Δerror` (tie-break by recency, then cost, then index/id).\n\
 6. Apply split, update bucket counts and repeat until no improving split fits.\n\
+7. If still over budget, drop oldest roots as fallback.\n\
 \n\
 **Properties:**\n\
 - Best age-share fit among current options.\n\
@@ -3811,13 +3886,14 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 \n\
 **Algorithm (detailed):**\n\
 1. Build initial cover from frontier roots ordered oldest -> newest.\n\
-2. Drop oldest roots until budget fits.\n\
+2. Keep roots as-is; use oldest-drop only as a last-resort fallback.\n\
 3. While budget headroom exists:\n\
    - scan cover from right to left,\n\
-   - take the first split that is valid (children exist, cost fits, monotonicity preserved),\n\
+   - take the first split that is valid (children exist, cost fits),\n\
    - apply immediately,\n\
    - restart right-to-left scan.\n\
 4. Stop when no valid split remains.\n\
+5. If still over budget, drop oldest roots as fallback.\n\
 \n\
 **Why this yields stable prefixes:**\n\
 - Edits are concentrated at rightmost splittable nodes,\n\
@@ -3849,12 +3925,13 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 2. Estimate `safe_cost = quantile(node_costs, q)`.\n\
 3. Derive `target_slots = floor(effective_budget / safe_cost)`.\n\
 4. Map age-weight targets to integer slot quotas.\n\
-5. Start with frontier cover, drop oldest until `used <= effective_budget`.\n\
+5. Start with frontier cover; use oldest-drop only as a last-resort fallback.\n\
 6. Consider right-to-left split candidates; a split is accepted only if:\n\
+   - candidate is within the newest suffix window,\n\
    - cost fits remaining headroom,\n\
-   - monotonicity holds,\n\
    - projected slot deficit strictly improves.\n\
-7. Stop on no improvement.\n\
+7. Choose the newest improving split (recency-first), then repeat.\n\
+8. If still over budget, drop oldest roots as fallback.\n\
 \n\
 **Properties:**\n\
 - Deterministic under fixed inputs,\n\
