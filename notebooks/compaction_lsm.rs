@@ -323,6 +323,8 @@ fn initial_state_from_bootstrap(bootstrap: &NotebookBootstrap) -> ViewState {
             state.base_leaf_size = p50_leaf.clamp(16, 4096);
         }
         state.context_budget = profile.prompt_budget_chars.clamp(200, 4_000_000);
+        state.chars_per_token = profile.llm.prompt_chars_per_token.max(1) as usize;
+        state.output_tokens_per_step = profile.llm.max_output_tokens as usize;
     }
     if let Some(inserts) = bootstrap.args.inserts {
         state.set_total_inserted(inserts.clamp(1, MAX_RELEVANT_INSERTS));
@@ -872,6 +874,16 @@ fn run_text_report(bootstrap: &NotebookBootstrap) -> Result<()> {
         "\n## Policy behavior (tail-consecutive window {}..={})",
         tail_window_start, tail_window_end
     );
+    let chars_per_token = bootstrap
+        .profile
+        .as_ref()
+        .map(|p| p.llm.prompt_chars_per_token.max(1) as f64)
+        .unwrap_or(DEFAULT_PROMPT_CHARS_PER_TOKEN as f64);
+    let assumed_out_tokens = bootstrap
+        .profile
+        .as_ref()
+        .map(|p| p.llm.max_output_tokens as f64)
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS as f64);
     for policy in ALL_POLICIES {
         let selection = select_cover(&sim, state.context_budget, policy, params);
         let fill_ratio = if state.context_budget == 0 {
@@ -903,25 +915,47 @@ fn run_text_report(bootstrap: &NotebookBootstrap) -> Result<()> {
             summarize_churn(&sparse_samples, steady_state_min_step(state.visible_leaves));
         match (tail_summary, sparse_summary) {
             (Some(tail), Some(sparse)) => {
+                let avg_cached_tokens = tail.avg_cached_input_chars / chars_per_token;
+                let avg_new_tokens = tail.avg_new_input_chars / chars_per_token;
+                let avg_input_tokens = tail.avg_input_chars / chars_per_token;
                 println!(
-                    "- {:>24} | fill {:>6.2}% | tail h-prefix {:>5.1}% h-suffix {:>6.2} h-set {:>6.2} | sparse h-prefix {:>5.1}% h-suffix {:>6.2}",
+                    "- {:>24} | fill {:>6.2}% util {:>6.2}% | tail h-prefix {:>5.1}% h-suffix {:>6.2} h-set {:>6.2} | sparse h-prefix {:>5.1}% h-suffix {:>6.2} | cache/new {:>6} | in tok t/c/n {:>6.0}/{:>6.0}/{:>6.0} | out {:>5.0}",
                     policy.label(),
                     fill_ratio * 100.0,
+                    tail.avg_context_utilization * 100.0,
                     tail.avg_history_prefix_retention * 100.0,
                     tail.avg_history_suffix_churn,
                     tail.avg_history_set_churn,
                     sparse.avg_history_prefix_retention * 100.0,
                     sparse.avg_history_suffix_churn,
+                    tail.cached_new_ratio
+                        .map(|ratio| format!("{ratio:.2}x"))
+                        .unwrap_or_else(|| "inf".to_string()),
+                    avg_input_tokens,
+                    avg_cached_tokens,
+                    avg_new_tokens,
+                    assumed_out_tokens,
                 );
             }
             (Some(tail), None) => {
+                let avg_cached_tokens = tail.avg_cached_input_chars / chars_per_token;
+                let avg_new_tokens = tail.avg_new_input_chars / chars_per_token;
+                let avg_input_tokens = tail.avg_input_chars / chars_per_token;
                 println!(
-                    "- {:>24} | fill {:>6.2}% | tail h-prefix {:>5.1}% h-suffix {:>6.2} h-set {:>6.2}",
+                    "- {:>24} | fill {:>6.2}% util {:>6.2}% | tail h-prefix {:>5.1}% h-suffix {:>6.2} h-set {:>6.2} | cache/new {:>6} | in tok t/c/n {:>6.0}/{:>6.0}/{:>6.0} | out {:>5.0}",
                     policy.label(),
                     fill_ratio * 100.0,
+                    tail.avg_context_utilization * 100.0,
                     tail.avg_history_prefix_retention * 100.0,
                     tail.avg_history_suffix_churn,
                     tail.avg_history_set_churn,
+                    tail.cached_new_ratio
+                        .map(|ratio| format!("{ratio:.2}x"))
+                        .unwrap_or_else(|| "inf".to_string()),
+                    avg_input_tokens,
+                    avg_cached_tokens,
+                    avg_new_tokens,
+                    assumed_out_tokens,
                 );
             }
             _ => {
@@ -1064,6 +1098,8 @@ struct ViewState {
     det_safe_quantile: f32,
     moment_ratio: f32,
     detq_suffix_window_ratio: f32,
+    chars_per_token: usize,
+    output_tokens_per_step: usize,
     show_advanced_controls: bool,
     churn_sample_count: usize,
     churn_sampling_mode: TraceSamplingMode,
@@ -1085,6 +1121,8 @@ impl Default for ViewState {
             det_safe_quantile: 0.9,
             moment_ratio: 0.25,
             detq_suffix_window_ratio: DEFAULT_DETQ_SUFFIX_WINDOW_RATIO,
+            chars_per_token: DEFAULT_PROMPT_CHARS_PER_TOKEN as usize,
+            output_tokens_per_step: DEFAULT_MAX_OUTPUT_TOKENS as usize,
             show_advanced_controls: false,
             churn_sample_count: 512,
             churn_sampling_mode: TraceSamplingMode::Uniform,
@@ -2626,6 +2664,10 @@ struct ChurnSample {
     cover_len: usize,
     history_cover_len: usize,
     moment_cover_len: usize,
+    input_chars: usize,
+    cached_input_chars: usize,
+    new_input_chars: usize,
+    context_utilization: f64,
     suffix_churn: usize,
     set_churn: usize,
     prefix_retention: f64,
@@ -2649,6 +2691,11 @@ struct ChurnSummary {
     avg_moment_prefix_retention: f64,
     avg_moment_suffix_churn: f64,
     avg_moment_set_churn: f64,
+    avg_context_utilization: f64,
+    avg_input_chars: f64,
+    avg_cached_input_chars: f64,
+    avg_new_input_chars: f64,
+    cached_new_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2948,7 +2995,7 @@ impl DerivedKey {
     }
 }
 
-fn cover_churn(prev: &[u64], next: &[u64]) -> (usize, usize, f64) {
+fn cover_churn(prev: &[u64], next: &[u64]) -> (usize, usize, f64, usize) {
     let prefix_len = prev
         .iter()
         .zip(next.iter())
@@ -2967,7 +3014,16 @@ fn cover_churn(prev: &[u64], next: &[u64]) -> (usize, usize, f64) {
     } else {
         prefix_len as f64 / prev.len() as f64
     };
-    (suffix_churn, set_churn, prefix_retention)
+    (suffix_churn, set_churn, prefix_retention, prefix_len)
+}
+
+fn prefix_chars(cover: &[u64], prefix_len: usize, by_id: &HashMap<u64, &SimNode>) -> usize {
+    cover
+        .iter()
+        .take(prefix_len.min(cover.len()))
+        .filter_map(|id| by_id.get(id).copied())
+        .map(cover_turn_cost)
+        .sum()
 }
 
 fn unique_sorted_steps(mut steps: Vec<usize>, max_step: usize) -> Vec<usize> {
@@ -3054,38 +3110,55 @@ fn build_churn_trace_for_steps(
     let mut prev_history_len = 0usize;
     for (idx, step) in step_points.iter().copied().enumerate() {
         let sim = simulate(stream, step, reduction_factor);
+        let by_id = sim.node_map();
         let selection = select_cover(&sim, context_budget, selection_policy, params);
         let history_len = selection.history_len.min(selection.cover.len());
         let moment_len = selection.cover.len().saturating_sub(history_len);
 
-        let (suffix_churn, set_churn, prefix_retention) = if prev_cover.is_empty() {
-            (0, 0, 1.0)
+        let (suffix_churn, set_churn, prefix_retention, prefix_len) = if prev_cover.is_empty() {
+            (0, 0, 1.0, 0)
         } else {
             cover_churn(&prev_cover, &selection.cover)
         };
-        let (history_suffix_churn, history_set_churn, history_prefix_retention) =
+        let (history_suffix_churn, history_set_churn, history_prefix_retention, _) =
             if prev_cover.is_empty() {
-                (0, 0, 1.0)
+                (0, 0, 1.0, 0)
             } else {
                 let prev_history = &prev_cover[..prev_history_len.min(prev_cover.len())];
                 let next_history = &selection.cover[..history_len];
                 cover_churn(prev_history, next_history)
             };
-        let (moment_suffix_churn, moment_set_churn, moment_prefix_retention) =
+        let (moment_suffix_churn, moment_set_churn, moment_prefix_retention, _) =
             if prev_cover.is_empty() {
-                (0, 0, 1.0)
+                (0, 0, 1.0, 0)
             } else {
                 let prev_history_end = prev_history_len.min(prev_cover.len());
                 let prev_moment = &prev_cover[prev_history_end..];
                 let next_moment = &selection.cover[history_len..];
                 cover_churn(prev_moment, next_moment)
             };
+        let cached_input_chars = if prev_cover.is_empty() {
+            0
+        } else {
+            prefix_chars(&prev_cover, prefix_len, &by_id)
+        };
+        let input_chars = selection.used_chars;
+        let new_input_chars = input_chars.saturating_sub(cached_input_chars);
+        let context_utilization = if context_budget == 0 {
+            0.0
+        } else {
+            (input_chars as f64 / context_budget as f64).clamp(0.0, 10.0)
+        };
 
         samples.push(ChurnSample {
             step,
             cover_len: selection.cover.len(),
             history_cover_len: history_len,
             moment_cover_len: moment_len,
+            input_chars,
+            cached_input_chars,
+            new_input_chars,
+            context_utilization,
             suffix_churn,
             set_churn,
             prefix_retention,
@@ -3215,6 +3288,45 @@ fn summarize_churn(samples: &[ChurnSample], min_step: usize) -> Option<ChurnSumm
         .map(|sample| sample.moment_set_churn as f64)
         .sum::<f64>()
         / transitions as f64;
+    let avg_context_utilization = samples
+        .iter()
+        .skip(start)
+        .map(|sample| sample.context_utilization)
+        .sum::<f64>()
+        / transitions as f64;
+    let avg_input_chars = samples
+        .iter()
+        .skip(start)
+        .map(|sample| sample.input_chars as f64)
+        .sum::<f64>()
+        / transitions as f64;
+    let avg_cached_input_chars = samples
+        .iter()
+        .skip(start)
+        .map(|sample| sample.cached_input_chars as f64)
+        .sum::<f64>()
+        / transitions as f64;
+    let avg_new_input_chars = samples
+        .iter()
+        .skip(start)
+        .map(|sample| sample.new_input_chars as f64)
+        .sum::<f64>()
+        / transitions as f64;
+    let total_cached_input_chars = samples
+        .iter()
+        .skip(start)
+        .map(|sample| sample.cached_input_chars as f64)
+        .sum::<f64>();
+    let total_new_input_chars = samples
+        .iter()
+        .skip(start)
+        .map(|sample| sample.new_input_chars as f64)
+        .sum::<f64>();
+    let cached_new_ratio = if total_new_input_chars > 0.0 {
+        Some(total_cached_input_chars / total_new_input_chars)
+    } else {
+        None
+    };
     Some(ChurnSummary {
         transitions,
         window_start_step: samples.get(start).map(|s| s.step).unwrap_or(min_step),
@@ -3226,6 +3338,11 @@ fn summarize_churn(samples: &[ChurnSample], min_step: usize) -> Option<ChurnSumm
         avg_moment_prefix_retention,
         avg_moment_suffix_churn,
         avg_moment_set_churn,
+        avg_context_utilization,
+        avg_input_chars,
+        avg_cached_input_chars,
+        avg_new_input_chars,
+        cached_new_ratio,
     })
 }
 
@@ -4435,10 +4552,10 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
             ui.label("All policies share the same moment split (newest raw leaves); policy only shapes history.");
             match selection_policy {
                 SelectionPolicy::DistributionAware => {
-                    ui.label("Policy: distribution history. Drop oldest history nodes to fit budget, then split the eligible node that best improves target age-distribution fit.")
+                    ui.label("Policy: distribution history. Keep full history cover and split the eligible node that best improves target age-distribution fit.")
                 }
                 SelectionPolicy::DeterministicSuffix => {
-                    ui.label("Policy: deterministic suffix history. Drop oldest history nodes to fit budget, then split the newest eligible node (right-to-left scan) for prefix stability.")
+                    ui.label("Policy: deterministic suffix history. Keep full history cover and split the newest eligible node (right-to-left scan) for prefix stability.")
                 }
                 SelectionPolicy::DeterministicQuotaHeadroom => {
                     ui.label(format!(
@@ -4464,6 +4581,10 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
         let samples = {
             let derived = derived.read(ui);
             Arc::clone(&derived.churn_samples)
+        };
+        let (chars_per_token, output_tokens_per_step) = {
+            let s = state.read(ui);
+            (s.chars_per_token.max(1) as f64, s.output_tokens_per_step as f64)
         };
         let (selection_policy, sampling_mode, sample_count, visible_leaves) = {
             let s = state.read(ui);
@@ -4509,6 +4630,45 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
                 .map(|sample| sample.history_set_churn as f64)
                 .sum::<f64>()
                 / transitions as f64;
+            let avg_input_chars = samples
+                .iter()
+                .skip(eval_start)
+                .map(|sample| sample.input_chars as f64)
+                .sum::<f64>()
+                / transitions as f64;
+            let avg_cached_input_chars = samples
+                .iter()
+                .skip(eval_start)
+                .map(|sample| sample.cached_input_chars as f64)
+                .sum::<f64>()
+                / transitions as f64;
+            let avg_new_input_chars = samples
+                .iter()
+                .skip(eval_start)
+                .map(|sample| sample.new_input_chars as f64)
+                .sum::<f64>()
+                / transitions as f64;
+            let avg_context_utilization = samples
+                .iter()
+                .skip(eval_start)
+                .map(|sample| sample.context_utilization)
+                .sum::<f64>()
+                / transitions as f64;
+            let total_cached_input_chars = samples
+                .iter()
+                .skip(eval_start)
+                .map(|sample| sample.cached_input_chars as f64)
+                .sum::<f64>();
+            let total_new_input_chars = samples
+                .iter()
+                .skip(eval_start)
+                .map(|sample| sample.new_input_chars as f64)
+                .sum::<f64>();
+            let cached_new_ratio = if total_new_input_chars > 0.0 {
+                Some(total_cached_input_chars / total_new_input_chars)
+            } else {
+                None
+            };
             let avg_moment_set = samples
                 .iter()
                 .skip(eval_start)
@@ -4570,6 +4730,22 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
                 ui.label(format!("avg suffix churn: {:.2}", avg_suffix));
                 ui.separator();
                 ui.label(format!("avg set churn: {:.2}", avg_set));
+                ui.separator();
+                ui.label(format!(
+                    "utilization: {:.1}% (in {:.0} chars)",
+                    avg_context_utilization * 100.0,
+                    avg_input_chars
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "cache/new: {} (in tok c/n {:.0}/{:.0}, out {:.0})",
+                    cached_new_ratio
+                        .map(|ratio| format!("{ratio:.2}x"))
+                        .unwrap_or_else(|| "inf".to_string()),
+                    avg_cached_input_chars / chars_per_token,
+                    avg_new_input_chars / chars_per_token,
+                    output_tokens_per_step
+                ));
                 ui.separator();
                 ui.label(format!("avg prefix retention: {:.1}%", avg_prefix * 100.0));
                 ui.separator();
@@ -4634,6 +4810,31 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
             let moment_len_points: Vec<[f64; 2]> = samples
                 .iter()
                 .map(|sample| [sample.step as f64, sample.moment_cover_len as f64])
+                .collect();
+            let input_chars_points: Vec<[f64; 2]> = samples
+                .iter()
+                .map(|sample| [sample.step as f64, sample.input_chars as f64])
+                .collect();
+            let cached_chars_points: Vec<[f64; 2]> = samples
+                .iter()
+                .map(|sample| [sample.step as f64, sample.cached_input_chars as f64])
+                .collect();
+            let new_chars_points: Vec<[f64; 2]> = samples
+                .iter()
+                .map(|sample| [sample.step as f64, sample.new_input_chars as f64])
+                .collect();
+            let utilization_points: Vec<[f64; 2]> = samples
+                .iter()
+                .map(|sample| [sample.step as f64, sample.context_utilization])
+                .collect();
+            let cache_ratio_points: Vec<[f64; 2]> = samples
+                .iter()
+                .filter_map(|sample| {
+                    (sample.new_input_chars > 0).then_some([
+                        sample.step as f64,
+                        sample.cached_input_chars as f64 / sample.new_input_chars as f64,
+                    ])
+                })
                 .collect();
 
             ui.add_space(6.0);
@@ -4708,6 +4909,45 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
                             "prefix retention",
                             PlotPoints::from(prefix_points),
                         ));
+                    });
+            });
+
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Input composition per insertion (chars)").monospace());
+            ui.push_id("cover_input_composition_plot", |ui| {
+                Plot::new("cover_input_composition_plot")
+                    .height(140.0)
+                    .legend(Legend::default())
+                    .include_y(0.0)
+                    .show(ui, |plot_ui| {
+                        plot_ui
+                            .line(Line::new("input total", PlotPoints::from(input_chars_points)));
+                        plot_ui.line(Line::new(
+                            "input cached",
+                            PlotPoints::from(cached_chars_points),
+                        ));
+                        plot_ui.line(Line::new("input new", PlotPoints::from(new_chars_points)));
+                    });
+            });
+
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Utilization + cache/new ratio per insertion").monospace(),
+            );
+            ui.push_id("cover_input_efficiency_plot", |ui| {
+                Plot::new("cover_input_efficiency_plot")
+                    .height(140.0)
+                    .legend(Legend::default())
+                    .include_y(0.0)
+                    .show(ui, |plot_ui| {
+                        plot_ui
+                            .line(Line::new("utilization", PlotPoints::from(utilization_points)));
+                        if !cache_ratio_points.is_empty() {
+                            plot_ui.line(Line::new(
+                                "cache/new ratio",
+                                PlotPoints::from(cache_ratio_points),
+                            ));
+                        }
                     });
             });
         });
