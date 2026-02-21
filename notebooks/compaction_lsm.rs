@@ -75,6 +75,7 @@ struct NotebookArgs {
     moment_ratio: Option<f32>,
     detq_suffix_window_ratio: Option<f32>,
     reduction_factor: Option<u32>,
+    merge_arity: Option<usize>,
     context_budget: Option<usize>,
     churn_sample_count: Option<usize>,
 }
@@ -198,6 +199,7 @@ fn parse_notebook_args() -> Result<NotebookArgs> {
         moment_ratio: None,
         detq_suffix_window_ratio: None,
         reduction_factor: None,
+        merge_arity: None,
         context_budget: None,
         churn_sample_count: None,
     };
@@ -285,6 +287,16 @@ fn parse_notebook_args() -> Result<NotebookArgs> {
                         .with_context(|| format!("invalid --reduction-factor value '{value}'"))?,
                 );
             }
+            "--merge-arity" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--merge-arity expects an integer"))?;
+                args.merge_arity = Some(
+                    value
+                        .parse::<usize>()
+                        .with_context(|| format!("invalid --merge-arity value '{value}'"))?,
+                );
+            }
             "--context-budget" => {
                 let value = it
                     .next()
@@ -346,6 +358,9 @@ fn initial_state_from_bootstrap(bootstrap: &NotebookBootstrap) -> ViewState {
     }
     if let Some(value) = bootstrap.args.reduction_factor {
         state.reduction_factor = value.max(2);
+    }
+    if let Some(value) = bootstrap.args.merge_arity {
+        state.merge_arity = value.max(2);
     }
     if let Some(value) = bootstrap.args.context_budget {
         state.context_budget = value.max(1);
@@ -824,6 +839,7 @@ fn run_text_report(bootstrap: &NotebookBootstrap) -> Result<()> {
         state.stream.as_slice(),
         state.visible_leaves,
         state.reduction_factor,
+        state.merge_arity,
     );
 
     println!("# Compaction Policy Study (text report)");
@@ -883,9 +899,10 @@ fn run_text_report(bootstrap: &NotebookBootstrap) -> Result<()> {
     }
 
     println!(
-        "- simulation setup: inserts={} reduction={} budget={} chars policy={} sampling={}({})",
+        "- simulation setup: inserts={} reduction={} merge_k={} budget={} chars policy={} sampling={}({})",
         state.visible_leaves,
         state.reduction_factor,
+        state.merge_arity,
         state.context_budget,
         state.selection_policy.label(),
         state.churn_sampling_mode.label(),
@@ -899,9 +916,10 @@ fn run_text_report(bootstrap: &NotebookBootstrap) -> Result<()> {
         state.detq_suffix_window_ratio
     );
     println!(
-        "- tree stats: nodes={} merges={} frontier_roots={} frontier_chars={}",
+        "- tree stats: nodes={} merges={} frontier_runs={} frontier_levels={} frontier_chars={}",
         sim.nodes.len(),
         sim.merges,
+        sim.frontier_root_count(),
         sim.roots_by_level.len(),
         sim.frontier_size()
     );
@@ -936,6 +954,7 @@ fn run_text_report(bootstrap: &NotebookBootstrap) -> Result<()> {
         let tail_samples = build_churn_trace_for_steps(
             state.stream.as_slice(),
             state.reduction_factor,
+            state.merge_arity,
             state.context_budget,
             policy,
             params,
@@ -946,6 +965,7 @@ fn run_text_report(bootstrap: &NotebookBootstrap) -> Result<()> {
             state.stream.as_slice(),
             state.visible_leaves,
             state.reduction_factor,
+            state.merge_arity,
             state.context_budget,
             policy,
             params,
@@ -1095,6 +1115,7 @@ fn run_text_report(bootstrap: &NotebookBootstrap) -> Result<()> {
             let tail_samples = build_churn_trace_for_steps(
                 state.stream.as_slice(),
                 state.reduction_factor,
+                state.merge_arity,
                 total_budget,
                 policy,
                 inv_params,
@@ -1207,14 +1228,13 @@ struct SimNode {
     size: usize,
     start_leaf: usize,
     end_leaf: usize,
-    left: Option<u64>,
-    right: Option<u64>,
+    children: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Simulation {
     nodes: Vec<SimNode>,
-    roots_by_level: BTreeMap<u32, u64>,
+    roots_by_level: BTreeMap<u32, Vec<u64>>,
     input_size: usize,
     merges: usize,
 }
@@ -1232,14 +1252,19 @@ impl Simulation {
         let by_id = self.node_map();
         self.roots_by_level
             .values()
+            .flatten()
             .filter_map(|id| by_id.get(id))
             .map(|node| node.size)
             .sum()
     }
 
+    fn frontier_root_count(&self) -> usize {
+        self.roots_by_level.values().map(Vec::len).sum()
+    }
+
     fn roots_in_time_order(&self) -> Vec<u64> {
         let by_id = self.node_map();
-        let mut roots: Vec<u64> = self.roots_by_level.values().copied().collect();
+        let mut roots: Vec<u64> = self.roots_by_level.values().flatten().copied().collect();
         roots.sort_by_key(|id| {
             by_id
                 .get(id)
@@ -1254,6 +1279,7 @@ impl Simulation {
 struct ViewState {
     base_leaf_size: usize,
     reduction_factor: u32,
+    merge_arity: usize,
     context_budget: usize,
     selection_policy: SelectionPolicy,
     det_fill_ratio: f32,
@@ -1277,6 +1303,7 @@ impl Default for ViewState {
         let mut state = Self {
             base_leaf_size: 220,
             reduction_factor: 2,
+            merge_arity: 4,
             context_budget: 2200,
             selection_policy: SelectionPolicy::DistributionAware,
             det_fill_ratio: 0.85,
@@ -1391,12 +1418,18 @@ fn spawn_insert_job(state: &ViewState, target_len: usize) -> Option<InsertJob> {
     })
 }
 
-fn simulate(stream: &[usize], visible_leaves: usize, reduction_factor: u32) -> Simulation {
+fn simulate(
+    stream: &[usize],
+    visible_leaves: usize,
+    reduction_factor: u32,
+    merge_arity: usize,
+) -> Simulation {
     let mut sim = Simulation::default();
-    let mut roots_by_level: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut roots_by_level: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
     let mut by_id: HashMap<u64, usize> = HashMap::new();
     let mut next_id = 1u64;
     let reduction = reduction_factor.max(2) as usize;
+    let merge_arity = merge_arity.max(2);
 
     for (leaf_idx, leaf_size) in stream.iter().copied().take(visible_leaves).enumerate() {
         sim.input_size = sim.input_size.saturating_add(leaf_size);
@@ -1408,8 +1441,7 @@ fn simulate(stream: &[usize], visible_leaves: usize, reduction_factor: u32) -> S
             size: leaf_size.max(1),
             start_leaf: leaf_idx,
             end_leaf: leaf_idx,
-            left: None,
-            right: None,
+            children: Vec::new(),
         };
         by_id.insert(leaf_id, sim.nodes.len());
         sim.nodes.push(leaf);
@@ -1417,23 +1449,41 @@ fn simulate(stream: &[usize], visible_leaves: usize, reduction_factor: u32) -> S
         let mut carry = leaf_id;
         let mut level = 0u32;
         loop {
-            let Some(existing) = roots_by_level.remove(&level) else {
-                roots_by_level.insert(level, carry);
-                break;
+            let merge_children = {
+                let runs = roots_by_level.entry(level).or_default();
+                runs.push(carry);
+                runs.sort_by_key(|id| {
+                    by_id
+                        .get(id)
+                        .and_then(|idx| sim.nodes.get(*idx))
+                        .map(|node| node.start_leaf)
+                        .unwrap_or(usize::MAX)
+                });
+                if runs.len() < merge_arity {
+                    break;
+                }
+                std::mem::take(runs)
             };
-
-            let left_idx = by_id[&existing];
-            let right_idx = by_id[&carry];
-            let (left_id, right_id) =
-                if sim.nodes[left_idx].start_leaf <= sim.nodes[right_idx].start_leaf {
-                    (existing, carry)
-                } else {
-                    (carry, existing)
+            if roots_by_level
+                .get(&level)
+                .map(Vec::is_empty)
+                .unwrap_or(false)
+            {
+                roots_by_level.remove(&level);
+            }
+            let children = merge_children;
+            let mut merged_input_size = 0usize;
+            let mut first_leaf = usize::MAX;
+            let mut last_leaf = 0usize;
+            for child_id in &children {
+                let Some(node) = sim.nodes.get(by_id[child_id]) else {
+                    continue;
                 };
-
-            let left = &sim.nodes[by_id[&left_id]];
-            let right = &sim.nodes[by_id[&right_id]];
-            let merged_size = ((left.size + right.size) / reduction).max(1);
+                merged_input_size = merged_input_size.saturating_add(node.size);
+                first_leaf = first_leaf.min(node.start_leaf);
+                last_leaf = last_leaf.max(node.end_leaf);
+            }
+            let merged_size = (merged_input_size / reduction).max(1);
             let parent_id = next_id;
             next_id += 1;
 
@@ -1441,10 +1491,9 @@ fn simulate(stream: &[usize], visible_leaves: usize, reduction_factor: u32) -> S
                 id: parent_id,
                 level: level + 1,
                 size: merged_size,
-                start_leaf: left.start_leaf,
-                end_leaf: right.end_leaf,
-                left: Some(left_id),
-                right: Some(right_id),
+                start_leaf: first_leaf,
+                end_leaf: last_leaf,
+                children,
             };
             by_id.insert(parent_id, sim.nodes.len());
             sim.nodes.push(parent);
@@ -1479,12 +1528,11 @@ struct CoverSelection {
     steps: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Candidate {
     index: usize,
     parent_id: u64,
-    left_id: u64,
-    right_id: u64,
+    child_ids: Vec<u64>,
     extra_cost: usize,
     recency_key: usize,
     distribution_improvement: f64,
@@ -1711,20 +1759,15 @@ fn cover_cost(cover: &[u64], by_id: &HashMap<u64, &SimNode>) -> usize {
         .sum()
 }
 
-fn ordered_children(by_id: &HashMap<u64, &SimNode>, left: u64, right: u64) -> (u64, u64) {
-    let left_start = by_id
-        .get(&left)
-        .map(|node| node.start_leaf)
-        .unwrap_or(usize::MAX);
-    let right_start = by_id
-        .get(&right)
-        .map(|node| node.start_leaf)
-        .unwrap_or(usize::MAX);
-    if left_start <= right_start {
-        (left, right)
-    } else {
-        (right, left)
-    }
+fn ordered_children(node: &SimNode, by_id: &HashMap<u64, &SimNode>) -> Vec<u64> {
+    let mut children = node.children.clone();
+    children.sort_by_key(|id| {
+        by_id
+            .get(id)
+            .map(|child| child.start_leaf)
+            .unwrap_or(usize::MAX)
+    });
+    children
 }
 
 fn leaf_ids_in_time_order(sim: &Simulation) -> Vec<u64> {
@@ -1755,10 +1798,11 @@ fn collect_cover_for_range(
         out.push(node_id);
         return;
     }
-    if let (Some(left), Some(right)) = (node.left, node.right) {
-        let (left, right) = ordered_children(by_id, left, right);
-        collect_cover_for_range(left, range_start, range_end, by_id, out);
-        collect_cover_for_range(right, range_start, range_end, by_id, out);
+    let children = ordered_children(node, by_id);
+    if !children.is_empty() {
+        for child_id in children {
+            collect_cover_for_range(child_id, range_start, range_end, by_id, out);
+        }
         return;
     }
     out.push(node_id);
@@ -1857,16 +1901,21 @@ fn apply_curve_constraint(
             if !node_violates_curve(node, global_newest_leaf, scale) {
                 continue;
             }
-            let (Some(left), Some(right)) = (node.left, node.right) else {
+            let children = ordered_children(node, by_id);
+            if children.is_empty() {
                 continue;
-            };
-            let (left, right) = ordered_children(by_id, left, right);
-            cover.splice(idx..=idx, [left, right]);
+            }
+            let child_desc = children
+                .iter()
+                .map(|child| format!("#{child:04}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            cover.splice(idx..=idx, children.clone());
             splits = splits.saturating_add(1);
             if let Some(steps) = steps.as_deref_mut() {
                 steps.push(format!(
-                    "{trace_prefix} curve split #{:04} -> #{:04}, #{:04} (scale {:.2})",
-                    node.id, left, right, scale
+                    "{trace_prefix} curve split #{:04} -> {} (scale {:.2})",
+                    node.id, child_desc, scale
                 ));
             }
             changed = true;
@@ -1909,33 +1958,43 @@ fn refine_history_suffix(
             let Some(parent) = by_id.get(&parent_id).copied() else {
                 continue;
             };
-            let (Some(left), Some(right)) = (parent.left, parent.right) else {
+            let children = ordered_children(parent, by_id);
+            if children.is_empty() {
                 continue;
-            };
-            let (left, right) = ordered_children(by_id, left, right);
-            let Some(left_node) = by_id.get(&left).copied() else {
-                continue;
-            };
-            let Some(right_node) = by_id.get(&right).copied() else {
-                continue;
-            };
-            if node_violates_curve(left_node, global_newest_leaf, scale)
-                || node_violates_curve(right_node, global_newest_leaf, scale)
-            {
+            }
+            let mut child_nodes = Vec::with_capacity(children.len());
+            let mut valid_split = true;
+            for child_id in &children {
+                let Some(node) = by_id.get(child_id).copied() else {
+                    valid_split = false;
+                    break;
+                };
+                if node_violates_curve(node, global_newest_leaf, scale) {
+                    valid_split = false;
+                    break;
+                }
+                child_nodes.push(node);
+            }
+            if !valid_split {
                 continue;
             }
             let parent_cost = cover_turn_cost(parent);
-            let child_cost = cover_turn_cost(left_node).saturating_add(cover_turn_cost(right_node));
+            let child_cost = child_nodes.iter().map(|node| cover_turn_cost(node)).sum::<usize>();
             let extra = child_cost.saturating_sub(parent_cost);
             if extra > remaining {
                 continue;
             }
-            cover.splice(idx..=idx, [left, right]);
+            let child_desc = children
+                .iter()
+                .map(|child| format!("#{child:04}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            cover.splice(idx..=idx, children.clone());
             *used_chars = used_chars.saturating_add(extra);
             splits = splits.saturating_add(1);
             steps.push(format!(
-                "history refine split #{:04} -> #{:04}, #{:04} (+{} chars)",
-                parent.id, left, right, extra
+                "history refine split #{:04} -> {} (+{} chars)",
+                parent.id, child_desc, extra
             ));
             changed = true;
             break;
@@ -2098,18 +2157,25 @@ fn select_cover_distribution(
             let Some(parent) = by_id.get(parent_id).copied() else {
                 continue;
             };
-            let (Some(left_id), Some(right_id)) = (parent.left, parent.right) else {
+            let child_ids = ordered_children(parent, &by_id);
+            if child_ids.is_empty() {
                 continue;
-            };
-            let Some(left) = by_id.get(&left_id).copied() else {
+            }
+            let mut child_nodes = Vec::with_capacity(child_ids.len());
+            let mut children_cost = 0usize;
+            for child_id in &child_ids {
+                let Some(child) = by_id.get(child_id).copied() else {
+                    child_nodes.clear();
+                    break;
+                };
+                children_cost = children_cost.saturating_add(cover_turn_cost(child));
+                child_nodes.push(child);
+            }
+            if child_nodes.is_empty() {
                 continue;
-            };
-            let Some(right) = by_id.get(&right_id).copied() else {
-                continue;
-            };
+            }
 
             let parent_cost = cover_turn_cost(parent);
-            let children_cost = cover_turn_cost(left).saturating_add(cover_turn_cost(right));
             let extra_cost = children_cost.saturating_sub(parent_cost);
             if extra_cost > remaining {
                 continue;
@@ -2117,8 +2183,7 @@ fn select_cover_distribution(
             let candidate = Candidate {
                 index: idx,
                 parent_id: *parent_id,
-                left_id,
-                right_id,
+                child_ids: child_ids.clone(),
                 extra_cost,
                 recency_key: parent.end_leaf,
                 distribution_improvement: {
@@ -2129,23 +2194,17 @@ fn select_cover_distribution(
                         leaf_count,
                         bucket_count,
                     );
-                    let left_bucket = age_bucket_for_end_leaf(
-                        left.end_leaf,
-                        newest_leaf,
-                        leaf_count,
-                        bucket_count,
-                    );
-                    let right_bucket = age_bucket_for_end_leaf(
-                        right.end_leaf,
-                        newest_leaf,
-                        leaf_count,
-                        bucket_count,
-                    );
                     projected[parent_bucket] = projected[parent_bucket].saturating_sub(parent_cost);
-                    projected[left_bucket] =
-                        projected[left_bucket].saturating_add(cover_turn_cost(left));
-                    projected[right_bucket] =
-                        projected[right_bucket].saturating_add(cover_turn_cost(right));
+                    for child in &child_nodes {
+                        let child_bucket = age_bucket_for_end_leaf(
+                            child.end_leaf,
+                            newest_leaf,
+                            leaf_count,
+                            bucket_count,
+                        );
+                        projected[child_bucket] =
+                            projected[child_bucket].saturating_add(cover_turn_cost(child));
+                    }
                     let projected_used = used_chars.saturating_add(extra_cost);
                     let projected_error = distribution_error(
                         &projected,
@@ -2156,7 +2215,7 @@ fn select_cover_distribution(
                     current_error - projected_error
                 },
             };
-            if better_candidate(candidate, best) {
+            if better_candidate(&candidate, best.as_ref()) {
                 best = Some(candidate);
             }
         }
@@ -2164,32 +2223,32 @@ fn select_cover_distribution(
         let Some(chosen) = best else {
             break;
         };
-        cover.splice(
-            chosen.index..=chosen.index,
-            [chosen.left_id, chosen.right_id],
-        );
+        cover.splice(chosen.index..=chosen.index, chosen.child_ids.clone());
         used_chars = used_chars.saturating_add(chosen.extra_cost);
         let Some(parent) = by_id.get(&chosen.parent_id).copied() else {
             continue;
         };
-        let Some(left) = by_id.get(&chosen.left_id).copied() else {
+        let mut child_nodes = Vec::with_capacity(chosen.child_ids.len());
+        for child_id in &chosen.child_ids {
+            let Some(child) = by_id.get(child_id).copied() else {
+                child_nodes.clear();
+                break;
+            };
+            child_nodes.push(child);
+        }
+        if child_nodes.is_empty() {
             continue;
-        };
-        let Some(right) = by_id.get(&chosen.right_id).copied() else {
-            continue;
-        };
+        }
         let parent_cost = cover_turn_cost(parent);
-        let left_cost = cover_turn_cost(left);
-        let right_cost = cover_turn_cost(right);
         let parent_bucket =
             age_bucket_for_end_leaf(parent.end_leaf, newest_leaf, leaf_count, bucket_count);
-        let left_bucket =
-            age_bucket_for_end_leaf(left.end_leaf, newest_leaf, leaf_count, bucket_count);
-        let right_bucket =
-            age_bucket_for_end_leaf(right.end_leaf, newest_leaf, leaf_count, bucket_count);
         bucket_chars[parent_bucket] = bucket_chars[parent_bucket].saturating_sub(parent_cost);
-        bucket_chars[left_bucket] = bucket_chars[left_bucket].saturating_add(left_cost);
-        bucket_chars[right_bucket] = bucket_chars[right_bucket].saturating_add(right_cost);
+        for child in &child_nodes {
+            let child_bucket =
+                age_bucket_for_end_leaf(child.end_leaf, newest_leaf, leaf_count, bucket_count);
+            bucket_chars[child_bucket] =
+                bucket_chars[child_bucket].saturating_add(cover_turn_cost(child));
+        }
         current_error = distribution_error(
             &bucket_chars,
             used_chars,
@@ -2197,11 +2256,16 @@ fn select_cover_distribution(
             target_weight_sum,
         );
         splits = splits.saturating_add(1);
+        let child_desc = chosen
+            .child_ids
+            .iter()
+            .map(|child| format!("#{child:04}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         steps.push(format!(
-            "split #{:04} -> #{:04}, #{:04} (+{} chars, Δerr {:+.4}) => {} / {} (error {:.4})",
+            "split #{:04} -> {} (+{} chars, Δerr {:+.4}) => {} / {} (error {:.4})",
             chosen.parent_id,
-            chosen.left_id,
-            chosen.right_id,
+            child_desc,
             chosen.extra_cost,
             chosen.distribution_improvement,
             used_chars,
@@ -2269,18 +2333,23 @@ fn select_cover_deterministic(
             let Some(parent) = by_id.get(&parent_id).copied() else {
                 continue;
             };
-            let (Some(left_id), Some(right_id)) = (parent.left, parent.right) else {
+            let child_ids = ordered_children(parent, &by_id);
+            if child_ids.is_empty() {
                 continue;
-            };
-            let Some(left) = by_id.get(&left_id).copied() else {
+            }
+            if child_ids
+                .iter()
+                .any(|child_id| !by_id.contains_key(child_id))
+            {
                 continue;
-            };
-            let Some(right) = by_id.get(&right_id).copied() else {
-                continue;
-            };
+            }
 
             let parent_cost = cover_turn_cost(parent);
-            let children_cost = cover_turn_cost(left).saturating_add(cover_turn_cost(right));
+            let children_cost = child_ids
+                .iter()
+                .filter_map(|child_id| by_id.get(child_id).copied())
+                .map(cover_turn_cost)
+                .sum::<usize>();
             let extra_cost = children_cost.saturating_sub(parent_cost);
             if extra_cost > remaining {
                 continue;
@@ -2288,8 +2357,7 @@ fn select_cover_deterministic(
             chosen = Some(Candidate {
                 index: idx,
                 parent_id,
-                left_id,
-                right_id,
+                child_ids: child_ids.clone(),
                 extra_cost,
                 recency_key: parent.end_leaf,
                 distribution_improvement: 0.0,
@@ -2301,17 +2369,19 @@ fn select_cover_deterministic(
             break;
         };
 
-        cover.splice(
-            chosen.index..=chosen.index,
-            [chosen.left_id, chosen.right_id],
-        );
+        cover.splice(chosen.index..=chosen.index, chosen.child_ids.clone());
         used_chars = used_chars.saturating_add(chosen.extra_cost);
         splits = splits.saturating_add(1);
+        let child_desc = chosen
+            .child_ids
+            .iter()
+            .map(|child| format!("#{child:04}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         steps.push(format!(
-            "split[det] #{:04} -> #{:04}, #{:04} (+{} chars) => {} / {}",
+            "split[det] #{:04} -> {} (+{} chars) => {} / {}",
             chosen.parent_id,
-            chosen.left_id,
-            chosen.right_id,
+            child_desc,
             chosen.extra_cost,
             used_chars,
             budget_chars
@@ -2483,34 +2553,37 @@ fn select_cover_deterministic_quota(
             let Some(parent) = by_id.get(&parent_id).copied() else {
                 continue;
             };
-            let (Some(left_id), Some(right_id)) = (parent.left, parent.right) else {
+            let child_ids = ordered_children(parent, &by_id);
+            if child_ids.is_empty() {
                 continue;
-            };
-            let Some(left) = by_id.get(&left_id).copied() else {
+            }
+            let mut child_nodes = Vec::with_capacity(child_ids.len());
+            let mut children_cost = 0usize;
+            for child_id in &child_ids {
+                let Some(child) = by_id.get(child_id).copied() else {
+                    child_nodes.clear();
+                    break;
+                };
+                children_cost = children_cost.saturating_add(cover_turn_cost(child));
+                child_nodes.push(child);
+            }
+            if child_nodes.is_empty() {
                 continue;
-            };
-            let Some(right) = by_id.get(&right_id).copied() else {
-                continue;
-            };
+            }
             let parent_cost = cover_turn_cost(parent);
-            let left_cost = cover_turn_cost(left);
-            let right_cost = cover_turn_cost(right);
-            let extra_cost = left_cost
-                .saturating_add(right_cost)
-                .saturating_sub(parent_cost);
+            let extra_cost = children_cost.saturating_sub(parent_cost);
             if extra_cost > remaining {
                 continue;
             }
             let parent_bucket =
                 age_bucket_for_end_leaf(parent.end_leaf, newest_leaf, leaf_count, bucket_count);
-            let left_bucket =
-                age_bucket_for_end_leaf(left.end_leaf, newest_leaf, leaf_count, bucket_count);
-            let right_bucket =
-                age_bucket_for_end_leaf(right.end_leaf, newest_leaf, leaf_count, bucket_count);
             let mut projected_counts = slot_counts.clone();
             projected_counts[parent_bucket] = projected_counts[parent_bucket].saturating_sub(1);
-            projected_counts[left_bucket] = projected_counts[left_bucket].saturating_add(1);
-            projected_counts[right_bucket] = projected_counts[right_bucket].saturating_add(1);
+            for child in &child_nodes {
+                let child_bucket =
+                    age_bucket_for_end_leaf(child.end_leaf, newest_leaf, leaf_count, bucket_count);
+                projected_counts[child_bucket] = projected_counts[child_bucket].saturating_add(1);
+            }
             let projected_deficit = slot_deficit(&projected_counts, &target_slot_quotas);
             let deficit_improvement = (current_deficit - projected_deficit) as f64;
             if deficit_improvement <= 0.0 {
@@ -2520,8 +2593,7 @@ fn select_cover_deterministic_quota(
             chosen = Some(Candidate {
                 index: idx,
                 parent_id,
-                left_id,
-                right_id,
+                child_ids: child_ids.clone(),
                 extra_cost,
                 recency_key: parent.end_leaf,
                 distribution_improvement: deficit_improvement,
@@ -2533,35 +2605,41 @@ fn select_cover_deterministic_quota(
             break;
         };
 
-        cover.splice(
-            chosen.index..=chosen.index,
-            [chosen.left_id, chosen.right_id],
-        );
+        cover.splice(chosen.index..=chosen.index, chosen.child_ids.clone());
         used_chars = used_chars.saturating_add(chosen.extra_cost);
         let Some(parent) = by_id.get(&chosen.parent_id).copied() else {
             continue;
         };
-        let Some(left) = by_id.get(&chosen.left_id).copied() else {
+        let mut child_nodes = Vec::with_capacity(chosen.child_ids.len());
+        for child_id in &chosen.child_ids {
+            let Some(child) = by_id.get(child_id).copied() else {
+                child_nodes.clear();
+                break;
+            };
+            child_nodes.push(child);
+        }
+        if child_nodes.is_empty() {
             continue;
-        };
-        let Some(right) = by_id.get(&chosen.right_id).copied() else {
-            continue;
-        };
+        }
         let parent_bucket =
             age_bucket_for_end_leaf(parent.end_leaf, newest_leaf, leaf_count, bucket_count);
-        let left_bucket =
-            age_bucket_for_end_leaf(left.end_leaf, newest_leaf, leaf_count, bucket_count);
-        let right_bucket =
-            age_bucket_for_end_leaf(right.end_leaf, newest_leaf, leaf_count, bucket_count);
         slot_counts[parent_bucket] = slot_counts[parent_bucket].saturating_sub(1);
-        slot_counts[left_bucket] = slot_counts[left_bucket].saturating_add(1);
-        slot_counts[right_bucket] = slot_counts[right_bucket].saturating_add(1);
+        for child in &child_nodes {
+            let child_bucket =
+                age_bucket_for_end_leaf(child.end_leaf, newest_leaf, leaf_count, bucket_count);
+            slot_counts[child_bucket] = slot_counts[child_bucket].saturating_add(1);
+        }
         splits = splits.saturating_add(1);
+        let child_desc = chosen
+            .child_ids
+            .iter()
+            .map(|child| format!("#{child:04}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         steps.push(format!(
-            "split[detq] #{:04} -> #{:04}, #{:04} (+{} chars, Δslot {:+.0}) => {} / {} (slots {} / {})",
+            "split[detq] #{:04} -> {} (+{} chars, Δslot {:+.0}) => {} / {} (slots {} / {})",
             chosen.parent_id,
-            chosen.left_id,
-            chosen.right_id,
+            child_desc,
             chosen.extra_cost,
             chosen.distribution_improvement,
             used_chars,
@@ -2597,7 +2675,7 @@ fn select_cover_deterministic_quota(
     }
 }
 
-fn better_candidate(candidate: Candidate, current: Option<Candidate>) -> bool {
+fn better_candidate(candidate: &Candidate, current: Option<&Candidate>) -> bool {
     let Some(current) = current else {
         return true;
     };
@@ -2987,6 +3065,7 @@ struct DerivedKey {
     stream_revision: u64,
     visible_leaves: usize,
     reduction_factor: u32,
+    merge_arity: usize,
     context_budget: usize,
     selection_policy: SelectionPolicy,
     det_fill_ratio_bits: u32,
@@ -3011,6 +3090,7 @@ struct DerivedSnapshot {
     stream: Vec<usize>,
     visible_leaves: usize,
     reduction_factor: u32,
+    merge_arity: usize,
     context_budget: usize,
     selection_policy: SelectionPolicy,
     params: CoverPolicyParams,
@@ -3042,6 +3122,7 @@ impl DerivedSnapshot {
             stream: state.stream.clone(),
             visible_leaves: state.visible_leaves,
             reduction_factor: state.reduction_factor,
+            merge_arity: state.merge_arity,
             context_budget: state.context_budget,
             selection_policy: state.selection_policy,
             params: CoverPolicyParams::from_state(state),
@@ -3074,6 +3155,7 @@ fn spawn_derived_job(key: DerivedKey, snapshot: DerivedSnapshot) -> DerivedJob {
             snapshot.stream.as_slice(),
             snapshot.visible_leaves,
             snapshot.reduction_factor,
+            snapshot.merge_arity,
         );
         progress_handle.store(1, Ordering::Relaxed);
         let cover = select_cover(
@@ -3086,6 +3168,7 @@ fn spawn_derived_job(key: DerivedKey, snapshot: DerivedSnapshot) -> DerivedJob {
         let churn_samples = build_churn_trace_for_steps(
             snapshot.stream.as_slice(),
             snapshot.reduction_factor,
+            snapshot.merge_arity,
             snapshot.context_budget,
             snapshot.selection_policy,
             snapshot.params,
@@ -3103,6 +3186,7 @@ fn spawn_derived_job(key: DerivedKey, snapshot: DerivedSnapshot) -> DerivedJob {
                 let samples = build_churn_trace_for_steps(
                     snapshot.stream.as_slice(),
                     snapshot.reduction_factor,
+                    snapshot.merge_arity,
                     snapshot.context_budget,
                     policy,
                     snapshot.params,
@@ -3205,6 +3289,7 @@ impl DerivedKey {
             stream_revision: state.stream_revision,
             visible_leaves: state.visible_leaves,
             reduction_factor: state.reduction_factor,
+            merge_arity: state.merge_arity,
             context_budget: state.context_budget,
             selection_policy: state.selection_policy,
             det_fill_ratio_bits: state.det_fill_ratio.to_bits(),
@@ -3404,6 +3489,7 @@ fn sampled_tail_steps(visible_leaves: usize, sample_count: usize) -> Vec<usize> 
 fn build_churn_trace_for_steps(
     stream: &[usize],
     reduction_factor: u32,
+    merge_arity: usize,
     context_budget: usize,
     selection_policy: SelectionPolicy,
     params: CoverPolicyParams,
@@ -3422,7 +3508,7 @@ fn build_churn_trace_for_steps(
     let mut prior_history_lens: Vec<usize> = Vec::with_capacity(step_points.len());
     let mut step_to_index: HashMap<usize, usize> = HashMap::with_capacity(step_points.len());
     for (idx, step) in step_points.iter().copied().enumerate() {
-        let sim = simulate(stream, step, reduction_factor);
+        let sim = simulate(stream, step, reduction_factor, merge_arity);
         let by_id = sim.node_map();
         let selection = select_cover(&sim, context_budget, selection_policy, params);
         let history_len = selection.history_len.min(selection.cover.len());
@@ -3586,6 +3672,7 @@ fn build_churn_trace_with(
     stream: &[usize],
     visible_leaves: usize,
     reduction_factor: u32,
+    merge_arity: usize,
     context_budget: usize,
     selection_policy: SelectionPolicy,
     params: CoverPolicyParams,
@@ -3599,6 +3686,7 @@ fn build_churn_trace_with(
     build_churn_trace_for_steps(
         stream,
         reduction_factor,
+        merge_arity,
         context_budget,
         selection_policy,
         params,
@@ -3906,6 +3994,7 @@ fn evaluate_sweep_row(
         state.stream.as_slice(),
         visible_leaves,
         state.reduction_factor,
+        state.merge_arity,
         state.context_budget,
         policy,
         params,
@@ -4156,12 +4245,12 @@ fn main(nb: &mut NotebookCtx) {
                 ui,
                 "# Compaction Policy Study\n\
 ## Abstract\n\
-This notebook studies context-cover selection over a binary carry compaction tree.\n\
+This notebook studies context-cover selection over a k-ary carry compaction tree.\n\
 We compare multiple policies under the same budget and stream, asking:\n\
 **How can we balance distribution fidelity, prefix stability, and deterministic restart behavior?**\n\
 \n\
 ## Model assumptions\n\
-- Indexing: binary carry merges over time-adjacent leaves.\n\
+- Indexing: k-ary carry merges over time-adjacent leaves.\n\
 - Selection output: an antichain cover under a strict context budget.\n\
 - Objective space: distribution fidelity vs prefix stability vs determinism."
             );
@@ -4337,6 +4426,9 @@ Primary readouts:\n\
                     ui.label("Reduction factor");
                     ui.add(Slider::new(&mut state.reduction_factor, 2..=8).text("merge"));
                     ui.add_space(8.0);
+                    ui.label("Merge arity (k)");
+                    ui.add(Slider::new(&mut state.merge_arity, 2..=16).text("runs"));
+                    ui.add_space(8.0);
                     ui.label("Jitter");
                     ui.add(ChoiceToggle::binary(&mut state.jitter, "OFF", "ON"));
                 });
@@ -4465,10 +4557,10 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 **Core intuition:** treat cover refinement as an optimization problem.\n\
 \n\
 **Algorithm (detailed):**\n\
-1. Build initial cover from frontier roots ordered oldest -> newest.\n\
+1. Build initial cover from frontier runs ordered oldest -> newest.\n\
 2. Keep roots as-is (never drop roots).\n\
 3. Enumerate every eligible split candidate:\n\
-   - candidate must have two children,\n\
+   - candidate must have children,\n\
    - extra cost must fit remaining budget.\n\
 4. For each candidate, project bucket chars and evaluate `Δerror = current_error - projected_error`.\n\
 5. Select max `Δerror` (tie-break by recency, then cost, then index/id).\n\
@@ -4500,7 +4592,7 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 **Core intuition:** keep historical prefix fixed; spend detail budget at the newest tail first.\n\
 \n\
 **Algorithm (detailed):**\n\
-1. Build initial cover from frontier roots ordered oldest -> newest.\n\
+1. Build initial cover from frontier runs ordered oldest -> newest.\n\
 2. Keep roots as-is (never drop roots).\n\
 3. While budget headroom exists:\n\
    - scan cover from right to left,\n\
@@ -4572,7 +4664,7 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 **Core intuition:** enforce an age->resolution curve over history, then spend leftover headroom via deterministic newest-first refinement.\n\
 \n\
 **Algorithm (detailed):**\n\
-1. Build an initial history cover from frontier roots clipped to leaves older than moment.\n\
+1. Build an initial history cover from frontier runs clipped to leaves older than moment.\n\
 2. Fit a quantized curve scale `s` from a fixed ladder; choose smallest `s` where history fits.\n\
 3. Enforce curve constraint by splitting violating history nodes:\n\
    `span(node) <= s * 2^floor(log2(age(node)+1))`.\n\
@@ -4895,7 +4987,7 @@ Interpretation: high prefix retention with low churn indicates stronger turn-to-
             md!(
                 ui,
                 "## Terminology\n\
-- **frontier**: one active root per compaction level after carry merges\n\
+- **frontier**: active carry runs across levels (up to `k-1` per level)\n\
 - **cover**: selected antichain of nodes sent into context\n\
 - **prefix**: oldest (left) part of the cover in time order\n\
 - **suffix**: newest (right) tail of the cover in time order\n\
@@ -5124,9 +5216,14 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
             let derived = derived.read(ui);
             (Arc::clone(&derived.sim), Arc::clone(&derived.cover))
         };
-        let (visible_leaves, selection_policy) = {
+        let (visible_leaves, selection_policy, merge_arity, reduction_factor) = {
             let s = state.read(ui);
-            (s.visible_leaves, s.selection_policy)
+            (
+                s.visible_leaves,
+                s.selection_policy,
+                s.merge_arity,
+                s.reduction_factor,
+            )
         };
 
         with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
@@ -5135,9 +5232,12 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
                 "## Results overview\n\
 - leaves: `{}`\n\
 - policy: `{}`\n\
+- merge arity (k): `{}`\n\
+- reduction factor: `{}`\n\
 - nodes: `{}`\n\
 - merges: `{}`\n\
-- frontier roots: `{}`\n\
+- frontier runs: `{}`\n\
+- frontier levels: `{}`\n\
 - input size: `{}`\n\
 - frontier size: `{}`\n\
 - cover size: `{}`\n\
@@ -5145,8 +5245,11 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
 - moment nodes in cover: `{}`",
                 visible_leaves,
                 selection_policy.label(),
+                merge_arity,
+                reduction_factor,
                 sim.nodes.len(),
                 sim.merges,
+                sim.frontier_root_count(),
                 sim.roots_by_level.len(),
                 sim.input_size,
                 sim.frontier_size(),
