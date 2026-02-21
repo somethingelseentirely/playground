@@ -25,7 +25,7 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
 const DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS: u64 = 512;
 const DEFAULT_PROMPT_CHARS_PER_TOKEN: u64 = 4;
-const DEFAULT_COMPACTION_REDUCTION_FACTOR: u64 = 3;
+const DEFAULT_COMPACTION_MERGE_ARITY: u64 = 8;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a terminal-based agent. Respond with exactly one shell command per turn. Output only raw command text: no markdown fences, no commentary prelude, no channel labels, and no multi-command blocks. Prefer faculties (available on PATH) over ad-hoc shell when applicable; run a faculty with no arguments to inspect usage. If unsure what to do next, run `orient show`.";
 // The branch that carries the core cognition loop + exec/LLM request state.
 const DEFAULT_BRANCH: &str = "cognition";
@@ -54,7 +54,7 @@ pub struct Config {
     pub llm_profile_name: String,
     pub llm_compaction_profile_id: Option<Id>,
     pub llm_compaction_prompt: Option<String>,
-    pub llm_compaction_reduction_factor: u64,
+    pub llm_compaction_merge_arity: u64,
     pub tavily_api_key: Option<String>,
     pub exa_api_key: Option<String>,
     pub exec: ExecConfig,
@@ -240,7 +240,7 @@ fn default_config(pile_path: PathBuf) -> Config {
         llm_profile_name: "default".to_string(),
         llm_compaction_profile_id: None,
         llm_compaction_prompt: None,
-        llm_compaction_reduction_factor: default_compaction_reduction_factor(),
+        llm_compaction_merge_arity: default_compaction_merge_arity(),
         tavily_api_key: None,
         exa_api_key: None,
         exec: ExecConfig::default(),
@@ -576,11 +576,11 @@ fn load_latest_config(
     if let Some(factor) = load_u256_attr(
         catalog,
         config_id,
-        playground_config::llm_compaction_reduction_factor,
+        playground_config::llm_compaction_merge_arity,
     )
     .and_then(u256be_to_u64)
     {
-        config.llm_compaction_reduction_factor = factor.max(2);
+        config.llm_compaction_merge_arity = factor.max(2);
     }
 
     if let Some(profile_id) = config.llm_profile_id {
@@ -705,10 +705,10 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         playground_config::poll_ms: poll_ms,
         playground_config::active_llm_profile_id: profile_id,
     };
-    let compaction_reduction_factor: Value<U256BE> =
-        config.llm_compaction_reduction_factor.max(2).to_value();
+    let llm_compaction_merge_arity: Value<U256BE> =
+        config.llm_compaction_merge_arity.max(2).to_value();
     change += entity! { &config_id @
-        playground_config::llm_compaction_reduction_factor: compaction_reduction_factor,
+        playground_config::llm_compaction_merge_arity: llm_compaction_merge_arity,
     };
 
     if let Some(id) = config.branch_id {
@@ -893,8 +893,8 @@ fn default_prompt_chars_per_token() -> u64 {
     DEFAULT_PROMPT_CHARS_PER_TOKEN
 }
 
-fn default_compaction_reduction_factor() -> u64 {
-    DEFAULT_COMPACTION_REDUCTION_FACTOR
+fn default_compaction_merge_arity() -> u64 {
+    DEFAULT_COMPACTION_MERGE_ARITY
 }
 
 fn default_branch() -> String {

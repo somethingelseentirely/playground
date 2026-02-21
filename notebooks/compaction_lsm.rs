@@ -1069,9 +1069,10 @@ fn run_text_report(bootstrap: &NotebookBootstrap) -> Result<()> {
         }
     }
 
-    let reserved_moment_budget = ((state.context_budget as f32) * state.moment_ratio.clamp(0.0, 1.0))
-        .round()
-        .clamp(0.0, state.context_budget as f32) as usize;
+    let reserved_moment_budget = ((state.context_budget as f32)
+        * state.moment_ratio.clamp(0.0, 1.0))
+    .round()
+    .clamp(0.0, state.context_budget as f32) as usize;
     let fixed_history_budget = state.context_budget.saturating_sub(reserved_moment_budget);
     let invariance_moment_ratios = [0.15_f32, 0.25_f32, 0.35_f32, 0.45_f32];
     println!(
@@ -1281,7 +1282,7 @@ impl Default for ViewState {
     fn default() -> Self {
         let mut state = Self {
             base_leaf_size: 220,
-            merge_arity: 4,
+            merge_arity: 8,
             context_budget: 2200,
             selection_policy: SelectionPolicy::DistributionAware,
             det_fill_ratio: 0.85,
@@ -1396,11 +1397,7 @@ fn spawn_insert_job(state: &ViewState, target_len: usize) -> Option<InsertJob> {
     })
 }
 
-fn simulate(
-    stream: &[usize],
-    visible_leaves: usize,
-    merge_arity: usize,
-) -> Simulation {
+fn simulate(stream: &[usize], visible_leaves: usize, merge_arity: usize) -> Simulation {
     let mut sim = Simulation::default();
     let mut roots_by_level: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
     let mut by_id: HashMap<u64, usize> = HashMap::new();
@@ -1956,7 +1953,10 @@ fn refine_history_suffix(
                 continue;
             }
             let parent_cost = cover_turn_cost(parent);
-            let child_cost = child_nodes.iter().map(|node| cover_turn_cost(node)).sum::<usize>();
+            let child_cost = child_nodes
+                .iter()
+                .map(|node| cover_turn_cost(node))
+                .sum::<usize>();
             let extra = child_cost.saturating_sub(parent_cost);
             if extra > remaining {
                 continue;
@@ -2357,11 +2357,7 @@ fn select_cover_deterministic(
             .join(", ");
         steps.push(format!(
             "split[det] #{:04} -> {} (+{} chars) => {} / {}",
-            chosen.parent_id,
-            child_desc,
-            chosen.extra_cost,
-            used_chars,
-            budget_chars
+            chosen.parent_id, child_desc, chosen.extra_cost, used_chars, budget_chars
         ));
     }
 
@@ -3333,7 +3329,10 @@ fn oldest_band_survival(
     (node_survival, char_survival)
 }
 
-fn history_quantile_flip(prev_history: &[u64], next_history: &[u64]) -> [f64; HISTORY_QUANTILE_BUCKETS] {
+fn history_quantile_flip(
+    prev_history: &[u64],
+    next_history: &[u64],
+) -> [f64; HISTORY_QUANTILE_BUCKETS] {
     let mut out = [0.0; HISTORY_QUANTILE_BUCKETS];
     if prev_history.is_empty() {
         return out;
@@ -4938,7 +4937,11 @@ Interpretation: high prefix retention with low churn indicates stronger turn-to-
                             if !qn_points.is_empty() {
                                 plot_ui.line(
                                     Line::new(
-                                        format!("{} q{} flip", policy.label(), HISTORY_QUANTILE_BUCKETS - 1),
+                                        format!(
+                                            "{} q{} flip",
+                                            policy.label(),
+                                            HISTORY_QUANTILE_BUCKETS - 1
+                                        ),
                                         PlotPoints::from(qn_points),
                                     )
                                     .color(policy_color(policy)),
@@ -5278,7 +5281,10 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
         };
         let (chars_per_token, output_tokens_per_step) = {
             let s = state.read(ui);
-            (s.chars_per_token.max(1) as f64, s.output_tokens_per_step as f64)
+            (
+                s.chars_per_token.max(1) as f64,
+                s.output_tokens_per_step as f64,
+            )
         };
         let (selection_policy, sampling_mode, sample_count, visible_leaves) = {
             let s = state.read(ui);
@@ -5429,10 +5435,8 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
             let mut lag_counts = [0usize; LAG_STEPS.len()];
             for sample in samples.iter().skip(eval_start) {
                 avg_moment_fill_ratio += sample.moment_fill_ratio;
-                min_moment_fill_ratio =
-                    f64::min(min_moment_fill_ratio, sample.moment_fill_ratio);
-                max_moment_fill_ratio =
-                    f64::max(max_moment_fill_ratio, sample.moment_fill_ratio);
+                min_moment_fill_ratio = f64::min(min_moment_fill_ratio, sample.moment_fill_ratio);
+                max_moment_fill_ratio = f64::max(max_moment_fill_ratio, sample.moment_fill_ratio);
                 avg_moment_spill_leaves += sample.moment_spill_leaves as f64;
                 avg_moment_spill_per_insert += sample.moment_spill_per_insert;
                 let spill_bin = match sample.moment_spill_leaves {
@@ -5454,10 +5458,7 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
                         lag_counts[lag_idx] = lag_counts[lag_idx].saturating_add(1);
                     }
                 }
-                for (lag_idx, value) in sample
-                    .lag_history_prefix_retention_chars
-                    .iter()
-                    .enumerate()
+                for (lag_idx, value) in sample.lag_history_prefix_retention_chars.iter().enumerate()
                 {
                     if value.is_finite() {
                         if !avg_lag_history_prefix_chars[lag_idx].is_finite() {
@@ -5694,15 +5695,16 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
                     ])
                 })
                 .collect();
-            let lag_retention_points: [Vec<[f64; 2]>; LAG_STEPS.len()] = std::array::from_fn(|lag_idx| {
-                samples
-                    .iter()
-                    .filter_map(|sample| {
-                        let value = sample.lag_history_prefix_retention[lag_idx];
-                        value.is_finite().then_some([sample.step as f64, value])
-                    })
-                    .collect()
-            });
+            let lag_retention_points: [Vec<[f64; 2]>; LAG_STEPS.len()] =
+                std::array::from_fn(|lag_idx| {
+                    samples
+                        .iter()
+                        .filter_map(|sample| {
+                            let value = sample.lag_history_prefix_retention[lag_idx];
+                            value.is_finite().then_some([sample.step as f64, value])
+                        })
+                        .collect()
+                });
             let lag_retention_chars_points: [Vec<[f64; 2]>; LAG_STEPS.len()] =
                 std::array::from_fn(|lag_idx| {
                     samples
@@ -5815,10 +5817,7 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
                     .legend(Legend::default())
                     .show(ui, |plot_ui| {
                         plot_ui.line(Line::new("prefix n", PlotPoints::from(prefix_points)));
-                        plot_ui.line(Line::new(
-                            "prefix c",
-                            PlotPoints::from(prefix_chars_points),
-                        ));
+                        plot_ui.line(Line::new("prefix c", PlotPoints::from(prefix_chars_points)));
                         plot_ui.line(Line::new(
                             "history n",
                             PlotPoints::from(history_prefix_points),
@@ -5861,9 +5860,7 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
             });
 
             ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("Oldest-band survival + quantile flip-rate").monospace(),
-            );
+            ui.label(egui::RichText::new("Oldest-band survival + quantile flip-rate").monospace());
             ui.push_id("cover_oldest_quantile_plot", |ui| {
                 Plot::new("cover_oldest_quantile_plot")
                     .height(150.0)
@@ -5896,8 +5893,10 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
                     .legend(Legend::default())
                     .include_y(0.0)
                     .show(ui, |plot_ui| {
-                        plot_ui
-                            .line(Line::new("input total", PlotPoints::from(input_chars_points)));
+                        plot_ui.line(Line::new(
+                            "input total",
+                            PlotPoints::from(input_chars_points),
+                        ));
                         plot_ui.line(Line::new(
                             "input cached",
                             PlotPoints::from(cached_chars_points),
@@ -5916,8 +5915,10 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
                     .legend(Legend::default())
                     .include_y(0.0)
                     .show(ui, |plot_ui| {
-                        plot_ui
-                            .line(Line::new("utilization", PlotPoints::from(utilization_points)));
+                        plot_ui.line(Line::new(
+                            "utilization",
+                            PlotPoints::from(utilization_points),
+                        ));
                         if !cache_ratio_points.is_empty() {
                             plot_ui.line(Line::new(
                                 "cache/new ratio",

@@ -41,7 +41,7 @@ pub mod playground_config {
         "1FF004BB48F7A4F8F72541F4D4FA75FF" as pub llm_prompt_safety_margin_tokens: U256BE;
         "095FAECDB8FF205DF591DF594E593B01" as pub llm_prompt_chars_per_token: U256BE;
         "1844C507906202EFF676D8C561E89704" as pub llm_compaction_prompt: Handle<Blake3, LongString>;
-        "167BABF8DFCD69AB4DB69773AAB18C4B" as pub llm_compaction_reduction_factor: U256BE;
+        "167BABF8DFCD69AB4DB69773AAB18C4B" as pub llm_compaction_merge_arity: U256BE;
         "120F9C6BBB103FAFFB31A66E2ABC15E6" as pub exec_default_cwd: Handle<Blake3, LongString>;
         "D18A351B6E03A460E4F400D97D285F96" as pub exec_sandbox_profile: GenId;
     }
@@ -183,7 +183,7 @@ where
     metadata += describe_attribute(blobs, &playground_config::llm_prompt_safety_margin_tokens)?;
     metadata += describe_attribute(blobs, &playground_config::llm_prompt_chars_per_token)?;
     metadata += describe_attribute(blobs, &playground_config::llm_compaction_prompt)?;
-    metadata += describe_attribute(blobs, &playground_config::llm_compaction_reduction_factor)?;
+    metadata += describe_attribute(blobs, &playground_config::llm_compaction_merge_arity)?;
     metadata += describe_attribute(blobs, &playground_config::exec_default_cwd)?;
     metadata += describe_attribute(blobs, &playground_config::exec_sandbox_profile)?;
 

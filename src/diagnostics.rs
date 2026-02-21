@@ -326,8 +326,7 @@ struct ContextChunkRow {
     summary: Value<Handle<Blake3, LongString>>,
     start_at: Option<i128>,
     end_at: Option<i128>,
-    left: Option<Id>,
-    right: Option<Id>,
+    children: Vec<Id>,
     about_exec_result: Option<Id>,
 }
 
@@ -350,7 +349,7 @@ struct ContextSelectedRow {
 
 #[derive(Debug, Clone)]
 struct ContextChildRow {
-    side: &'static str,
+    index: usize,
     chunk_id: Id,
     summary: Option<String>,
 }
@@ -492,7 +491,7 @@ struct AgentConfigRow {
     llm_compaction_base_url: Option<String>,
     llm_compaction_prompt_chars_per_token: Option<u64>,
     llm_compaction_api_key: Option<String>,
-    llm_compaction_reduction_factor: Option<u64>,
+    llm_compaction_merge_arity: Option<u64>,
     llm_compaction_prompt: Option<String>,
     tavily_api_key: Option<String>,
     exa_api_key: Option<String>,
@@ -1609,10 +1608,10 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_compaction_entity_id,
         playground_config::llm_api_key,
     );
-    let llm_compaction_reduction_factor = load_optional_u64_attr(
+    let llm_compaction_merge_arity = load_optional_u64_attr(
         data,
         config_id,
-        playground_config::llm_compaction_reduction_factor,
+        playground_config::llm_compaction_merge_arity,
     );
     let llm_compaction_prompt = load_optional_string_attr(
         data,
@@ -1666,7 +1665,7 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_compaction_base_url,
         llm_compaction_prompt_chars_per_token,
         llm_compaction_api_key,
-        llm_compaction_reduction_factor,
+        llm_compaction_merge_arity,
         llm_compaction_prompt,
         tavily_api_key,
         exa_api_key,
@@ -2404,8 +2403,7 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
                 summary,
                 start_at: Some(interval_key(start_at)),
                 end_at: Some(interval_key(end_at)),
-                left: None,
-                right: None,
+                children: Vec::new(),
                 about_exec_result: None,
             },
         );
@@ -2416,11 +2414,25 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
         pattern!(data, [{
             ?chunk_id @
             playground_context::kind: playground_context::kind_chunk,
+            playground_context::child: ?child_id,
+        }])
+    ) {
+        if let Some(row) = rows.get_mut(&chunk_id) {
+            row.children.push(child_id);
+        }
+    }
+
+    // Legacy two-child edges.
+    for (chunk_id, child_id) in find!(
+        (chunk_id: Id, child_id: Id),
+        pattern!(data, [{
+            ?chunk_id @
+            playground_context::kind: playground_context::kind_chunk,
             playground_context::left: ?child_id,
         }])
     ) {
         if let Some(row) = rows.get_mut(&chunk_id) {
-            row.left = Some(child_id);
+            row.children.push(child_id);
         }
     }
 
@@ -2433,7 +2445,7 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
         }])
     ) {
         if let Some(row) = rows.get_mut(&chunk_id) {
-            row.right = Some(child_id);
+            row.children.push(child_id);
         }
     }
 
@@ -2451,6 +2463,19 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
     }
 
     let mut list: Vec<ContextChunkRow> = rows.into_values().collect();
+    let start_by_id: HashMap<Id, i128> = list
+        .iter()
+        .map(|row| (row.id, row.start_at.unwrap_or(i128::MAX)))
+        .collect();
+    for row in &mut list {
+        row.children.sort_by_key(|child_id| {
+            (
+                start_by_id.get(child_id).copied().unwrap_or(i128::MAX),
+                *child_id,
+            )
+        });
+        row.children.dedup();
+    }
     list.sort_by_key(|row| (row.level, row.start_at.unwrap_or(i128::MIN)));
     list
 }
@@ -2469,21 +2494,12 @@ fn build_context_selected(
     let summary = load_text(ws, row.summary);
     let mut children = Vec::new();
     if show_children {
-        if let Some(left) = row.left {
+        for (child_index, child_id) in row.children.iter().copied().enumerate() {
             children.push(ContextChildRow {
-                side: "left",
-                chunk_id: left,
+                index: child_index,
+                chunk_id: child_id,
                 summary: by_id
-                    .get(&left)
-                    .and_then(|child| load_text(ws, child.summary)),
-            });
-        }
-        if let Some(right) = row.right {
-            children.push(ContextChildRow {
-                side: "right",
-                chunk_id: right,
-                summary: by_id
-                    .get(&right)
+                    .get(&child_id)
                     .and_then(|child| load_text(ws, child.summary)),
             });
         }
@@ -2502,17 +2518,13 @@ fn build_context_selected(
             let Some(node) = by_id.get(&id) else {
                 continue;
             };
-            let is_leaf =
-                node.about_exec_result.is_some() || (node.left.is_none() && node.right.is_none());
+            let is_leaf = node.about_exec_result.is_some() || node.children.is_empty();
             if is_leaf {
                 leaves.push(id);
                 continue;
             }
-            if let Some(left) = node.left {
-                stack.push(left);
-            }
-            if let Some(right) = node.right {
-                stack.push(right);
+            for child_id in &node.children {
+                stack.push(*child_id);
             }
         }
 
@@ -3841,10 +3853,10 @@ fn render_agent_config(
             );
             ui.end_row();
 
-            ui.label("llm.compaction.reduction_factor");
+            ui.label("llm.compaction.merge_arity");
             ui.monospace(
                 config
-                    .llm_compaction_reduction_factor
+                    .llm_compaction_merge_arity
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );
@@ -4021,11 +4033,8 @@ fn render_context_compaction(
 
     let mut children: HashSet<Id> = HashSet::new();
     for row in chunks {
-        if let Some(left) = row.left {
-            children.insert(left);
-        }
-        if let Some(right) = row.right {
-            children.insert(right);
+        for child_id in &row.children {
+            children.insert(*child_id);
         }
     }
 
@@ -4084,21 +4093,16 @@ fn context_leaf_count(
         memo.insert(node_id, 0);
         return 0;
     };
-    let is_leaf = node.about_exec_result.is_some() || (node.left.is_none() && node.right.is_none());
+    let is_leaf = node.about_exec_result.is_some() || node.children.is_empty();
     if is_leaf {
         memo.insert(node_id, 1);
         return 1;
     }
 
-    let left = node
-        .left
-        .map(|id| context_leaf_count(id, by_id, memo))
-        .unwrap_or(0);
-    let right = node
-        .right
-        .map(|id| context_leaf_count(id, by_id, memo))
-        .unwrap_or(0);
-    let count = left.saturating_add(right);
+    let mut count = 0usize;
+    for child_id in &node.children {
+        count = count.saturating_add(context_leaf_count(*child_id, by_id, memo));
+    }
     memo.insert(node_id, count);
     count
 }
@@ -4133,11 +4137,8 @@ fn render_context_chunk_node(
     let response = egui::CollapsingHeader::new(egui::RichText::new(label).monospace())
         .id_salt(format!("context_chunk::{node_id:x}"))
         .show(ui, |ui| {
-            if let Some(left) = node.left {
-                render_context_chunk_node(ui, state, now_key, by_id, left, leaf_counts);
-            }
-            if let Some(right) = node.right {
-                render_context_chunk_node(ui, state, now_key, by_id, right, leaf_counts);
+            for child_id in &node.children {
+                render_context_chunk_node(ui, state, now_key, by_id, *child_id, leaf_counts);
             }
         });
 
@@ -4249,7 +4250,11 @@ fn render_context_selected_details(
             let Some(child_node) = by_id.get(&child.chunk_id) else {
                 ui.colored_label(
                     egui::Color32::RED,
-                    format!("missing {} child {}", child.side, id_prefix(child.chunk_id)),
+                    format!(
+                        "missing child[{}] {}",
+                        child.index,
+                        id_prefix(child.chunk_id)
+                    ),
                 );
                 continue;
             };
@@ -4266,8 +4271,8 @@ fn render_context_selected_details(
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.monospace(format!(
-                            "{}: L{} {}  {child_start}..{child_end}  leaves:{child_count}",
-                            child.side,
+                            "child[{}]: L{} {}  {child_start}..{child_end}  leaves:{child_count}",
+                            child.index,
                             child_node.level,
                             id_prefix(child.chunk_id),
                         ));

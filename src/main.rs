@@ -202,7 +202,7 @@ enum ConfigField {
     LlmPromptCharsPerToken,
     LlmCompactionProfileId,
     LlmCompactionPrompt,
-    LlmCompactionReductionFactor,
+    LlmCompactionMergeArity,
     ExecDefaultCwd,
     ExecSandboxProfile,
 }
@@ -514,12 +514,12 @@ fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
                 "llm_compaction_prompt",
             )?);
         }
-        ConfigField::LlmCompactionReductionFactor => {
-            let factor = parse_u64(args.value.as_str(), "llm_compaction_reduction_factor")?;
+        ConfigField::LlmCompactionMergeArity => {
+            let factor = parse_u64(args.value.as_str(), "llm_compaction_merge_arity")?;
             if factor < 2 {
-                return Err(anyhow!("llm_compaction_reduction_factor must be >= 2"));
+                return Err(anyhow!("llm_compaction_merge_arity must be >= 2"));
             }
-            config.llm_compaction_reduction_factor = factor;
+            config.llm_compaction_merge_arity = factor;
         }
         ConfigField::ExecDefaultCwd => {
             let value = load_value_or_file(args.value.as_str(), "exec_default_cwd")?;
@@ -927,8 +927,8 @@ fn print_config(config: &Config, show_secrets: bool) {
             .unwrap_or_else(|| "null".to_string())
     );
     println!(
-        "compaction_reduction_factor = {}",
-        config.llm_compaction_reduction_factor
+        "compaction_merge_arity = {}",
+        config.llm_compaction_merge_arity
     );
 
     println!("\n[integrations]");
@@ -1893,8 +1893,7 @@ struct ContextChunk {
     summary: Value<Handle<Blake3, LongString>>,
     start_at: Value<NsTAIInterval>,
     end_at: Value<NsTAIInterval>,
-    left: Option<Id>,
-    right: Option<Id>,
+    children: Vec<Id>,
     about_exec_result: Option<Id>,
     about_archive_message: Option<Id>,
     archive_author: Option<Id>,
@@ -1907,9 +1906,8 @@ struct ContextChunk {
 #[derive(Default)]
 struct ContextChunkIndex {
     chunks: HashMap<Id, ContextChunk>,
-    // The LSM frontier: one "root" chunk per level (best-effort; if multiple exist, keep the
-    // newest by end_at as the active chunk for merging).
-    root_by_level: HashMap<u64, Id>,
+    // The LSM frontier: roots grouped by level and ordered by time.
+    root_by_level: HashMap<u64, Vec<Id>>,
     // Leaf chunks tie a single exec result to a compacted chunk.
     chunk_for_exec_result: HashMap<Id, Id>,
     // Leaf chunks tie a single imported archive message to a compacted chunk.
@@ -2062,8 +2060,7 @@ fn build_prompt_messages_with_compaction(
             summary: leaf_summary_handle,
             start_at: message.created_at,
             end_at: message.created_at,
-            left: None,
-            right: None,
+            children: Vec::new(),
             about_exec_result: None,
             about_archive_message: Some(message.id),
             archive_author: Some(message.author_id),
@@ -2078,6 +2075,7 @@ fn build_prompt_messages_with_compaction(
             &mut index,
             &mut compact_change,
             chunk,
+            config.llm_compaction_merge_arity as usize,
             &semantic_compactor,
         )?;
     }
@@ -2116,8 +2114,7 @@ fn build_prompt_messages_with_compaction(
             summary: leaf_summary_handle,
             start_at: finished_at,
             end_at: finished_at,
-            left: None,
-            right: None,
+            children: Vec::new(),
             about_exec_result: Some(result.id),
             about_archive_message: None,
             archive_author: None,
@@ -2132,6 +2129,7 @@ fn build_prompt_messages_with_compaction(
             &mut index,
             &mut compact_change,
             chunk,
+            config.llm_compaction_merge_arity as usize,
             &semantic_compactor,
         )?;
     }
@@ -2166,12 +2164,11 @@ struct MemoryCoverTurn {
     cost: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SplitCandidate {
     index: usize,
     parent_id: Id,
-    left_id: Id,
-    right_id: Id,
+    child_ids: Vec<Id>,
     extra_cost: usize,
     recency_key: i128,
 }
@@ -2189,6 +2186,7 @@ fn build_memory_cover_messages(
     let mut cover: Vec<Id> = index
         .root_by_level
         .values()
+        .flatten()
         .copied()
         .filter(|id| seen_roots.insert(*id))
         .filter(|id| index.chunks.contains_key(id))
@@ -2233,14 +2231,16 @@ fn build_memory_cover_messages(
             let Some(parent_chunk) = index.chunks.get(parent_id) else {
                 continue;
             };
-            let (Some(left_id), Some(right_id)) = (parent_chunk.left, parent_chunk.right) else {
+            if parent_chunk.children.len() < 2 {
                 continue;
-            };
+            }
 
             let parent_turn = memory_cover_turn(ws, index, &mut turn_cache, *parent_id)?;
-            let left_turn = memory_cover_turn(ws, index, &mut turn_cache, left_id)?;
-            let right_turn = memory_cover_turn(ws, index, &mut turn_cache, right_id)?;
-            let children_cost = left_turn.cost.saturating_add(right_turn.cost);
+            let mut children_cost = 0usize;
+            for child_id in &parent_chunk.children {
+                let child_turn = memory_cover_turn(ws, index, &mut turn_cache, *child_id)?;
+                children_cost = children_cost.saturating_add(child_turn.cost);
+            }
             let extra_cost = children_cost.saturating_sub(parent_turn.cost);
             if extra_cost > remaining {
                 continue;
@@ -2249,12 +2249,11 @@ fn build_memory_cover_messages(
             let candidate = SplitCandidate {
                 index: cover_index,
                 parent_id: *parent_id,
-                left_id,
-                right_id,
+                child_ids: parent_chunk.children.clone(),
                 extra_cost,
                 recency_key: interval_key(parent_chunk.end_at),
             };
-            if is_better_split_candidate(candidate, best) {
+            if is_better_split_candidate(&candidate, best.as_ref()) {
                 best = Some(candidate);
             }
         }
@@ -2265,7 +2264,7 @@ fn build_memory_cover_messages(
 
         cover.splice(
             candidate.index..=candidate.index,
-            [candidate.left_id, candidate.right_id],
+            candidate.child_ids.clone(),
         );
         used = used.saturating_add(candidate.extra_cost);
     }
@@ -2309,7 +2308,7 @@ fn memory_cover_turn(
     Ok(turn)
 }
 
-fn is_better_split_candidate(candidate: SplitCandidate, current: Option<SplitCandidate>) -> bool {
+fn is_better_split_candidate(candidate: &SplitCandidate, current: Option<&SplitCandidate>) -> bool {
     let Some(current) = current else {
         return true;
     };
@@ -2342,12 +2341,14 @@ fn format_memory_output(ws: &mut Workspace<Pile>, chunk: &ContextChunk) -> Resul
     if let Some(thread_root_id) = chunk.archive_thread_root {
         header.push_str(&format!(" thread={}", id_prefix(thread_root_id)));
     }
-    if let (Some(left), Some(right)) = (chunk.left, chunk.right) {
-        header.push_str(&format!(
-            " children={} {}",
-            id_prefix(left),
-            id_prefix(right)
-        ));
+    if !chunk.children.is_empty() {
+        header.push_str(" children=");
+        for (idx, child_id) in chunk.children.iter().enumerate() {
+            if idx > 0 {
+                header.push(',');
+            }
+            header.push_str(id_prefix(*child_id).as_str());
+        }
     }
     if let Some(source_format) = chunk.archive_source_format.as_deref() {
         header.push_str(&format!(" source={source_format}"));
@@ -2810,8 +2811,7 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
                 summary,
                 start_at,
                 end_at,
-                left: None,
-                right: None,
+                children: Vec::new(),
                 about_exec_result: None,
                 about_archive_message: None,
                 archive_author: None,
@@ -2828,11 +2828,25 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
         pattern!(catalog, [{
             ?chunk_id @
             playground_context::kind: playground_context::kind_chunk,
+            playground_context::child: ?child_id,
+        }])
+    ) {
+        if let Some(chunk) = index.chunks.get_mut(&chunk_id) {
+            chunk.children.push(child_id);
+        }
+    }
+
+    // Legacy two-child edges.
+    for (chunk_id, child_id) in find!(
+        (chunk_id: Id, child_id: Id),
+        pattern!(catalog, [{
+            ?chunk_id @
+            playground_context::kind: playground_context::kind_chunk,
             playground_context::left: ?child_id,
         }])
     ) {
         if let Some(chunk) = index.chunks.get_mut(&chunk_id) {
-            chunk.left = Some(child_id);
+            chunk.children.push(child_id);
         }
     }
 
@@ -2845,8 +2859,23 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
         }])
     ) {
         if let Some(chunk) = index.chunks.get_mut(&chunk_id) {
-            chunk.right = Some(child_id);
+            chunk.children.push(child_id);
         }
+    }
+
+    let child_order: HashMap<Id, i128> = index
+        .chunks
+        .iter()
+        .map(|(chunk_id, chunk)| (*chunk_id, interval_key(chunk.start_at)))
+        .collect();
+    for chunk in index.chunks.values_mut() {
+        chunk.children.sort_by_key(|child_id| {
+            (
+                child_order.get(child_id).copied().unwrap_or(i128::MAX),
+                *child_id,
+            )
+        });
+        chunk.children.dedup();
     }
 
     for (chunk_id, exec_result_id) in find!(
@@ -2947,11 +2976,8 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
     // Determine the LSM frontier by removing all chunks that are referenced as children.
     let mut children = HashSet::new();
     for chunk in index.chunks.values() {
-        if let Some(left) = chunk.left {
-            children.insert(left);
-        }
-        if let Some(right) = chunk.right {
-            children.insert(right);
+        for child_id in &chunk.children {
+            children.insert(*child_id);
         }
     }
 
@@ -2959,17 +2985,20 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
         if children.contains(&chunk.id) {
             continue;
         }
-        let end_key = interval_key(chunk.end_at);
-        match index
+        index
             .root_by_level
-            .get(&chunk.level)
-            .and_then(|id| index.chunks.get(id))
-        {
-            Some(existing) if interval_key(existing.end_at) >= end_key => {}
-            _ => {
-                index.root_by_level.insert(chunk.level, chunk.id);
-            }
-        }
+            .entry(chunk.level)
+            .or_default()
+            .push(chunk.id);
+    }
+    for roots in index.root_by_level.values_mut() {
+        roots.sort_by_key(|chunk_id| {
+            index
+                .chunks
+                .get(chunk_id)
+                .map(|chunk| (interval_key(chunk.start_at), *chunk_id))
+                .unwrap_or((i128::MAX, *chunk_id))
+        });
     }
 
     index
@@ -2979,75 +3008,100 @@ fn insert_chunk_with_carry(
     ws: &mut Workspace<Pile>,
     index: &mut ContextChunkIndex,
     change: &mut TribleSet,
-    mut carry: ContextChunk,
+    carry: ContextChunk,
+    merge_arity: usize,
     semantic: &SemanticCompactor,
 ) -> Result<()> {
+    let merge_arity = merge_arity.max(2);
+    let mut carry = carry;
     let mut level = carry.level;
     loop {
-        if let Some(existing_id) = index.root_by_level.remove(&level) {
-            let existing = index
+        index.chunks.insert(carry.id, carry.clone());
+        let runs = index.root_by_level.entry(level).or_default();
+        runs.push(carry.id);
+        runs.sort_by_key(|chunk_id| {
+            index
                 .chunks
-                .get(&existing_id)
-                .cloned()
-                .context("missing existing chunk for carry")?;
+                .get(chunk_id)
+                .map(|chunk| (interval_key(chunk.start_at), *chunk_id))
+                .unwrap_or((i128::MAX, *chunk_id))
+        });
 
-            // Order children by time to keep summaries consistent.
-            let (left, right) = if interval_key(existing.start_at) <= interval_key(carry.start_at) {
-                (existing, carry)
-            } else {
-                (carry, existing)
-            };
-
-            let left_text = load_text(ws, left.summary).context("load left chunk summary")?;
-            let right_text = load_text(ws, right.summary).context("load right chunk summary")?;
-            let merged_text = semantic
-                .merge(left_text.as_str(), right_text.as_str())
-                .context("semantic merge context chunks")?;
-            let merged_handle = ws.put(merged_text);
-
-            let now = epoch_interval(now_epoch());
-            let parent_id = ufoid();
-            let parent_level = level + 1;
-            *change += entity! { &parent_id @
-                playground_context::kind: playground_context::kind_chunk,
-                playground_context::level: parent_level,
-                playground_context::summary: merged_handle,
-                playground_context::created_at: now,
-                playground_context::start_at: left.start_at,
-                playground_context::end_at: right.end_at,
-                playground_context::left: left.id,
-                playground_context::right: right.id,
-            };
-
-            carry = ContextChunk {
-                id: *parent_id,
-                level: parent_level,
-                summary: merged_handle,
-                start_at: left.start_at,
-                end_at: right.end_at,
-                left: Some(left.id),
-                right: Some(right.id),
-                about_exec_result: None,
-                about_archive_message: None,
-                archive_author: None,
-                archive_person: None,
-                archive_thread_root: None,
-                archive_conversation: None,
-                archive_source_format: None,
-            };
-
-            // Update chunk index for subsequent carry steps.
-            index.chunks.insert(left.id, left);
-            index.chunks.insert(right.id, right);
-            index.chunks.insert(carry.id, carry.clone());
-
-            level = parent_level;
-            continue;
+        if runs.len() < merge_arity {
+            return Ok(());
         }
 
-        index.root_by_level.insert(level, carry.id);
-        index.chunks.insert(carry.id, carry);
-        return Ok(());
+        let child_ids = std::mem::take(runs);
+        if index
+            .root_by_level
+            .get(&level)
+            .map(Vec::is_empty)
+            .unwrap_or(false)
+        {
+            index.root_by_level.remove(&level);
+        }
+
+        let mut children = Vec::with_capacity(child_ids.len());
+        for child_id in &child_ids {
+            let child = index
+                .chunks
+                .get(child_id)
+                .cloned()
+                .with_context(|| format!("missing child chunk {child_id:x} for carry"))?;
+            children.push(child);
+        }
+        children.sort_by_key(|child| (interval_key(child.start_at), child.id));
+        let mut inputs = Vec::with_capacity(children.len());
+        for child in &children {
+            inputs.push(load_text(ws, child.summary).context("load child chunk summary")?);
+        }
+        let merged_text = semantic
+            .merge(inputs.as_slice())
+            .context("semantic merge context chunks")?;
+        let merged_handle = ws.put(merged_text);
+
+        let now = epoch_interval(now_epoch());
+        let parent_id = ufoid();
+        let parent_level = level + 1;
+        let start_at = children
+            .first()
+            .map(|chunk| chunk.start_at)
+            .context("carry merge missing first child")?;
+        let end_at = children
+            .last()
+            .map(|chunk| chunk.end_at)
+            .context("carry merge missing last child")?;
+
+        *change += entity! { &parent_id @
+            playground_context::kind: playground_context::kind_chunk,
+            playground_context::level: parent_level,
+            playground_context::summary: merged_handle,
+            playground_context::created_at: now,
+            playground_context::start_at: start_at,
+            playground_context::end_at: end_at,
+        };
+        for child in &children {
+            *change += entity! { &parent_id @
+                playground_context::child: child.id,
+            };
+        }
+
+        carry = ContextChunk {
+            id: *parent_id,
+            level: parent_level,
+            summary: merged_handle,
+            start_at,
+            end_at,
+            children: children.iter().map(|chunk| chunk.id).collect(),
+            about_exec_result: None,
+            about_archive_message: None,
+            archive_author: None,
+            archive_person: None,
+            archive_thread_root: None,
+            archive_conversation: None,
+            archive_source_format: None,
+        };
+        level = parent_level;
     }
 }
 
@@ -3057,11 +3111,10 @@ struct SemanticCompactor {
     api_key: Option<String>,
     model: String,
     chars_per_token: u64,
-    reduction_factor: u64,
     system_prompt: String,
 }
 
-const DEFAULT_COMPACTION_PROMPT: &str = "You are a context compaction module.\n\nGiven two prior memory chunks from a terminal-based agent, write a concise merged summary that preserves:\n- key actions taken\n- important results/outputs\n- errors and their causes\n- paths/ids that matter for follow-up\n\nOutput plain text only (no markdown), no code fences, no tool calls.\n";
+const DEFAULT_COMPACTION_PROMPT: &str = "You are a context compaction module.\n\nGiven one or more prior memory chunks from a terminal-based agent, write a concise merged summary that preserves:\n- key actions taken\n- important results/outputs\n- errors and their causes\n- paths/ids that matter for follow-up\n\nOutput plain text only (no markdown), no code fences, no tool calls.\n";
 
 impl SemanticCompactor {
     fn new(config: &Config) -> Result<Self> {
@@ -3097,7 +3150,6 @@ impl SemanticCompactor {
             api_key,
             model,
             chars_per_token,
-            reduction_factor: config.llm_compaction_reduction_factor.max(2),
             system_prompt: config
                 .llm_compaction_prompt
                 .clone()
@@ -3105,19 +3157,29 @@ impl SemanticCompactor {
         })
     }
 
-    fn merge(&self, left: &str, right: &str) -> Result<String> {
-        let input_chars = left
-            .chars()
-            .count()
-            .saturating_add(right.chars().count())
+    fn merge(&self, chunks: &[String]) -> Result<String> {
+        if chunks.len() < 2 {
+            return Err(anyhow!("semantic merge needs at least 2 chunks"));
+        }
+        let input_chars = chunks
+            .iter()
+            .map(|chunk| chunk.chars().count())
+            .fold(0usize, usize::saturating_add)
             .max(1);
-        let target_chars = input_chars / (self.reduction_factor.max(2) as usize);
+        let compression = chunks.len().max(2);
+        let target_chars = input_chars / compression;
         let target_chars = target_chars.max(1);
         let max_tokens = target_chars.div_ceil(self.chars_per_token as usize) as u64;
 
-        let user = format!(
-            "CHUNK A:\n{left}\n\nCHUNK B:\n{right}\n\nMerge them into one summary and compress by ~1/{factor}. Keep critical details; drop repetition.",
-            factor = self.reduction_factor,
+        let mut user = String::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            user.push_str(format!("CHUNK {}:\n{}\n\n", idx + 1, chunk).as_str());
+        }
+        user.push_str(
+            format!(
+                "Merge them into one summary and compress by ~1/{compression}. Keep critical details; drop repetition."
+            )
+            .as_str(),
         );
         let payload = serde_json::json!({
             "model": self.model,

@@ -18,6 +18,7 @@ pub mod playground_context {
         "95D629052C40FA09B378DDC507BEA0D3" as pub end_at: NsTAIInterval;
         "CB97C36A32DEC70E0D1149E7C5D88588" as pub left: GenId;
         "087D07E3D9D94F0C4E96813C7BC5E74C" as pub right: GenId;
+        "9B83D68AECD6888AA9CE95E754494768" as pub child: GenId;
         "316834CC6B0EA6F073BF5362D67AC530" as pub about_exec_result: GenId;
         "A4E2B712CA28AB1EED76C34DE72AFA39" as pub about_archive_message: GenId;
         "0369F021B2CF6CC26BA5DBF3179A5AF2" as pub archive_author: GenId;
@@ -128,6 +129,7 @@ where
     metadata += describe_attribute(blobs, &playground_context::end_at)?;
     metadata += describe_attribute(blobs, &playground_context::left)?;
     metadata += describe_attribute(blobs, &playground_context::right)?;
+    metadata += describe_attribute(blobs, &playground_context::child)?;
     metadata += describe_attribute(blobs, &playground_context::about_exec_result)?;
     metadata += describe_attribute(blobs, &playground_context::about_archive_message)?;
     metadata += describe_attribute(blobs, &playground_context::archive_author)?;
