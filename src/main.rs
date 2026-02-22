@@ -397,6 +397,10 @@ fn run_memory_command(config: Config, command: MemoryCommand) -> Result<()> {
     }
 }
 
+fn memory_status(message: impl AsRef<str>) {
+    eprintln!("[memory] {}", message.as_ref());
+}
+
 fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
     let merge_arity = config.llm_compaction_merge_arity.max(2) as usize;
     let profile = resolve_compaction_profile_info(&config);
@@ -404,23 +408,29 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
     repo_util::seed_metadata(&mut repo)?;
     let result = (|| -> Result<()> {
+        memory_status("loading archive branch...");
         let archive_catalog = load_optional_catalog(
             &mut repo,
             config.archive_branch_id,
             "pull archive workspace for memory estimate",
         )?;
+        memory_status("loading relations branch...");
         let relations_catalog = load_optional_catalog(
             &mut repo,
             config.relations_branch_id,
             "pull relations workspace for memory estimate",
         )?;
+        memory_status("loading cognition workspace...");
         let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace for memory estimate")?;
         let catalog = ws.checkout(..).context("checkout workspace")?;
 
         let mut core_index = CoreIndex::default();
         core_index.apply_delta(&catalog, &catalog);
+        memory_status("indexing existing context chunks...");
         let index = load_context_chunks(&catalog);
+        memory_status("collecting archive messages...");
         let archive_messages = load_archive_messages(&archive_catalog);
+        memory_status("building relations index...");
         let relations = load_relations_index(&mut ws, &relations_catalog)?;
 
         let pending_archive_total = archive_messages
@@ -443,10 +453,15 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
         let pending_exec = pending_exec_total;
 
         let new_leaves = pending_archive.saturating_add(pending_exec);
+        memory_status(format!(
+            "simulating carry merges for {new_leaves} pending leaves (k={merge_arity})..."
+        ));
         let sim = simulate_kary_merges(&index.root_by_level, merge_arity, new_leaves);
 
+        memory_status("sampling existing context leaf summaries...");
         let (existing_chars_sum, existing_samples) =
             sample_existing_leaf_summary_chars(&mut ws, &index, args.sample_leaves)?;
+        memory_status("sampling pending archive summaries...");
         let (archive_chars_sum, archive_samples) = sample_pending_archive_leaf_summary_chars(
             &mut ws,
             archive_messages.as_slice(),
@@ -508,6 +523,7 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
         for (level, count) in sim.final_runs_by_level {
             println!("    L{level}: {count} run(s)");
         }
+        memory_status("estimate complete.");
 
         Ok(())
     })();
@@ -529,22 +545,28 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
     repo_util::seed_metadata(&mut repo)?;
     let result = (|| -> Result<()> {
+        memory_status("loading archive branch...");
         let archive_catalog = load_optional_catalog(
             &mut repo,
             config.archive_branch_id,
             "pull archive workspace for memory build",
         )?;
+        memory_status("loading relations branch...");
         let relations_catalog = load_optional_catalog(
             &mut repo,
             config.relations_branch_id,
             "pull relations workspace for memory build",
         )?;
+        memory_status("loading cognition workspace...");
         let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace for memory build")?;
         let catalog = ws.checkout(..).context("checkout workspace")?;
         let mut core_index = CoreIndex::default();
         core_index.apply_delta(&catalog, &catalog);
+        memory_status("indexing existing context chunks...");
         let mut index = load_context_chunks(&catalog);
+        memory_status("collecting archive messages...");
         let archive_messages = load_archive_messages(&archive_catalog);
+        memory_status("building relations index...");
         let relations = load_relations_index(&mut ws, &relations_catalog)?;
 
         println!("memory build");
@@ -561,12 +583,14 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
         println!("  merge_arity: {}", merge_arity);
         if args.dry_run {
             println!("  mode: dry-run (no writes)");
+            memory_status("dry-run complete.");
             return Ok(());
         }
 
         let semantic_compactor = SemanticCompactor::new(&config)?;
         let mut change = TribleSet::new();
         let mut stats = CompactionRunStats::default();
+        memory_status("backfilling archive memory chunks...");
         let archive_added = ingest_archive_context_chunks(
             &mut ws,
             &mut index,
@@ -578,8 +602,10 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
             merge_arity,
             &semantic_compactor,
             &mut stats,
+            Some(500),
         )?;
         let exec_added = if args.include_exec {
+            memory_status("backfilling exec memory chunks...");
             let results = sorted_finished_command_results(&core_index);
             ingest_exec_context_chunks(
                 &mut ws,
@@ -591,6 +617,7 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
                 merge_arity,
                 &semantic_compactor,
                 &mut stats,
+                Some(200),
             )?
         } else {
             0
@@ -598,9 +625,11 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
 
         if change.is_empty() {
             println!("  no pending memory chunks to backfill.");
+            memory_status("build complete (nothing to write).");
             return Ok(());
         }
 
+        memory_status("committing/pushing backfill to pile...");
         ws.commit(change, None, Some("memory backfill"));
         push_workspace(&mut repo, &mut ws).context("push memory backfill")?;
         println!("  archive_leaves_added: {}", archive_added);
@@ -615,6 +644,7 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
             "  merge_output_chars_total: {}",
             stats.merge_output_chars_total
         );
+        memory_status("build complete.");
         Ok(())
     })();
 
@@ -2421,9 +2451,12 @@ fn ingest_archive_context_chunks(
     merge_arity: usize,
     semantic_compactor: &SemanticCompactor,
     stats: &mut CompactionRunStats,
+    progress_every: Option<usize>,
 ) -> Result<usize> {
     let mut added = 0usize;
+    let mut seen = 0usize;
     for message in archive_messages {
+        seen = seen.saturating_add(1);
         if max_new.is_some_and(|limit| added >= limit) {
             break;
         }
@@ -2508,6 +2541,16 @@ fn ingest_archive_context_chunks(
         )?;
         stats.archive_leaves_added = stats.archive_leaves_added.saturating_add(1);
         added = added.saturating_add(1);
+        if progress_every.is_some_and(|step| step > 0 && added % step == 0) {
+            memory_status(format!(
+                "archive progress: added {added} chunk(s) (scanned {seen})"
+            ));
+        }
+    }
+    if progress_every.is_some() {
+        memory_status(format!(
+            "archive ingest finished: added {added} chunk(s) (scanned {seen})"
+        ));
     }
     Ok(added)
 }
@@ -2522,9 +2565,12 @@ fn ingest_exec_context_chunks(
     merge_arity: usize,
     semantic_compactor: &SemanticCompactor,
     stats: &mut CompactionRunStats,
+    progress_every: Option<usize>,
 ) -> Result<usize> {
     let mut added = 0usize;
+    let mut seen = 0usize;
     for result in exec_results {
+        seen = seen.saturating_add(1);
         if max_new.is_some_and(|limit| added >= limit) {
             break;
         }
@@ -2580,6 +2626,16 @@ fn ingest_exec_context_chunks(
         )?;
         stats.exec_leaves_added = stats.exec_leaves_added.saturating_add(1);
         added = added.saturating_add(1);
+        if progress_every.is_some_and(|step| step > 0 && added % step == 0) {
+            memory_status(format!(
+                "exec progress: added {added} chunk(s) (scanned {seen})"
+            ));
+        }
+    }
+    if progress_every.is_some() {
+        memory_status(format!(
+            "exec ingest finished: added {added} chunk(s) (scanned {seen})"
+        ));
     }
     Ok(added)
 }
@@ -2653,6 +2709,7 @@ fn build_prompt_messages_with_compaction(
         merge_arity,
         &semantic_compactor,
         &mut compaction_stats,
+        None,
     )?;
     ingest_exec_context_chunks(
         ws,
@@ -2664,6 +2721,7 @@ fn build_prompt_messages_with_compaction(
         merge_arity,
         &semantic_compactor,
         &mut compaction_stats,
+        None,
     )?;
 
     let (messages, _used_chars) = build_memory_cover_messages(ws, &index, body_budget_chars)?;
