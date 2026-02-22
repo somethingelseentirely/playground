@@ -2543,25 +2543,46 @@ fn load_archive_messages_incremental(
         "{label}: scanning payload in {total_batches} batch(es) of up to {batch_size} commit(s)..."
     ));
     for (batch_idx, batch) in commits.chunks(batch_size).enumerate() {
-        if batch_idx % 10 == 0 || batch_idx + 1 == total_batches {
+        let is_checkpoint = batch_idx % 10 == 0 || batch_idx + 1 == total_batches;
+        if is_checkpoint {
             memory_status(format!(
-                "{label}: loading batch {}/{} ({} commit(s))...",
+                "{label}: checkpoint before batch {}/{} ({} commit(s))...",
                 batch_idx + 1,
                 total_batches,
                 batch.len()
             ));
         }
+
+        let message_count_before = projection.message_facts.len();
+        let reply_links_before = projection.reply_to.len();
+        let message_batch_links_before = projection.batch_by_message.len();
         let delta = ws
             .checkout(batch)
             .with_context(|| format!("checkout {label} batch {}", batch_idx + 1))?;
+        let batch_tribles = delta.len();
         projection.apply_delta(&delta);
-        if batch_idx % 10 == 0 || batch_idx + 1 == total_batches {
+        if is_checkpoint {
+            let new_message_facts = projection
+                .message_facts
+                .len()
+                .saturating_sub(message_count_before);
+            let new_reply_links = projection.reply_to.len().saturating_sub(reply_links_before);
+            let new_message_batch_links = projection
+                .batch_by_message
+                .len()
+                .saturating_sub(message_batch_links_before);
             memory_status(format!(
-                "{label}: scanned batch {}/{} ({} commit(s), {} message fact(s))",
+                "{label}: scanned batch {}/{} ({} commit(s), {} tribles, message facts {} (+{}), reply links {} (+{}), import links {} (+{}))",
                 batch_idx + 1,
                 total_batches,
                 batch.len(),
-                projection.message_facts.len()
+                batch_tribles,
+                projection.message_facts.len(),
+                new_message_facts,
+                projection.reply_to.len(),
+                new_reply_links,
+                projection.batch_by_message.len(),
+                new_message_batch_links
             ));
         }
     }
