@@ -404,7 +404,7 @@ fn memory_status(message: impl AsRef<str>) {
     eprintln!("[memory] {}", message.as_ref());
 }
 
-const MEMORY_CATALOG_CHECKOUT_BATCH_SIZE: usize = 128;
+const MEMORY_PROGRESS_CHECKPOINT_EVERY: usize = 250;
 
 fn memory_status_timed(stage: &str, started_at: Instant) {
     memory_status(format!(
@@ -438,7 +438,6 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
             config.archive_branch_id,
             "pull archive workspace for memory estimate",
             "archive",
-            MEMORY_CATALOG_CHECKOUT_BATCH_SIZE,
         )?;
         memory_status_timed(
             &format!(
@@ -614,7 +613,6 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
             config.archive_branch_id,
             "pull archive workspace for memory build",
             "archive",
-            MEMORY_CATALOG_CHECKOUT_BATCH_SIZE,
         )?;
         memory_status_timed(
             &format!(
@@ -2533,7 +2531,6 @@ fn load_archive_messages_incremental(
     branch_id: Option<Id>,
     context: &str,
     label: &str,
-    batch_size: usize,
 ) -> Result<Vec<ArchiveMessageInfo>> {
     let Some(branch_id) = branch_id else {
         return Ok(Vec::new());
@@ -2568,30 +2565,30 @@ fn load_archive_messages_incremental(
 
     let mut projection = ArchiveMessageProjection::default();
     let mut projection_catalog = TribleSet::new();
-    let batch_size = batch_size.max(1);
-    let total_batches = payload_commits.len().div_ceil(batch_size);
+    let total_commits = payload_commits.len();
     let checkout_started = Instant::now();
     memory_status(format!(
-        "{label}: scanning payload in {total_batches} batch(es) of up to {batch_size} unique payload commit(s)..."
+        "{label}: scanning payload commit-by-commit ({total_commits} unique payload commit(s))..."
     ));
-    for (batch_idx, batch) in payload_commits.chunks(batch_size).enumerate() {
-        let is_checkpoint = batch_idx % 10 == 0 || batch_idx + 1 == total_batches;
+    for (commit_idx, commit) in payload_commits.into_iter().enumerate() {
+        let commit_num = commit_idx + 1;
+        let is_checkpoint = commit_idx == 0
+            || commit_num % MEMORY_PROGRESS_CHECKPOINT_EVERY == 0
+            || commit_num == total_commits;
         if is_checkpoint {
             memory_status(format!(
-                "{label}: checkpoint before batch {}/{} ({} unique payload commit(s))...",
-                batch_idx + 1,
-                total_batches,
-                batch.len()
+                "{label}: checkpoint before commit {commit_num}/{total_commits}..."
             ));
         }
 
         let message_count_before = projection.message_facts.len();
         let reply_links_before = projection.reply_to.len();
         let message_batch_links_before = projection.batch_by_message.len();
+        let one = [commit];
         let delta = ws
-            .checkout(batch)
-            .with_context(|| format!("checkout {label} batch {}", batch_idx + 1))?;
-        let batch_tribles = delta.len();
+            .checkout(&one[..])
+            .with_context(|| format!("checkout {label} commit {commit_num}"))?;
+        let commit_tribles = delta.len();
         let projection_delta = filter_archive_projection_delta(&delta);
         if !projection_delta.is_empty() {
             projection_catalog += projection_delta.clone();
@@ -2608,11 +2605,8 @@ fn load_archive_messages_incremental(
                 .len()
                 .saturating_sub(message_batch_links_before);
             memory_status(format!(
-                "{label}: scanned batch {}/{} ({} unique payload commit(s), {} tribles, message facts {} (+{}), reply links {} (+{}), import links {} (+{}))",
-                batch_idx + 1,
-                total_batches,
-                batch.len(),
-                batch_tribles,
+                "{label}: scanned commit {commit_num}/{total_commits} ({} tribles, message facts {} (+{}), reply links {} (+{}), import links {} (+{}))",
+                commit_tribles,
                 projection.message_facts.len(),
                 new_message_facts,
                 projection.reply_to.len(),
