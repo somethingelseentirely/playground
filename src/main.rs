@@ -121,9 +121,11 @@ struct MemoryEstimateArgs {
     #[arg(long, default_value_t = 256)]
     sample_leaves: usize,
     #[arg(long)]
-    input_usd_per_1m_tokens: Option<f64>,
+    input_cost_per_1m_tokens: Option<f64>,
     #[arg(long)]
-    output_usd_per_1m_tokens: Option<f64>,
+    output_cost_per_1m_tokens: Option<f64>,
+    #[arg(long)]
+    cost_currency: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -486,15 +488,20 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
         println!("  estimated_output_tokens: {}", output_tokens as u64);
         println!("  sampled_leaf_summaries: {}", sample_count);
         println!("  sampled_avg_leaf_chars: {:.1}", avg_leaf_chars);
-        if let (Some(in_price), Some(out_price)) =
-            (args.input_usd_per_1m_tokens, args.output_usd_per_1m_tokens)
-        {
-            let usd =
+        if let (Some(in_price), Some(out_price)) = (
+            args.input_cost_per_1m_tokens,
+            args.output_cost_per_1m_tokens,
+        ) {
+            let estimated_cost =
                 (input_tokens / 1_000_000.0) * in_price + (output_tokens / 1_000_000.0) * out_price;
-            println!("  estimated_usd: {:.4}", usd);
+            if let Some(currency) = args.cost_currency.as_deref() {
+                println!("  estimated_cost: {:.4} {currency}", estimated_cost);
+            } else {
+                println!("  estimated_cost: {:.4}", estimated_cost);
+            }
         } else {
             println!(
-                "  estimated_usd: n/a (pass --input-usd-per-1m-tokens and --output-usd-per-1m-tokens)"
+                "  estimated_cost: n/a (pass --input-cost-per-1m-tokens and --output-cost-per-1m-tokens)"
             );
         }
         println!("  frontier_after_backfill:");

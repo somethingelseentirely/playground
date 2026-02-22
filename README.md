@@ -84,8 +84,9 @@ Optionally provide pricing to get a rough USD estimate:
 ```bash
 cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile \
   memory estimate \
-  --input-usd-per-1m-tokens 2.0 \
-  --output-usd-per-1m-tokens 6.0
+  --input-cost-per-1m-tokens 2.0 \
+  --output-cost-per-1m-tokens 6.0 \
+  --cost-currency EUR
 ```
 
 Backfill context memory chunks without creating LLM requests:
