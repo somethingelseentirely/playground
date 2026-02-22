@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -59,6 +59,11 @@ enum CommandMode {
     #[cfg(feature = "diagnostics")]
     #[command(about = "Open the diagnostics dashboard")]
     Diagnostics(DiagnosticsArgs),
+    #[command(about = "Estimate/backfill context memory independent of LLM requests")]
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -95,6 +100,40 @@ enum ProfileCommand {
         #[arg(value_name = "PROFILE")]
         profile: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCommand {
+    #[command(about = "Estimate pending compaction work and approximate token/cost usage")]
+    Estimate(MemoryEstimateArgs),
+    #[command(
+        about = "Backfill context memory chunks from archive/exec without creating LLM requests"
+    )]
+    Build(MemoryBuildArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct MemoryEstimateArgs {
+    #[arg(long, default_value_t = false)]
+    include_exec: bool,
+    #[arg(long)]
+    max_archive_leaves: Option<usize>,
+    #[arg(long, default_value_t = 256)]
+    sample_leaves: usize,
+    #[arg(long)]
+    input_usd_per_1m_tokens: Option<f64>,
+    #[arg(long)]
+    output_usd_per_1m_tokens: Option<f64>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct MemoryBuildArgs {
+    #[arg(long, default_value_t = false)]
+    include_exec: bool,
+    #[arg(long)]
+    max_archive_leaves: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -282,6 +321,12 @@ fn main() -> Result<()> {
                 .context("run diagnostics")?;
             Ok(())
         }
+        CommandMode::Memory { command } => {
+            let instance = default_instance_name();
+            let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
+            let config = Config::load(Some(pile_path.as_path())).context("load config")?;
+            run_memory_command(config, command)
+        }
         CommandMode::Config { command } => {
             let instance = default_instance_name();
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
@@ -326,6 +371,411 @@ fn run_llm_worker(config: Config, args: WorkerArgs) -> Result<()> {
     let poll_ms = args.poll_ms.unwrap_or(config.poll_ms);
     let worker_id = parse_worker_id(args.worker_id)?;
     llm_worker::run_llm_loop(config, worker_id, poll_ms, None)
+}
+
+#[derive(Debug, Clone)]
+struct CompactionProfileInfo {
+    model: String,
+    base_url: String,
+    chars_per_token: u64,
+    source: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct MergeSimulation {
+    merge_calls: usize,
+    merged_children_total: usize,
+    final_runs_by_level: BTreeMap<u64, usize>,
+}
+
+fn run_memory_command(config: Config, command: MemoryCommand) -> Result<()> {
+    match command {
+        MemoryCommand::Estimate(args) => run_memory_estimate(config, args),
+        MemoryCommand::Build(args) => run_memory_build(config, args),
+    }
+}
+
+fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
+    let merge_arity = config.llm_compaction_merge_arity.max(2) as usize;
+    let profile = resolve_compaction_profile_info(&config);
+
+    let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
+    repo_util::seed_metadata(&mut repo)?;
+    let result = (|| -> Result<()> {
+        let archive_catalog = load_optional_catalog(
+            &mut repo,
+            config.archive_branch_id,
+            "pull archive workspace for memory estimate",
+        )?;
+        let relations_catalog = load_optional_catalog(
+            &mut repo,
+            config.relations_branch_id,
+            "pull relations workspace for memory estimate",
+        )?;
+        let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace for memory estimate")?;
+        let catalog = ws.checkout(..).context("checkout workspace")?;
+
+        let mut core_index = CoreIndex::default();
+        core_index.apply_delta(&catalog, &catalog);
+        let index = load_context_chunks(&catalog);
+        let archive_messages = load_archive_messages(&archive_catalog);
+        let relations = load_relations_index(&mut ws, &relations_catalog)?;
+
+        let pending_archive_total = archive_messages
+            .iter()
+            .filter(|msg| !index.chunk_for_archive_message.contains_key(&msg.id))
+            .count();
+        let pending_archive = args
+            .max_archive_leaves
+            .map(|limit| pending_archive_total.min(limit))
+            .unwrap_or(pending_archive_total);
+
+        let pending_exec_total = if args.include_exec {
+            sorted_finished_command_results(&core_index)
+                .into_iter()
+                .filter(|result| !index.chunk_for_exec_result.contains_key(&result.id))
+                .count()
+        } else {
+            0
+        };
+        let pending_exec = pending_exec_total;
+
+        let new_leaves = pending_archive.saturating_add(pending_exec);
+        let sim = simulate_kary_merges(&index.root_by_level, merge_arity, new_leaves);
+
+        let (existing_chars_sum, existing_samples) =
+            sample_existing_leaf_summary_chars(&mut ws, &index, args.sample_leaves)?;
+        let (archive_chars_sum, archive_samples) = sample_pending_archive_leaf_summary_chars(
+            &mut ws,
+            archive_messages.as_slice(),
+            &index,
+            &relations,
+            args.sample_leaves,
+        )?;
+        let sample_chars_sum = existing_chars_sum.saturating_add(archive_chars_sum);
+        let sample_count = existing_samples.saturating_add(archive_samples);
+        let avg_leaf_chars = if sample_count == 0 {
+            800.0
+        } else {
+            (sample_chars_sum as f64) / (sample_count as f64)
+        };
+
+        let estimated_input_chars = (sim.merged_children_total as f64) * avg_leaf_chars;
+        let estimated_output_chars = (sim.merge_calls as f64) * avg_leaf_chars;
+        let input_tokens = (estimated_input_chars / profile.chars_per_token as f64).ceil();
+        let output_tokens = (estimated_output_chars / profile.chars_per_token as f64).ceil();
+
+        println!("memory estimate");
+        println!("  model: {} ({})", profile.model, profile.source);
+        println!("  base_url: {}", profile.base_url);
+        println!(
+            "  local_endpoint: {}",
+            if looks_local_base_url(profile.base_url.as_str()) {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!("  chars_per_token: {}", profile.chars_per_token);
+        println!("  merge_arity: {}", merge_arity);
+        println!("  pending_archive: {}", pending_archive);
+        println!("  pending_exec: {}", pending_exec);
+        println!("  leaves_to_add: {}", new_leaves);
+        println!("  estimated_merge_calls: {}", sim.merge_calls);
+        println!("  estimated_input_tokens: {}", input_tokens as u64);
+        println!("  estimated_output_tokens: {}", output_tokens as u64);
+        println!("  sampled_leaf_summaries: {}", sample_count);
+        println!("  sampled_avg_leaf_chars: {:.1}", avg_leaf_chars);
+        if let (Some(in_price), Some(out_price)) =
+            (args.input_usd_per_1m_tokens, args.output_usd_per_1m_tokens)
+        {
+            let usd =
+                (input_tokens / 1_000_000.0) * in_price + (output_tokens / 1_000_000.0) * out_price;
+            println!("  estimated_usd: {:.4}", usd);
+        } else {
+            println!(
+                "  estimated_usd: n/a (pass --input-usd-per-1m-tokens and --output-usd-per-1m-tokens)"
+            );
+        }
+        println!("  frontier_after_backfill:");
+        for (level, count) in sim.final_runs_by_level {
+            println!("    L{level}: {count} run(s)");
+        }
+
+        Ok(())
+    })();
+
+    if let Err(err) = close_repo(repo) {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+
+    result
+}
+
+fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
+    let merge_arity = config.llm_compaction_merge_arity.max(2) as usize;
+    let profile = resolve_compaction_profile_info(&config);
+
+    let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
+    repo_util::seed_metadata(&mut repo)?;
+    let result = (|| -> Result<()> {
+        let archive_catalog = load_optional_catalog(
+            &mut repo,
+            config.archive_branch_id,
+            "pull archive workspace for memory build",
+        )?;
+        let relations_catalog = load_optional_catalog(
+            &mut repo,
+            config.relations_branch_id,
+            "pull relations workspace for memory build",
+        )?;
+        let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace for memory build")?;
+        let catalog = ws.checkout(..).context("checkout workspace")?;
+        let mut core_index = CoreIndex::default();
+        core_index.apply_delta(&catalog, &catalog);
+        let mut index = load_context_chunks(&catalog);
+        let archive_messages = load_archive_messages(&archive_catalog);
+        let relations = load_relations_index(&mut ws, &relations_catalog)?;
+
+        println!("memory build");
+        println!("  model: {} ({})", profile.model, profile.source);
+        println!("  base_url: {}", profile.base_url);
+        println!(
+            "  local_endpoint: {}",
+            if looks_local_base_url(profile.base_url.as_str()) {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!("  merge_arity: {}", merge_arity);
+        if args.dry_run {
+            println!("  mode: dry-run (no writes)");
+            return Ok(());
+        }
+
+        let semantic_compactor = SemanticCompactor::new(&config)?;
+        let mut change = TribleSet::new();
+        let mut stats = CompactionRunStats::default();
+        let archive_added = ingest_archive_context_chunks(
+            &mut ws,
+            &mut index,
+            &mut change,
+            archive_messages.as_slice(),
+            &relations,
+            None,
+            args.max_archive_leaves,
+            merge_arity,
+            &semantic_compactor,
+            &mut stats,
+        )?;
+        let exec_added = if args.include_exec {
+            let results = sorted_finished_command_results(&core_index);
+            ingest_exec_context_chunks(
+                &mut ws,
+                &core_index,
+                &mut index,
+                &mut change,
+                results.as_slice(),
+                None,
+                merge_arity,
+                &semantic_compactor,
+                &mut stats,
+            )?
+        } else {
+            0
+        };
+
+        if change.is_empty() {
+            println!("  no pending memory chunks to backfill.");
+            return Ok(());
+        }
+
+        ws.commit(change, None, Some("memory backfill"));
+        push_workspace(&mut repo, &mut ws).context("push memory backfill")?;
+        println!("  archive_leaves_added: {}", archive_added);
+        println!("  exec_leaves_added: {}", exec_added);
+        println!("  merge_calls: {}", stats.merge_calls);
+        println!("  merged_children_total: {}", stats.merged_children_total);
+        println!(
+            "  merge_input_chars_total: {}",
+            stats.merge_input_chars_total
+        );
+        println!(
+            "  merge_output_chars_total: {}",
+            stats.merge_output_chars_total
+        );
+        Ok(())
+    })();
+
+    if let Err(err) = close_repo(repo) {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+
+    result
+}
+
+fn resolve_compaction_profile_info(config: &Config) -> CompactionProfileInfo {
+    let mut model = config.llm.model.clone();
+    let mut base_url = config.llm.base_url.clone();
+    let mut chars_per_token = config.llm.prompt_chars_per_token.max(1);
+    let mut source = "active profile".to_string();
+
+    if let Some(profile_id) = config.llm_compaction_profile_id {
+        match config::load_llm_profile(config.pile_path.as_path(), profile_id) {
+            Ok(Some((profile, name))) => {
+                model = profile.model;
+                base_url = profile.base_url;
+                chars_per_token = profile.prompt_chars_per_token.max(1);
+                source = format!("compaction profile {name}");
+            }
+            Ok(None) => {
+                eprintln!(
+                    "warning: compaction profile {profile_id:x} not found; using active profile"
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to load compaction profile {profile_id:x}: {err:#}; using active profile"
+                );
+            }
+        }
+    }
+
+    CompactionProfileInfo {
+        model,
+        base_url,
+        chars_per_token,
+        source,
+    }
+}
+
+fn looks_local_base_url(base_url: &str) -> bool {
+    let lower = base_url.to_ascii_lowercase();
+    lower.contains("localhost")
+        || lower.contains("127.0.0.1")
+        || lower.contains("::1")
+        || lower.contains("ollama")
+}
+
+fn simulate_kary_merges(
+    root_by_level: &HashMap<u64, Vec<Id>>,
+    merge_arity: usize,
+    new_leaves: usize,
+) -> MergeSimulation {
+    let k = merge_arity.max(2);
+    let mut counts: BTreeMap<u64, usize> = root_by_level
+        .iter()
+        .filter_map(|(level, runs)| {
+            if runs.is_empty() {
+                None
+            } else {
+                Some((*level, runs.len()))
+            }
+        })
+        .collect();
+    let mut sim = MergeSimulation::default();
+
+    for _ in 0..new_leaves {
+        *counts.entry(0).or_insert(0) += 1;
+        let mut level = 0u64;
+        loop {
+            let Some(count) = counts.get(&level).copied() else {
+                break;
+            };
+            if count < k {
+                break;
+            }
+            let carry_count = count / k;
+            let remainder = count % k;
+            if remainder == 0 {
+                counts.remove(&level);
+            } else {
+                counts.insert(level, remainder);
+            }
+            *counts.entry(level + 1).or_insert(0) += carry_count;
+            sim.merge_calls = sim.merge_calls.saturating_add(carry_count);
+            sim.merged_children_total = sim
+                .merged_children_total
+                .saturating_add(carry_count.saturating_mul(k));
+            level = level.saturating_add(1);
+        }
+    }
+
+    sim.final_runs_by_level = counts;
+    sim
+}
+
+fn sample_existing_leaf_summary_chars(
+    ws: &mut Workspace<Pile>,
+    index: &ContextChunkIndex,
+    sample_size: usize,
+) -> Result<(usize, usize)> {
+    let mut leaves: Vec<&ContextChunk> = index
+        .chunks
+        .values()
+        .filter(|chunk| chunk.level == 0)
+        .collect();
+    leaves.sort_by_key(|chunk| (interval_key(chunk.end_at), chunk.id));
+    leaves.reverse();
+
+    let mut total = 0usize;
+    let mut count = 0usize;
+    for chunk in leaves.into_iter().take(sample_size) {
+        let text = load_text(ws, chunk.summary).context("load existing leaf summary")?;
+        total = total.saturating_add(text.chars().count());
+        count = count.saturating_add(1);
+    }
+    Ok((total, count))
+}
+
+fn sample_pending_archive_leaf_summary_chars(
+    ws: &mut Workspace<Pile>,
+    archive_messages: &[ArchiveMessageInfo],
+    index: &ContextChunkIndex,
+    relations: &RelationsIndex,
+    sample_size: usize,
+) -> Result<(usize, usize)> {
+    let mut total = 0usize;
+    let mut count = 0usize;
+    for message in archive_messages.iter() {
+        if count >= sample_size {
+            break;
+        }
+        if index.chunk_for_archive_message.contains_key(&message.id) {
+            continue;
+        }
+
+        let author_name = load_optional_text(ws, message.author_name)?;
+        let source_author = load_optional_text(ws, message.source_author)?;
+        let source_role = load_optional_text(ws, message.source_role)?;
+        let source_message_id = load_optional_text(ws, message.source_message_id)?;
+        let conversation_id = load_optional_text(ws, message.conversation_id)?;
+        let content = load_text(ws, message.content).context("load archive message content")?;
+        let resolved_person =
+            resolve_archive_person(relations, author_name.as_deref(), source_author.as_deref());
+        let leaf_summary = format_archive_output(
+            message,
+            author_name.as_deref(),
+            source_author.as_deref(),
+            source_role.as_deref(),
+            source_message_id.as_deref(),
+            conversation_id.as_deref(),
+            content.as_str(),
+            resolved_person
+                .and_then(|person_id| relations.person_label.get(&person_id).map(|s| s.as_str())),
+            resolved_person,
+        );
+        total = total.saturating_add(leaf_summary.chars().count());
+        count = count.saturating_add(1);
+    }
+    Ok((total, count))
 }
 
 fn handle_config(pile: Option<&Path>, command: ConfigCommand) -> Result<()> {
@@ -1935,6 +2385,198 @@ struct RelationsIndex {
     person_label: HashMap<Id, String>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct CompactionRunStats {
+    archive_leaves_added: usize,
+    exec_leaves_added: usize,
+    merge_calls: usize,
+    merged_children_total: usize,
+    merge_input_chars_total: usize,
+    merge_output_chars_total: usize,
+}
+
+fn sorted_finished_command_results(core_index: &CoreIndex) -> Vec<CommandResultInfo> {
+    let mut results: Vec<CommandResultInfo> =
+        core_index.command_results.values().cloned().collect();
+    results.sort_by_key(|result| result.finished_at.map(interval_key).unwrap_or(i128::MIN));
+    results.retain(|result| result.finished_at.is_some());
+    results
+}
+
+fn ingest_archive_context_chunks(
+    ws: &mut Workspace<Pile>,
+    index: &mut ContextChunkIndex,
+    change: &mut TribleSet,
+    archive_messages: &[ArchiveMessageInfo],
+    relations: &RelationsIndex,
+    max_created_at_key: Option<i128>,
+    max_new: Option<usize>,
+    merge_arity: usize,
+    semantic_compactor: &SemanticCompactor,
+    stats: &mut CompactionRunStats,
+) -> Result<usize> {
+    let mut added = 0usize;
+    for message in archive_messages {
+        if max_new.is_some_and(|limit| added >= limit) {
+            break;
+        }
+        if max_created_at_key.is_some_and(|max_key| interval_key(message.created_at) > max_key) {
+            continue;
+        }
+        if index.chunk_for_archive_message.contains_key(&message.id) {
+            continue;
+        }
+
+        let author_name = load_optional_text(ws, message.author_name)?;
+        let source_author = load_optional_text(ws, message.source_author)?;
+        let source_role = load_optional_text(ws, message.source_role)?;
+        let source_message_id = load_optional_text(ws, message.source_message_id)?;
+        let conversation_id = load_optional_text(ws, message.conversation_id)?;
+        let content = load_text(ws, message.content).context("load archive message content")?;
+        let resolved_person =
+            resolve_archive_person(relations, author_name.as_deref(), source_author.as_deref());
+        let leaf_summary = format_archive_output(
+            message,
+            author_name.as_deref(),
+            source_author.as_deref(),
+            source_role.as_deref(),
+            source_message_id.as_deref(),
+            conversation_id.as_deref(),
+            content.as_str(),
+            resolved_person
+                .and_then(|person_id| relations.person_label.get(&person_id).map(|s| s.as_str())),
+            resolved_person,
+        );
+        let leaf_summary_handle = ws.put(leaf_summary);
+        let now = epoch_interval(now_epoch());
+        let chunk_id = ufoid();
+
+        *change += entity! { &chunk_id @
+            playground_context::kind: playground_context::kind_chunk,
+            playground_context::level: 0u64,
+            playground_context::summary: leaf_summary_handle,
+            playground_context::created_at: now,
+            playground_context::start_at: message.created_at,
+            playground_context::end_at: message.created_at,
+            playground_context::about_archive_message: message.id,
+            playground_context::archive_author: message.author_id,
+            playground_context::archive_thread_root: message.thread_root_id,
+        };
+        if let Some(person_id) = resolved_person {
+            *change += entity! { &chunk_id @ playground_context::archive_person: person_id };
+        }
+        if let Some(conversation_id) = message.conversation_id {
+            *change +=
+                entity! { &chunk_id @ playground_context::archive_conversation: conversation_id };
+        }
+        if let Some(source_format) = message.source_format.as_deref() {
+            *change +=
+                entity! { &chunk_id @ playground_context::archive_source_format: source_format };
+        }
+
+        let chunk = ContextChunk {
+            id: *chunk_id,
+            level: 0,
+            summary: leaf_summary_handle,
+            start_at: message.created_at,
+            end_at: message.created_at,
+            children: Vec::new(),
+            about_exec_result: None,
+            about_archive_message: Some(message.id),
+            archive_author: Some(message.author_id),
+            archive_person: resolved_person,
+            archive_thread_root: Some(message.thread_root_id),
+            archive_conversation: message.conversation_id,
+            archive_source_format: message.source_format.clone(),
+        };
+        index.chunk_for_archive_message.insert(message.id, chunk.id);
+        insert_chunk_with_carry(
+            ws,
+            index,
+            change,
+            chunk,
+            merge_arity,
+            semantic_compactor,
+            stats,
+        )?;
+        stats.archive_leaves_added = stats.archive_leaves_added.saturating_add(1);
+        added = added.saturating_add(1);
+    }
+    Ok(added)
+}
+
+fn ingest_exec_context_chunks(
+    ws: &mut Workspace<Pile>,
+    core_index: &CoreIndex,
+    index: &mut ContextChunkIndex,
+    change: &mut TribleSet,
+    exec_results: &[CommandResultInfo],
+    max_new: Option<usize>,
+    merge_arity: usize,
+    semantic_compactor: &SemanticCompactor,
+    stats: &mut CompactionRunStats,
+) -> Result<usize> {
+    let mut added = 0usize;
+    for result in exec_results {
+        if max_new.is_some_and(|limit| added >= limit) {
+            break;
+        }
+        if index.chunk_for_exec_result.contains_key(&result.id) {
+            continue;
+        }
+        let finished_at = result
+            .finished_at
+            .context("command result missing finished_at")?;
+        let command = load_command_for_result(ws, core_index, result)?;
+        let reasoning_text = load_reasoning_for_exec_result(ws, core_index, result)?;
+        let exec_output = load_exec_result(ws, result.clone())?;
+        let leaf_summary =
+            format_exec_output(command.as_str(), exec_output, reasoning_text.as_deref());
+        let leaf_summary_handle = ws.put(leaf_summary);
+        let now = epoch_interval(now_epoch());
+        let chunk_id = ufoid();
+
+        *change += entity! { &chunk_id @
+            playground_context::kind: playground_context::kind_chunk,
+            playground_context::level: 0u64,
+            playground_context::summary: leaf_summary_handle,
+            playground_context::created_at: now,
+            playground_context::start_at: finished_at,
+            playground_context::end_at: finished_at,
+            playground_context::about_exec_result: result.id,
+        };
+
+        let chunk = ContextChunk {
+            id: *chunk_id,
+            level: 0,
+            summary: leaf_summary_handle,
+            start_at: finished_at,
+            end_at: finished_at,
+            children: Vec::new(),
+            about_exec_result: Some(result.id),
+            about_archive_message: None,
+            archive_author: None,
+            archive_person: None,
+            archive_thread_root: None,
+            archive_conversation: None,
+            archive_source_format: None,
+        };
+        index.chunk_for_exec_result.insert(result.id, chunk.id);
+        insert_chunk_with_carry(
+            ws,
+            index,
+            change,
+            chunk,
+            merge_arity,
+            semantic_compactor,
+            stats,
+        )?;
+        stats.exec_leaves_added = stats.exec_leaves_added.saturating_add(1);
+        added = added.saturating_add(1);
+    }
+    Ok(added)
+}
+
 fn prompt_for_exec_result_with_history(
     ws: &mut Workspace<Pile>,
     core_index: &CoreIndex,
@@ -1972,12 +2614,10 @@ fn build_prompt_messages_with_compaction(
     let mut index = load_context_chunks(catalog);
     let body_budget_chars = prompt_body_budget_chars(config);
     let semantic_compactor = SemanticCompactor::new(config)?;
+    let merge_arity = config.llm_compaction_merge_arity as usize;
 
     // Sort all command results in chronological order (oldest -> newest).
-    let mut results: Vec<CommandResultInfo> =
-        core_index.command_results.values().cloned().collect();
-    results.sort_by_key(|result| result.finished_at.map(interval_key).unwrap_or(i128::MIN));
-    results.retain(|result| result.finished_at.is_some());
+    let results = sorted_finished_command_results(core_index);
 
     let Some(current_pos) = results
         .iter()
@@ -1994,145 +2634,30 @@ fn build_prompt_messages_with_compaction(
     let archive_messages = load_archive_messages(archive_catalog);
 
     let mut compact_change = TribleSet::new();
-
-    // Archive leaves are always represented as memory chunks (never as raw shell turns).
-    for message in archive_messages
-        .iter()
-        .filter(|message| interval_key(message.created_at) <= current_finished_key)
-    {
-        if index.chunk_for_archive_message.contains_key(&message.id) {
-            continue;
-        }
-        let author_name = load_optional_text(ws, message.author_name)?;
-        let source_author = load_optional_text(ws, message.source_author)?;
-        let source_role = load_optional_text(ws, message.source_role)?;
-        let source_message_id = load_optional_text(ws, message.source_message_id)?;
-        let conversation_id = load_optional_text(ws, message.conversation_id)?;
-        let content = load_text(ws, message.content).context("load archive message content")?;
-        let resolved_person =
-            resolve_archive_person(&relations, author_name.as_deref(), source_author.as_deref());
-        let leaf_summary = format_archive_output(
-            message,
-            author_name.as_deref(),
-            source_author.as_deref(),
-            source_role.as_deref(),
-            source_message_id.as_deref(),
-            conversation_id.as_deref(),
-            content.as_str(),
-            resolved_person
-                .and_then(|person_id| relations.person_label.get(&person_id).map(|s| s.as_str())),
-            resolved_person,
-        );
-        let leaf_summary_handle = ws.put(leaf_summary);
-        let now = epoch_interval(now_epoch());
-        let chunk_id = ufoid();
-
-        compact_change += entity! { &chunk_id @
-            playground_context::kind: playground_context::kind_chunk,
-            playground_context::level: 0u64,
-            playground_context::summary: leaf_summary_handle,
-            playground_context::created_at: now,
-            playground_context::start_at: message.created_at,
-            playground_context::end_at: message.created_at,
-            playground_context::about_archive_message: message.id,
-            playground_context::archive_author: message.author_id,
-            playground_context::archive_thread_root: message.thread_root_id,
-        };
-        if let Some(person_id) = resolved_person {
-            compact_change += entity! { &chunk_id @
-                playground_context::archive_person: person_id,
-            };
-        }
-        if let Some(conversation_id) = message.conversation_id {
-            compact_change += entity! { &chunk_id @
-                playground_context::archive_conversation: conversation_id,
-            };
-        }
-        if let Some(source_format) = message.source_format.as_deref() {
-            compact_change += entity! { &chunk_id @
-                playground_context::archive_source_format: source_format,
-            };
-        }
-
-        let chunk = ContextChunk {
-            id: *chunk_id,
-            level: 0,
-            summary: leaf_summary_handle,
-            start_at: message.created_at,
-            end_at: message.created_at,
-            children: Vec::new(),
-            about_exec_result: None,
-            about_archive_message: Some(message.id),
-            archive_author: Some(message.author_id),
-            archive_person: resolved_person,
-            archive_thread_root: Some(message.thread_root_id),
-            archive_conversation: message.conversation_id,
-            archive_source_format: message.source_format.clone(),
-        };
-        index.chunk_for_archive_message.insert(message.id, chunk.id);
-        insert_chunk_with_carry(
-            ws,
-            &mut index,
-            &mut compact_change,
-            chunk,
-            config.llm_compaction_merge_arity as usize,
-            &semantic_compactor,
-        )?;
-    }
-
-    // Exec leaves are represented as memory chunks too; prompt selection is a stateless cover
-    // over the chunk tree (not a separate "recent raw turns" bucket).
-    for result in &results {
-        if index.chunk_for_exec_result.contains_key(&result.id) {
-            continue;
-        }
-        let finished_at = result
-            .finished_at
-            .context("command result missing finished_at")?;
-        let command = load_command_for_result(ws, core_index, result)?;
-        let reasoning_text = load_reasoning_for_exec_result(ws, core_index, result)?;
-        let exec_output = load_exec_result(ws, result.clone())?;
-        let leaf_summary =
-            format_exec_output(command.as_str(), exec_output, reasoning_text.as_deref());
-        let leaf_summary_handle = ws.put(leaf_summary);
-        let now = epoch_interval(now_epoch());
-        let chunk_id = ufoid();
-
-        compact_change += entity! { &chunk_id @
-            playground_context::kind: playground_context::kind_chunk,
-            playground_context::level: 0u64,
-            playground_context::summary: leaf_summary_handle,
-            playground_context::created_at: now,
-            playground_context::start_at: finished_at,
-            playground_context::end_at: finished_at,
-            playground_context::about_exec_result: result.id,
-        };
-
-        let chunk = ContextChunk {
-            id: *chunk_id,
-            level: 0,
-            summary: leaf_summary_handle,
-            start_at: finished_at,
-            end_at: finished_at,
-            children: Vec::new(),
-            about_exec_result: Some(result.id),
-            about_archive_message: None,
-            archive_author: None,
-            archive_person: None,
-            archive_thread_root: None,
-            archive_conversation: None,
-            archive_source_format: None,
-        };
-        index.chunk_for_exec_result.insert(result.id, chunk.id);
-        insert_chunk_with_carry(
-            ws,
-            &mut index,
-            &mut compact_change,
-            chunk,
-            config.llm_compaction_merge_arity as usize,
-            &semantic_compactor,
-        )?;
-    }
+    let mut compaction_stats = CompactionRunStats::default();
+    ingest_archive_context_chunks(
+        ws,
+        &mut index,
+        &mut compact_change,
+        archive_messages.as_slice(),
+        &relations,
+        Some(current_finished_key),
+        None,
+        merge_arity,
+        &semantic_compactor,
+        &mut compaction_stats,
+    )?;
+    ingest_exec_context_chunks(
+        ws,
+        core_index,
+        &mut index,
+        &mut compact_change,
+        results.as_slice(),
+        None,
+        merge_arity,
+        &semantic_compactor,
+        &mut compaction_stats,
+    )?;
 
     let (messages, _used_chars) = build_memory_cover_messages(ws, &index, body_budget_chars)?;
     Ok((messages, compact_change))
@@ -3011,6 +3536,7 @@ fn insert_chunk_with_carry(
     carry: ContextChunk,
     merge_arity: usize,
     semantic: &SemanticCompactor,
+    stats: &mut CompactionRunStats,
 ) -> Result<()> {
     let merge_arity = merge_arity.max(2);
     let mut carry = carry;
@@ -3055,9 +3581,19 @@ fn insert_chunk_with_carry(
         for child in &children {
             inputs.push(load_text(ws, child.summary).context("load child chunk summary")?);
         }
+        let input_chars = inputs
+            .iter()
+            .map(|text| text.chars().count())
+            .fold(0usize, usize::saturating_add);
         let merged_text = semantic
             .merge(inputs.as_slice())
             .context("semantic merge context chunks")?;
+        let output_chars = merged_text.chars().count();
+        stats.merge_calls = stats.merge_calls.saturating_add(1);
+        stats.merged_children_total = stats.merged_children_total.saturating_add(children.len());
+        stats.merge_input_chars_total = stats.merge_input_chars_total.saturating_add(input_chars);
+        stats.merge_output_chars_total =
+            stats.merge_output_chars_total.saturating_add(output_chars);
         let merged_handle = ws.put(merged_text);
 
         let now = epoch_interval(now_epoch());

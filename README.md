@@ -65,6 +65,42 @@ Run the exec worker only (VM/split-host setups):
 cargo run --manifest-path playground/Cargo.toml --bin playground -- --pile /path/to/pile/self.pile exec
 ```
 
+## Memory backfill (independent of requests)
+
+Estimate pending compaction work (archive by default):
+
+```bash
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory estimate
+```
+
+Include pending exec leaves in the estimate:
+
+```bash
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory estimate --include-exec
+```
+
+Optionally provide pricing to get a rough USD estimate:
+
+```bash
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile \
+  memory estimate \
+  --input-usd-per-1m-tokens 2.0 \
+  --output-usd-per-1m-tokens 6.0
+```
+
+Backfill context memory chunks without creating LLM requests:
+
+```bash
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory build
+```
+
+Cap archive ingestion per run (useful for staged backfills):
+
+```bash
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile \
+  memory build --max-archive-leaves 500
+```
+
 ## Config in the pile
 
 Playground stores its configuration inside the pile. Use the `config` subcommand to inspect or update it:
