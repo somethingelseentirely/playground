@@ -13,7 +13,6 @@ use reqwest::blocking::Client;
 use triblespace::core::blob::Bytes;
 use triblespace::core::blob::schemas::UnknownBlob;
 use triblespace::core::metadata;
-use triblespace::core::query::ContainsConstraint;
 use triblespace::core::repo::content as commit_content;
 use triblespace::core::repo::parent as commit_parent;
 use triblespace::core::repo::pile::Pile;
@@ -2623,8 +2622,8 @@ fn load_archive_messages_incremental(
     // Process oldest payloads first so progress and growth are easier to read in checkpoints.
     payload_commits.reverse();
 
-    let mut projection = ArchiveMessageProjection::default();
     let mut projection_catalog = TribleSet::new();
+    let mut projection_counts = ArchiveProjectionCounts::default();
     let total_commits = payload_commits.len();
     let checkout_started = Instant::now();
     memory_status(format!(
@@ -2641,9 +2640,6 @@ fn load_archive_messages_incremental(
             ));
         }
 
-        let message_count_before = projection.message_facts.len();
-        let reply_links_before = projection.reply_to.len();
-        let message_batch_links_before = projection.batch_by_message.len();
         let one = [commit];
         let delta = ws
             .checkout(&one[..])
@@ -2651,29 +2647,30 @@ fn load_archive_messages_incremental(
         let commit_tribles = delta.len();
         let projection_delta = filter_archive_projection_delta(&delta);
         if !projection_delta.is_empty() {
-            projection_catalog += projection_delta.clone();
-            projection.apply_delta(&projection_catalog, &projection_delta);
+            projection_catalog += projection_delta;
         }
         if is_checkpoint {
-            let new_message_facts = projection
+            let current_counts = archive_projection_counts(&projection_catalog);
+            let new_message_facts = current_counts
                 .message_facts
-                .len()
-                .saturating_sub(message_count_before);
-            let new_reply_links = projection.reply_to.len().saturating_sub(reply_links_before);
-            let new_message_batch_links = projection
-                .batch_by_message
-                .len()
-                .saturating_sub(message_batch_links_before);
+                .saturating_sub(projection_counts.message_facts);
+            let new_reply_links = current_counts
+                .reply_links
+                .saturating_sub(projection_counts.reply_links);
+            let new_message_batch_links = current_counts
+                .import_links
+                .saturating_sub(projection_counts.import_links);
             memory_status(format!(
                 "{label}: scanned commit {commit_num}/{total_commits} ({} tribles, message facts {} (+{}), reply links {} (+{}), import links {} (+{}))",
                 commit_tribles,
-                projection.message_facts.len(),
+                current_counts.message_facts,
                 new_message_facts,
-                projection.reply_to.len(),
+                current_counts.reply_links,
                 new_reply_links,
-                projection.batch_by_message.len(),
+                current_counts.import_links,
                 new_message_batch_links
             ));
+            projection_counts = current_counts;
         }
     }
     memory_status_timed(&format!("{label}: payload scan complete"), checkout_started);
@@ -2685,7 +2682,7 @@ fn load_archive_messages_incremental(
             coverage.strict_imported_total, coverage.imported_message_total
         ));
     }
-    let messages = projection.into_messages()?;
+    let messages = load_archive_messages(&projection_catalog)?;
     Ok(ArchiveLoadResult { messages, coverage })
 }
 
@@ -3375,19 +3372,6 @@ fn load_reasoning_for_exec_result(
     Ok(Some(reasoning_text))
 }
 
-#[derive(Default)]
-struct ArchiveMessageProjection {
-    reply_to: HashMap<Id, Id>,
-    author_name_by_author: HashMap<Id, Value<Handle<Blake3, LongString>>>,
-    batch_by_message: HashMap<Id, Id>,
-    source_format_by_batch: HashMap<Id, String>,
-    conversation_by_batch: HashMap<Id, Value<Handle<Blake3, LongString>>>,
-    source_message_id_by_message: HashMap<Id, Value<Handle<Blake3, LongString>>>,
-    source_author_by_message: HashMap<Id, Value<Handle<Blake3, LongString>>>,
-    source_role_by_message: HashMap<Id, Value<Handle<Blake3, LongString>>>,
-    message_facts: HashMap<Id, (Id, Value<Handle<Blake3, LongString>>, Value<NsTAIInterval>)>,
-}
-
 fn archive_projection_attr_ids() -> [Id; 12] {
     [
         playground_archive::kind.id(),
@@ -3416,307 +3400,209 @@ fn filter_archive_projection_delta(delta: &TribleSet) -> TribleSet {
     filtered
 }
 
-impl ArchiveMessageProjection {
-    fn apply_delta(&mut self, updated: &TribleSet, delta: &TribleSet) {
-        let mut touched_messages = HashSet::new();
-        let mut touched_authors = HashSet::new();
-        let mut touched_batches = HashSet::new();
+#[derive(Debug, Clone, Copy, Default)]
+struct ArchiveProjectionCounts {
+    message_facts: usize,
+    reply_links: usize,
+    import_links: usize,
+}
 
-        for (message_id,) in find!(
-            (message_id: Id),
-            pattern_changes!(updated, delta, [{
-                ?message_id @
-                    playground_archive::kind: playground_archive::kind_message,
-                    playground_archive::author: _?author,
-                    playground_archive::content: _?content,
-                    playground_archive::created_at: _?created_at,
-            }])
-        ) {
-            touched_messages.insert(message_id);
-        }
+#[derive(Debug, Clone)]
+struct StrictArchiveMessageRow {
+    message_id: Id,
+    author_id: Id,
+    content: Value<Handle<Blake3, LongString>>,
+    created_at: Value<NsTAIInterval>,
+    batch_id: Id,
+    source_message_id: Value<Handle<Blake3, LongString>>,
+    source_author: Value<Handle<Blake3, LongString>>,
+    source_role: Value<Handle<Blake3, LongString>>,
+}
 
-        for (message_id,) in find!(
-            (message_id: Id),
-            pattern_changes!(updated, delta, [{
-                ?message_id @ playground_archive::reply_to: _?reply_to,
-            }])
-        ) {
-            touched_messages.insert(message_id);
-        }
+fn archive_projection_counts(catalog: &TribleSet) -> ArchiveProjectionCounts {
+    let message_facts = find!(
+        (message_id: Id),
+        pattern!(catalog, [{
+            ?message_id @
+                playground_archive::kind: playground_archive::kind_message,
+                playground_archive::author: _?author_id,
+                playground_archive::content: _?content,
+                playground_archive::created_at: _?created_at,
+        }])
+    )
+    .collect::<HashSet<_>>()
+    .len();
 
-        for (message_id, batch_id) in find!(
-            (message_id: Id, batch_id: Id),
-            pattern_changes!(updated, delta, [{
-                ?message_id @ playground_archive_import::batch: ?batch_id,
-            }])
-        ) {
-            touched_messages.insert(message_id);
-            touched_batches.insert(batch_id);
-        }
+    let reply_links = find!(
+        (message_id: Id),
+        pattern!(catalog, [{
+            ?message_id @ playground_archive::reply_to: _?parent_id,
+        }])
+    )
+    .collect::<HashSet<_>>()
+    .len();
 
-        for (message_id,) in find!(
-            (message_id: Id),
-            pattern_changes!(updated, delta, [{
-                ?message_id @ playground_archive_import::source_message_id: _?source_message_id,
-            }])
-        ) {
-            touched_messages.insert(message_id);
-        }
+    let import_links = find!(
+        (message_id: Id),
+        pattern!(catalog, [{
+            ?message_id @ playground_archive_import::batch: _?batch_id,
+        }])
+    )
+    .collect::<HashSet<_>>()
+    .len();
 
-        for (message_id,) in find!(
-            (message_id: Id),
-            pattern_changes!(updated, delta, [{
-                ?message_id @ playground_archive_import::source_author: _?source_author,
-            }])
-        ) {
-            touched_messages.insert(message_id);
-        }
-
-        for (message_id,) in find!(
-            (message_id: Id),
-            pattern_changes!(updated, delta, [{
-                ?message_id @ playground_archive_import::source_role: _?source_role,
-            }])
-        ) {
-            touched_messages.insert(message_id);
-        }
-
-        for (author_id,) in find!(
-            (author_id: Id),
-            pattern_changes!(updated, delta, [{
-                ?author_id @ playground_archive::author_name: _?author_name,
-            }])
-        ) {
-            touched_authors.insert(author_id);
-        }
-
-        for (batch_id,) in find!(
-            (batch_id: Id),
-            pattern_changes!(updated, delta, [{
-                ?batch_id @ playground_archive_import::source_format: _?source_format,
-            }])
-        ) {
-            touched_batches.insert(batch_id);
-        }
-
-        for (batch_id,) in find!(
-            (batch_id: Id),
-            pattern_changes!(updated, delta, [{
-                ?batch_id @ playground_archive_import::source_conversation_id: _?conversation_id,
-            }])
-        ) {
-            touched_batches.insert(batch_id);
-        }
-
-        if !touched_authors.is_empty() {
-            for (message_id, _author_id) in find!(
-                (message_id: Id, _author_id: Id),
-                and!(
-                    (&touched_authors).has(_author_id),
-                    pattern!(updated, [{
-                        ?message_id @
-                            playground_archive::kind: playground_archive::kind_message,
-                            playground_archive::author: ?_author_id,
-                    }])
-                )
-            ) {
-                touched_messages.insert(message_id);
-            }
-        }
-
-        if !touched_batches.is_empty() {
-            for (message_id, _batch_id) in find!(
-                (message_id: Id, _batch_id: Id),
-                and!(
-                    (&touched_batches).has(_batch_id),
-                    pattern!(updated, [{
-                        ?message_id @ playground_archive_import::batch: ?_batch_id,
-                    }])
-                )
-            ) {
-                touched_messages.insert(message_id);
-            }
-        }
-
-        if !touched_authors.is_empty() {
-            for (author_id, author_name) in find!(
-                (author_id: Id, author_name: Value<Handle<Blake3, LongString>>),
-                and!(
-                    (&touched_authors).has(author_id),
-                    pattern!(updated, [{
-                        ?author_id @ playground_archive::author_name: ?author_name,
-                    }])
-                )
-            ) {
-                self.author_name_by_author.insert(author_id, author_name);
-            }
-        }
-
-        if !touched_batches.is_empty() {
-            for (batch_id, source_format) in find!(
-                (batch_id: Id, source_format: String),
-                and!(
-                    (&touched_batches).has(batch_id),
-                    pattern!(updated, [{
-                        ?batch_id @ playground_archive_import::source_format: ?source_format,
-                    }])
-                )
-            ) {
-                self.source_format_by_batch.insert(batch_id, source_format);
-            }
-
-            for (batch_id, conversation_id) in find!(
-                (batch_id: Id, conversation_id: Value<Handle<Blake3, LongString>>),
-                and!(
-                    (&touched_batches).has(batch_id),
-                    pattern!(updated, [{
-                        ?batch_id @ playground_archive_import::source_conversation_id: ?conversation_id,
-                    }])
-                )
-            ) {
-                self.conversation_by_batch.insert(batch_id, conversation_id);
-            }
-        }
-
-        if touched_messages.is_empty() {
-            return;
-        }
-
-        for (message_id, parent_id) in find!(
-            (message_id: Id, parent_id: Id),
-            and!(
-                (&touched_messages).has(message_id),
-                pattern!(updated, [{
-                    ?message_id @ playground_archive::reply_to: ?parent_id,
-                }])
-            )
-        ) {
-            self.reply_to.insert(message_id, parent_id);
-        }
-
-        for (message_id, batch_id) in find!(
-            (message_id: Id, batch_id: Id),
-            and!(
-                (&touched_messages).has(message_id),
-                pattern!(updated, [{
-                    ?message_id @ playground_archive_import::batch: ?batch_id,
-                }])
-            )
-        ) {
-            self.batch_by_message.insert(message_id, batch_id);
-        }
-
-        for (message_id, source_message_id) in find!(
-            (message_id: Id, source_message_id: Value<Handle<Blake3, LongString>>),
-            and!(
-                (&touched_messages).has(message_id),
-                pattern!(updated, [{
-                    ?message_id @ playground_archive_import::source_message_id: ?source_message_id,
-                }])
-            )
-        ) {
-            self.source_message_id_by_message
-                .insert(message_id, source_message_id);
-        }
-
-        for (message_id, source_author) in find!(
-            (message_id: Id, source_author: Value<Handle<Blake3, LongString>>),
-            and!(
-                (&touched_messages).has(message_id),
-                pattern!(updated, [{
-                    ?message_id @ playground_archive_import::source_author: ?source_author,
-                }])
-            )
-        ) {
-            self.source_author_by_message
-                .insert(message_id, source_author);
-        }
-
-        for (message_id, source_role) in find!(
-            (message_id: Id, source_role: Value<Handle<Blake3, LongString>>),
-            and!(
-                (&touched_messages).has(message_id),
-                pattern!(updated, [{
-                    ?message_id @ playground_archive_import::source_role: ?source_role,
-                }])
-            )
-        ) {
-            self.source_role_by_message.insert(message_id, source_role);
-        }
-
-        for (message_id, author_id, content, created_at) in find!(
-            (
-                message_id: Id,
-                author_id: Id,
-                content: Value<Handle<Blake3, LongString>>,
-                created_at: Value<NsTAIInterval>
-            ),
-            and!(
-                (&touched_messages).has(message_id),
-                pattern!(updated, [{
-                    ?message_id @
-                        playground_archive::kind: playground_archive::kind_message,
-                        playground_archive::author: ?author_id,
-                        playground_archive::content: ?content,
-                        playground_archive::created_at: ?created_at,
-                }])
-            )
-        ) {
-            self.message_facts
-                .insert(message_id, (author_id, content, created_at));
-        }
-    }
-
-    fn into_messages(self) -> Result<Vec<ArchiveMessageInfo>> {
-        let mut messages = Vec::with_capacity(self.message_facts.len());
-        for (message_id, (author_id, content, created_at)) in self.message_facts {
-            let thread_root_id = archive_thread_root(message_id, &self.reply_to);
-            let batch_id = self.batch_by_message.get(&message_id).copied();
-            let conversation_id =
-                batch_id.and_then(|id| self.conversation_by_batch.get(&id).copied());
-            let source_format =
-                batch_id.and_then(|id| self.source_format_by_batch.get(&id).cloned());
-            let source_message_id = self
-                .source_message_id_by_message
-                .get(&message_id)
-                .copied()
-                .ok_or_else(|| {
-                    anyhow!("archive message {message_id:x} missing source_message_id")
-                })?;
-            let source_author = self
-                .source_author_by_message
-                .get(&message_id)
-                .copied()
-                .ok_or_else(|| anyhow!("archive message {message_id:x} missing source_author"))?;
-            let source_role = self
-                .source_role_by_message
-                .get(&message_id)
-                .copied()
-                .ok_or_else(|| anyhow!("archive message {message_id:x} missing source_role"))?;
-            messages.push(ArchiveMessageInfo {
-                id: message_id,
-                author_id,
-                author_name: self.author_name_by_author.get(&author_id).copied(),
-                content,
-                created_at,
-                thread_root_id,
-                conversation_id,
-                source_format,
-                source_message_id,
-                source_author,
-                source_role,
-            });
-        }
-        messages.sort_by_key(|message| (interval_key(message.created_at), message.id));
-        Ok(messages)
+    ArchiveProjectionCounts {
+        message_facts,
+        reply_links,
+        import_links,
     }
 }
 
 fn load_archive_messages(catalog: &TribleSet) -> Result<Vec<ArchiveMessageInfo>> {
-    let projection_delta = filter_archive_projection_delta(catalog);
-    let mut projection = ArchiveMessageProjection::default();
-    projection.apply_delta(&projection_delta, &projection_delta);
-    projection.into_messages()
+    let catalog = filter_archive_projection_delta(catalog);
+    let mut reply_to = HashMap::new();
+    for (message_id, parent_id) in find!(
+        (message_id: Id, parent_id: Id),
+        pattern!(&catalog, [{
+            ?message_id @ playground_archive::reply_to: ?parent_id,
+        }])
+    ) {
+        reply_to
+            .entry(message_id)
+            .and_modify(|current: &mut Id| {
+                let current_key: [u8; 16] = (*current).into();
+                let next_key: [u8; 16] = parent_id.into();
+                if next_key < current_key {
+                    *current = parent_id;
+                }
+            })
+            .or_insert(parent_id);
+    }
+
+    let mut author_name_by_author = HashMap::new();
+    for (author_id, author_name) in find!(
+        (author_id: Id, author_name: Value<Handle<Blake3, LongString>>),
+        pattern!(&catalog, [{
+            ?author_id @ playground_archive::author_name: ?author_name,
+        }])
+    ) {
+        author_name_by_author.entry(author_id).or_insert(author_name);
+    }
+
+    let mut source_format_by_batch = HashMap::new();
+    for (batch_id, source_format) in find!(
+        (batch_id: Id, source_format: String),
+        pattern!(&catalog, [{
+            ?batch_id @ playground_archive_import::source_format: ?source_format,
+        }])
+    ) {
+        source_format_by_batch
+            .entry(batch_id)
+            .or_insert(source_format);
+    }
+
+    let mut conversation_by_batch = HashMap::new();
+    for (batch_id, conversation_id) in find!(
+        (batch_id: Id, conversation_id: Value<Handle<Blake3, LongString>>),
+        pattern!(&catalog, [{
+            ?batch_id @ playground_archive_import::source_conversation_id: ?conversation_id,
+        }])
+    ) {
+        conversation_by_batch
+            .entry(batch_id)
+            .or_insert(conversation_id);
+    }
+
+    let mut strict_rows: Vec<StrictArchiveMessageRow> = find!(
+        (
+            message_id: Id,
+            author_id: Id,
+            content: Value<Handle<Blake3, LongString>>,
+            created_at: Value<NsTAIInterval>,
+            batch_id: Id,
+            source_message_id: Value<Handle<Blake3, LongString>>,
+            source_author: Value<Handle<Blake3, LongString>>,
+            source_role: Value<Handle<Blake3, LongString>>
+        ),
+        pattern!(&catalog, [{
+            ?message_id @
+                playground_archive::kind: playground_archive::kind_message,
+                playground_archive::author: ?author_id,
+                playground_archive::content: ?content,
+                playground_archive::created_at: ?created_at,
+                playground_archive_import::batch: ?batch_id,
+                playground_archive_import::source_message_id: ?source_message_id,
+                playground_archive_import::source_author: ?source_author,
+                playground_archive_import::source_role: ?source_role,
+        }])
+    )
+    .map(
+        |(
+            message_id,
+            author_id,
+            content,
+            created_at,
+            batch_id,
+            source_message_id,
+            source_author,
+            source_role,
+        )| StrictArchiveMessageRow {
+            message_id,
+            author_id,
+            content,
+            created_at,
+            batch_id,
+            source_message_id,
+            source_author,
+            source_role,
+        },
+    )
+    .collect();
+
+    strict_rows.sort_by_key(|row| {
+        let message_sort_key: [u8; 16] = row.message_id.into();
+        let batch_sort_key: [u8; 16] = row.batch_id.into();
+        (message_sort_key, batch_sort_key)
+    });
+
+    let mut by_message = HashMap::<Id, StrictArchiveMessageRow>::new();
+    for row in strict_rows {
+        match by_message.entry(row.message_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(row);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get();
+                let existing_batch_key: [u8; 16] = existing.batch_id.into();
+                let row_batch_key: [u8; 16] = row.batch_id.into();
+                if row_batch_key < existing_batch_key {
+                    entry.insert(row);
+                }
+            }
+        }
+    }
+
+    let mut messages = Vec::with_capacity(by_message.len());
+    for (message_id, row) in by_message {
+        let thread_root_id = archive_thread_root(message_id, &reply_to);
+        let conversation_id = conversation_by_batch.get(&row.batch_id).copied();
+        let source_format = source_format_by_batch.get(&row.batch_id).cloned();
+        messages.push(ArchiveMessageInfo {
+            id: message_id,
+            author_id: row.author_id,
+            author_name: author_name_by_author.get(&row.author_id).copied(),
+            content: row.content,
+            created_at: row.created_at,
+            thread_root_id,
+            conversation_id,
+            source_format,
+            source_message_id: row.source_message_id,
+            source_author: row.source_author,
+            source_role: row.source_role,
+        });
+    }
+    messages.sort_by_key(|message| (interval_key(message.created_at), message.id));
+    Ok(messages)
 }
 
 fn archive_coverage_report(catalog: &TribleSet) -> ArchiveCoverageReport {
