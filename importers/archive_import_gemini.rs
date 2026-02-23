@@ -21,7 +21,7 @@ use scraper::{Html, Selector};
 use triblespace::prelude::*;
 
 
-#[path = "archive_common.rs"]
+#[path = "../faculties/archive_common.rs"]
 mod common;
 
 #[derive(Parser)]

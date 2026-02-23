@@ -18,10 +18,12 @@ use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
 use hifitime::Epoch;
 use serde_json::{Map, Value as JsonValue};
+use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::import::json_tree::JsonTreeImporter;
+use triblespace::prelude::valueschemas::{Blake3, Handle};
 use triblespace::prelude::*;
 
-#[path = "archive_common.rs"]
+#[path = "../faculties/archive_common.rs"]
 mod common;
 
 #[derive(Parser)]
@@ -60,16 +62,83 @@ struct MessageRecord {
     order: usize,
 }
 
+type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
+
+fn refresh_catalog(
+    ws: &mut common::Ws,
+    catalog: &mut TribleSet,
+    catalog_head: &mut Option<CommitHandle>,
+) -> Result<()> {
+    let next_head = ws.head();
+    if *catalog_head == next_head {
+        return Ok(());
+    }
+
+    let delta = ws
+        .checkout(*catalog_head..next_head)
+        .context("checkout workspace delta")?;
+    if !delta.is_empty() {
+        *catalog += delta;
+    }
+    *catalog_head = next_head;
+    Ok(())
+}
+
+fn commit_delta(
+    repo: &mut common::Repo,
+    ws: &mut common::Ws,
+    catalog: &mut TribleSet,
+    catalog_head: &mut Option<CommitHandle>,
+    change: TribleSet,
+    metadata: Option<&TribleSet>,
+    message: &'static str,
+) -> Result<bool> {
+    let delta = change.difference(catalog);
+    if delta.is_empty() {
+        return Ok(false);
+    }
+
+    ws.commit(delta, metadata.cloned(), Some(message));
+    common::push_workspace(repo, ws).with_context(|| format!("push {message}"))?;
+    refresh_catalog(ws, catalog, catalog_head)
+        .with_context(|| format!("refresh catalog after {message}"))?;
+    Ok(true)
+}
+
 fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+    let mut catalog = ws.checkout(..).context("checkout workspace")?;
+    let mut catalog_head = ws.head();
+    let json_tree_metadata =
+        triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
+            .into_facts();
+
     if path.is_dir() {
         let mut paths = Vec::new();
         collect_jsonl_files(path, &mut paths)
             .with_context(|| format!("scan {}", path.display()))?;
         paths.sort();
         let mut total = ImportStats::default();
-        for file in paths {
-            let stats = import_codex_file(&file, repo, branch_id)
-                .with_context(|| format!("import {}", file.display()))?;
+        let total_files = paths.len();
+        for (index, file) in paths.iter().enumerate() {
+            println!(
+                "import codex file {}/{}: {}",
+                index + 1,
+                total_files,
+                file.display()
+            );
+            let stats = import_codex_file(
+                file,
+                repo,
+                &mut ws,
+                &mut catalog,
+                &mut catalog_head,
+                &json_tree_metadata,
+            )
+            .with_context(|| format!("import {}", file.display()))?;
             total.files += stats.files;
             total.conversations += stats.conversations;
             total.messages += stats.messages;
@@ -77,10 +146,25 @@ fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
         }
         return Ok(total);
     }
-    import_codex_file(path, repo, branch_id)
+
+    import_codex_file(
+        path,
+        repo,
+        &mut ws,
+        &mut catalog,
+        &mut catalog_head,
+        &json_tree_metadata,
+    )
 }
 
-fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
+fn import_codex_file(
+    path: &Path,
+    repo: &mut common::Repo,
+    ws: &mut common::Ws,
+    catalog: &mut TribleSet,
+    catalog_head: &mut Option<CommitHandle>,
+    json_tree_metadata: &TribleSet,
+) -> Result<ImportStats> {
     let raw_text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut raw_records = Vec::new();
     for (line_idx, line) in raw_text.lines().enumerate() {
@@ -93,11 +177,6 @@ fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
         raw_records.push(value);
     }
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let mut catalog = ws.checkout(..).context("checkout workspace")?;
-
     let mut stats = ImportStats {
         files: 1,
         ..ImportStats::default()
@@ -106,11 +185,6 @@ fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
     if raw_records.is_empty() {
         return Ok(stats);
     }
-
-    let json_tree_metadata =
-        triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
-            .into_facts();
 
     let raw_root = {
         let raw_payload = serde_json::to_string(&raw_records).context("serialize codex jsonl")?;
@@ -124,15 +198,15 @@ fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
         let root = fragment
             .root()
             .ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
-        let delta = fragment.facts().difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(
-                delta.clone(),
-                Some(json_tree_metadata.clone()),
-                Some("import codex json tree"),
-            );
-            common::push_workspace(repo, &mut ws).context("push codex json tree")?;
-            catalog += delta;
+        if commit_delta(
+            repo,
+            ws,
+            catalog,
+            catalog_head,
+            fragment.facts().clone(),
+            Some(json_tree_metadata),
+            "import codex json tree",
+        )? {
             stats.commits += 1;
         }
         root
@@ -188,7 +262,7 @@ fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
                 id
             } else {
                 let (id, author_change) =
-                    common::ensure_author(&mut ws, &catalog, &message.author, &message.role)?;
+                    common::ensure_author(ws, &catalog, &message.author, &message.role)?;
                 change += author_change;
                 author_cache.insert(author_key, id);
                 id
@@ -220,10 +294,15 @@ fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
         stats.conversations += 1;
     }
 
-    let delta = change.difference(&catalog);
-    if !delta.is_empty() {
-        ws.commit(delta.clone(), None, Some("import codex"));
-        common::push_workspace(repo, &mut ws).context("push codex import")?;
+    if commit_delta(
+        repo,
+        ws,
+        catalog,
+        catalog_head,
+        change,
+        None,
+        "import codex",
+    )? {
         stats.commits += 1;
     }
 

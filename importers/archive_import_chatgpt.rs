@@ -21,7 +21,7 @@ use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::core::blob::Bytes;
 use triblespace::prelude::*;
 
-#[path = "archive_common.rs"]
+#[path = "../faculties/archive_common.rs"]
 mod common;
 
 #[derive(Parser)]
