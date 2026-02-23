@@ -433,12 +433,14 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
     let result = (|| -> Result<()> {
         memory_status("loading archive branch...");
         let stage = Instant::now();
-        let archive_messages = load_archive_messages_incremental(
+        let archive_load = load_archive_messages_incremental(
             &mut repo,
             config.archive_branch_id,
             "pull archive workspace for memory estimate",
             "archive",
         )?;
+        let archive_messages = archive_load.messages;
+        let archive_coverage = archive_load.coverage;
         memory_status_timed(
             &format!(
                 "archive branch loaded ({} message(s))",
@@ -558,6 +560,32 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
         println!("  merge_arity: {}", merge_arity);
         println!("  pending_archive: {}", pending_archive);
         println!("  pending_exec: {}", pending_exec);
+        println!("  archive_kind_messages: {}", archive_coverage.kind_message_total);
+        println!(
+            "  archive_imported_messages: {}",
+            archive_coverage.imported_message_total
+        );
+        println!(
+            "  archive_core_imported_messages: {}",
+            archive_coverage.core_imported_total
+        );
+        println!(
+            "  archive_strict_imported_messages: {} ({:.2}%)",
+            archive_coverage.strict_imported_total,
+            archive_coverage.strict_imported_pct()
+        );
+        println!(
+            "  archive_missing_source_message_id: {}",
+            archive_coverage.missing_source_message_id()
+        );
+        println!(
+            "  archive_missing_source_author: {}",
+            archive_coverage.missing_source_author()
+        );
+        println!(
+            "  archive_missing_source_role: {}",
+            archive_coverage.missing_source_role()
+        );
         println!("  leaves_to_add: {}", new_leaves);
         println!("  estimated_merge_calls: {}", sim.merge_calls);
         println!("  estimated_input_tokens: {}", input_tokens as u64);
@@ -608,12 +636,14 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
     let result = (|| -> Result<()> {
         memory_status("loading archive branch...");
         let stage = Instant::now();
-        let archive_messages = load_archive_messages_incremental(
+        let archive_load = load_archive_messages_incremental(
             &mut repo,
             config.archive_branch_id,
             "pull archive workspace for memory build",
             "archive",
         )?;
+        let archive_messages = archive_load.messages;
+        let archive_coverage = archive_load.coverage;
         memory_status_timed(
             &format!(
                 "archive branch loaded ({} message(s))",
@@ -668,6 +698,32 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
             }
         );
         println!("  merge_arity: {}", merge_arity);
+        println!("  archive_kind_messages: {}", archive_coverage.kind_message_total);
+        println!(
+            "  archive_imported_messages: {}",
+            archive_coverage.imported_message_total
+        );
+        println!(
+            "  archive_core_imported_messages: {}",
+            archive_coverage.core_imported_total
+        );
+        println!(
+            "  archive_strict_imported_messages: {} ({:.2}%)",
+            archive_coverage.strict_imported_total,
+            archive_coverage.strict_imported_pct()
+        );
+        println!(
+            "  archive_missing_source_message_id: {}",
+            archive_coverage.missing_source_message_id()
+        );
+        println!(
+            "  archive_missing_source_author: {}",
+            archive_coverage.missing_source_author()
+        );
+        println!(
+            "  archive_missing_source_role: {}",
+            archive_coverage.missing_source_role()
+        );
         if args.dry_run {
             println!("  mode: dry-run (no writes)");
             memory_status("dry-run complete.");
@@ -2535,14 +2591,14 @@ fn load_archive_messages_incremental(
     branch_id: Option<Id>,
     context: &str,
     label: &str,
-) -> Result<Vec<ArchiveMessageInfo>> {
+) -> Result<ArchiveLoadResult> {
     let Some(branch_id) = branch_id else {
-        return Ok(Vec::new());
+        return Ok(ArchiveLoadResult::default());
     };
     let mut ws = pull_workspace(repo, branch_id, context)?;
     let Some(head) = ws.head() else {
         memory_status(format!("{label}: branch is empty."));
-        return Ok(Vec::new());
+        return Ok(ArchiveLoadResult::default());
     };
 
     let discover_started = Instant::now();
@@ -2562,7 +2618,7 @@ fn load_archive_messages_incremental(
 
     let mut payload_commits = discovery.payload_commits;
     if payload_commits.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ArchiveLoadResult::default());
     }
     // Process oldest payloads first so progress and growth are easier to read in checkpoints.
     payload_commits.reverse();
@@ -2622,7 +2678,15 @@ fn load_archive_messages_incremental(
     }
     memory_status_timed(&format!("{label}: payload scan complete"), checkout_started);
 
-    projection.into_messages()
+    let coverage = archive_coverage_report(&projection_catalog);
+    if coverage.strict_imported_total < coverage.imported_message_total {
+        memory_status(format!(
+            "{label}: archive coverage warning: strict imported pattern matches {}/{} message(s)",
+            coverage.strict_imported_total, coverage.imported_message_total
+        ));
+    }
+    let messages = projection.into_messages()?;
+    Ok(ArchiveLoadResult { messages, coverage })
 }
 
 #[derive(Debug, Clone)]
@@ -2666,6 +2730,47 @@ struct ArchiveMessageInfo {
     source_message_id: Value<Handle<Blake3, LongString>>,
     source_author: Value<Handle<Blake3, LongString>>,
     source_role: Value<Handle<Blake3, LongString>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ArchiveCoverageReport {
+    kind_message_total: usize,
+    imported_message_total: usize,
+    core_imported_total: usize,
+    strict_imported_total: usize,
+    with_source_message_id_total: usize,
+    with_source_author_total: usize,
+    with_source_role_total: usize,
+}
+
+impl ArchiveCoverageReport {
+    fn strict_imported_pct(&self) -> f64 {
+        if self.imported_message_total == 0 {
+            return 100.0;
+        }
+        (self.strict_imported_total as f64) * 100.0 / (self.imported_message_total as f64)
+    }
+
+    fn missing_source_message_id(&self) -> usize {
+        self.imported_message_total
+            .saturating_sub(self.with_source_message_id_total)
+    }
+
+    fn missing_source_author(&self) -> usize {
+        self.imported_message_total
+            .saturating_sub(self.with_source_author_total)
+    }
+
+    fn missing_source_role(&self) -> usize {
+        self.imported_message_total
+            .saturating_sub(self.with_source_role_total)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ArchiveLoadResult {
+    messages: Vec<ArchiveMessageInfo>,
+    coverage: ArchiveCoverageReport,
 }
 
 #[derive(Default)]
@@ -3612,6 +3717,105 @@ fn load_archive_messages(catalog: &TribleSet) -> Result<Vec<ArchiveMessageInfo>>
     let mut projection = ArchiveMessageProjection::default();
     projection.apply_delta(&projection_delta, &projection_delta);
     projection.into_messages()
+}
+
+fn archive_coverage_report(catalog: &TribleSet) -> ArchiveCoverageReport {
+    let kind_message_total = find!(
+        (message_id: Id),
+        pattern!(catalog, [{
+            ?message_id @ playground_archive::kind: playground_archive::kind_message,
+        }])
+    )
+    .collect::<HashSet<_>>()
+    .len();
+
+    let imported_message_total = find!(
+        (message_id: Id),
+        pattern!(catalog, [{
+            ?message_id @
+                playground_archive::kind: playground_archive::kind_message,
+                playground_archive_import::batch: _?batch_id,
+        }])
+    )
+    .collect::<HashSet<_>>()
+    .len();
+
+    let core_imported_total = find!(
+        (message_id: Id),
+        pattern!(catalog, [{
+            ?message_id @
+                playground_archive::kind: playground_archive::kind_message,
+                playground_archive_import::batch: _?batch_id,
+                playground_archive::author: _?author_id,
+                playground_archive::content: _?content,
+                playground_archive::created_at: _?created_at,
+        }])
+    )
+    .collect::<HashSet<_>>()
+    .len();
+
+    let with_source_message_id_total = find!(
+        (message_id: Id),
+        pattern!(catalog, [{
+            ?message_id @
+                playground_archive::kind: playground_archive::kind_message,
+                playground_archive_import::batch: _?batch_id,
+                playground_archive_import::source_message_id: _?source_message_id,
+        }])
+    )
+    .collect::<HashSet<_>>()
+    .len();
+
+    let with_source_author_total = find!(
+        (message_id: Id),
+        pattern!(catalog, [{
+            ?message_id @
+                playground_archive::kind: playground_archive::kind_message,
+                playground_archive_import::batch: _?batch_id,
+                playground_archive_import::source_author: _?source_author,
+        }])
+    )
+    .collect::<HashSet<_>>()
+    .len();
+
+    let with_source_role_total = find!(
+        (message_id: Id),
+        pattern!(catalog, [{
+            ?message_id @
+                playground_archive::kind: playground_archive::kind_message,
+                playground_archive_import::batch: _?batch_id,
+                playground_archive_import::source_role: _?source_role,
+        }])
+    )
+    .collect::<HashSet<_>>()
+    .len();
+
+    let strict_imported_total = find!(
+        (message_id: Id),
+        pattern!(catalog, [{
+            ?message_id @
+                playground_archive::kind: playground_archive::kind_message,
+                playground_archive_import::batch: _?batch_id,
+                playground_archive::author: _?author_id,
+                playground_archive::content: _?content,
+                playground_archive::created_at: _?created_at,
+                playground_archive_import::source_message_id: _?source_message_id,
+                playground_archive_import::source_author: _?source_author,
+                playground_archive_import::source_role: _?source_role,
+        }])
+    )
+    .collect::<HashSet<_>>()
+    .len();
+
+    ArchiveCoverageReport {
+        kind_message_total,
+        imported_message_total,
+        core_imported_total,
+        strict_imported_total,
+        with_source_message_id_total,
+        with_source_author_total,
+        with_source_role_total,
+    }
 }
 
 fn archive_thread_root(message_id: Id, reply_to: &HashMap<Id, Id>) -> Id {
