@@ -99,70 +99,56 @@ fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let batch_size = (threads * 2).max(1);
-        let total_batches = total_files.div_ceil(batch_size);
         let parser_pool = ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .context("build codex parser thread pool")?;
+        let parse_start = Instant::now();
+        println!(
+            "codex phase parse: {} file(s) using {} thread(s)",
+            total_files, threads
+        );
+        let parsed_files: Vec<(PathBuf, Result<Vec<JsonValue>>)> = parser_pool.install(|| {
+            paths
+                .par_iter()
+                .map(|file| (file.to_path_buf(), parse_codex_jsonl(file)))
+                .collect()
+        });
+        println!("codex phase parse: done in {:?}", parse_start.elapsed());
 
-        let mut processed = 0usize;
-        for (batch_index, chunk) in paths.chunks(batch_size).enumerate() {
-            let batch_start = Instant::now();
+        for (index, (file, parsed_records)) in parsed_files.into_iter().enumerate() {
+            let processed = index + 1;
+            let file_start = Instant::now();
             println!(
-                "codex phase parse-batch {}/{}: {} file(s) using {} thread(s)",
-                batch_index + 1,
-                total_batches,
-                chunk.len(),
-                threads
+                "import codex file {processed}/{total_files}: {}",
+                file.display()
             );
-            let parsed_chunk: Vec<(PathBuf, Result<Vec<JsonValue>>)> = parser_pool.install(|| {
-                chunk
-                    .par_iter()
-                    .map(|file| (file.to_path_buf(), parse_codex_jsonl(file)))
-                    .collect()
-            });
+            let raw_records =
+                parsed_records.with_context(|| format!("parse {}", file.display()))?;
+            println!("codex phase parse: {} line record(s)", raw_records.len());
+            let stats = import_codex_records(
+                &file,
+                raw_records,
+                repo,
+                &mut ws,
+                &mut catalog,
+                &mut catalog_head,
+                &json_tree_metadata,
+            )
+            .with_context(|| format!("import {}", file.display()))?;
+            total.files += stats.files;
+            total.conversations += stats.conversations;
+            total.messages += stats.messages;
+            total.commits += stats.commits;
             println!(
-                "codex phase parse-batch {}/{}: done in {:?}",
-                batch_index + 1,
-                total_batches,
-                batch_start.elapsed()
+                "codex progress files {}/{} (conversations {}, messages {}, commits {}) in {:?}",
+                processed,
+                total_files,
+                total.conversations,
+                total.messages,
+                total.commits,
+                file_start.elapsed()
             );
-
-            for (file, parsed_records) in parsed_chunk {
-                processed += 1;
-                let file_start = Instant::now();
-                println!(
-                    "import codex file {processed}/{total_files}: {}",
-                    file.display()
-                );
-                let raw_records =
-                    parsed_records.with_context(|| format!("parse {}", file.display()))?;
-                println!("codex phase parse: {} line record(s)", raw_records.len());
-                let stats = import_codex_records(
-                    &file,
-                    raw_records,
-                    repo,
-                    &mut ws,
-                    &mut catalog,
-                    &mut catalog_head,
-                    &json_tree_metadata,
-                )
-                .with_context(|| format!("import {}", file.display()))?;
-                total.files += stats.files;
-                total.conversations += stats.conversations;
-                total.messages += stats.messages;
-                total.commits += stats.commits;
-                println!(
-                    "codex progress files {}/{} (conversations {}, messages {}, commits {}) in {:?}",
-                    processed,
-                    total_files,
-                    total.conversations,
-                    total.messages,
-                    total.commits,
-                    file_start.elapsed()
-                );
-            }
         }
         return Ok(total);
     }
