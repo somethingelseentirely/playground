@@ -6,6 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4"
 //! rand_core = "0.6.4"
+//! rayon = "1.10"
 //! serde_json = "1"
 //! triblespace = "0.16.0"
 //! ```
@@ -18,6 +19,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
 use hifitime::Epoch;
+use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 use serde_json::{Map, Value as JsonValue};
 use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::prelude::*;
@@ -93,42 +96,88 @@ fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
         );
         let mut total = ImportStats::default();
         let total_files = paths.len();
-        for (index, file) in paths.iter().enumerate() {
-            let file_start = Instant::now();
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let batch_size = (threads * 2).max(1);
+        let total_batches = total_files.div_ceil(batch_size);
+        let parser_pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .context("build codex parser thread pool")?;
+
+        let mut processed = 0usize;
+        for (batch_index, chunk) in paths.chunks(batch_size).enumerate() {
+            let batch_start = Instant::now();
             println!(
-                "import codex file {}/{}: {}",
-                index + 1,
-                total_files,
-                file.display()
+                "codex phase parse-batch {}/{}: {} file(s) using {} thread(s)",
+                batch_index + 1,
+                total_batches,
+                chunk.len(),
+                threads
             );
-            let stats = import_codex_file(
-                file,
-                repo,
-                &mut ws,
-                &mut catalog,
-                &mut catalog_head,
-                &json_tree_metadata,
-            )
-            .with_context(|| format!("import {}", file.display()))?;
-            total.files += stats.files;
-            total.conversations += stats.conversations;
-            total.messages += stats.messages;
-            total.commits += stats.commits;
+            let parsed_chunk: Vec<(PathBuf, Result<Vec<JsonValue>>)> = parser_pool.install(|| {
+                chunk
+                    .par_iter()
+                    .map(|file| (file.to_path_buf(), parse_codex_jsonl(file)))
+                    .collect()
+            });
             println!(
-                "codex progress files {}/{} (conversations {}, messages {}, commits {}) in {:?}",
-                index + 1,
-                total_files,
-                total.conversations,
-                total.messages,
-                total.commits,
-                file_start.elapsed()
+                "codex phase parse-batch {}/{}: done in {:?}",
+                batch_index + 1,
+                total_batches,
+                batch_start.elapsed()
             );
+
+            for (file, parsed_records) in parsed_chunk {
+                processed += 1;
+                let file_start = Instant::now();
+                println!(
+                    "import codex file {processed}/{total_files}: {}",
+                    file.display()
+                );
+                let raw_records =
+                    parsed_records.with_context(|| format!("parse {}", file.display()))?;
+                println!("codex phase parse: {} line record(s)", raw_records.len());
+                let stats = import_codex_records(
+                    &file,
+                    raw_records,
+                    repo,
+                    &mut ws,
+                    &mut catalog,
+                    &mut catalog_head,
+                    &json_tree_metadata,
+                )
+                .with_context(|| format!("import {}", file.display()))?;
+                total.files += stats.files;
+                total.conversations += stats.conversations;
+                total.messages += stats.messages;
+                total.commits += stats.commits;
+                println!(
+                    "codex progress files {}/{} (conversations {}, messages {}, commits {}) in {:?}",
+                    processed,
+                    total_files,
+                    total.conversations,
+                    total.messages,
+                    total.commits,
+                    file_start.elapsed()
+                );
+            }
         }
         return Ok(total);
     }
 
-    import_codex_file(
+    let parse_start = Instant::now();
+    println!("codex phase parse: {}", path.display());
+    let raw_records = parse_codex_jsonl(path)?;
+    println!(
+        "codex phase parse: {} line record(s) in {:?}",
+        raw_records.len(),
+        parse_start.elapsed()
+    );
+    import_codex_records(
         path,
+        raw_records,
         repo,
         &mut ws,
         &mut catalog,
@@ -137,33 +186,15 @@ fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
     )
 }
 
-fn import_codex_file(
+fn import_codex_records(
     path: &Path,
+    raw_records: Vec<JsonValue>,
     repo: &mut common::Repo,
     ws: &mut common::Ws,
     catalog: &mut TribleSet,
     catalog_head: &mut Option<common::CommitHandle>,
     json_tree_metadata: &TribleSet,
 ) -> Result<ImportStats> {
-    let parse_start = Instant::now();
-    println!("codex phase parse: {}", path.display());
-    let raw_text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut raw_records = Vec::new();
-    for (line_idx, line) in raw_text.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: JsonValue = serde_json::from_str(trimmed)
-            .with_context(|| format!("parse jsonl line {}", line_idx + 1))?;
-        raw_records.push(value);
-    }
-    println!(
-        "codex phase parse: {} line record(s) in {:?}",
-        raw_records.len(),
-        parse_start.elapsed()
-    );
-
     let mut stats = ImportStats {
         files: 1,
         ..ImportStats::default()
@@ -331,6 +362,21 @@ fn import_codex_file(
     );
 
     Ok(stats)
+}
+
+fn parse_codex_jsonl(path: &Path) -> Result<Vec<JsonValue>> {
+    let raw_text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut raw_records = Vec::new();
+    for (line_idx, line) in raw_text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: JsonValue = serde_json::from_str(trimmed)
+            .with_context(|| format!("parse jsonl line {}", line_idx + 1))?;
+        raw_records.push(value);
+    }
+    Ok(raw_records)
 }
 
 fn collect_jsonl_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
