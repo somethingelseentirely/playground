@@ -7,6 +7,7 @@ use crate::common;
 use anyhow::{Context, Result, anyhow};
 use hifitime::Epoch;
 use serde_json::{Map, Value as JsonValue};
+use tracing::info_span;
 use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::prelude::*;
 
@@ -620,8 +621,21 @@ pub fn import_into_archive(
     branch_name: &str,
     branch_id: Id,
 ) -> Result<()> {
+    let _span = info_span!(
+        "codex_import",
+        path = %path.display(),
+        branch = branch_name,
+        branch_id = %format!("{branch_id:x}")
+    )
+    .entered();
+    let import_start = Instant::now();
     let (mut repo, branch_id) = common::open_repo_for_write(pile_path, branch_id, branch_name)?;
     let res = import_codex_path(path, &mut repo, branch_id);
+    tracing::info!(
+        ok = res.is_ok(),
+        elapsed_ms = import_start.elapsed().as_millis() as u64,
+        "codex import finished"
+    );
     let close_res = repo
         .close()
         .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
