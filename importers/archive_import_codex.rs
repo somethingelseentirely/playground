@@ -18,9 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
 use hifitime::Epoch;
 use serde_json::{Map, Value as JsonValue};
-use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::import::json_tree::JsonTreeImporter;
-use triblespace::prelude::valueschemas::{Blake3, Handle};
 use triblespace::prelude::*;
 
 #[path = "../faculties/archive_common.rs"]
@@ -60,49 +58,6 @@ struct MessageRecord {
     content: String,
     created_at: Option<Epoch>,
     order: usize,
-}
-
-type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
-
-fn refresh_catalog(
-    ws: &mut common::Ws,
-    catalog: &mut TribleSet,
-    catalog_head: &mut Option<CommitHandle>,
-) -> Result<()> {
-    let next_head = ws.head();
-    if *catalog_head == next_head {
-        return Ok(());
-    }
-
-    let delta = ws
-        .checkout(*catalog_head..next_head)
-        .context("checkout workspace delta")?;
-    if !delta.is_empty() {
-        *catalog += delta;
-    }
-    *catalog_head = next_head;
-    Ok(())
-}
-
-fn commit_delta(
-    repo: &mut common::Repo,
-    ws: &mut common::Ws,
-    catalog: &mut TribleSet,
-    catalog_head: &mut Option<CommitHandle>,
-    change: TribleSet,
-    metadata: Option<&TribleSet>,
-    message: &'static str,
-) -> Result<bool> {
-    let delta = change.difference(catalog);
-    if delta.is_empty() {
-        return Ok(false);
-    }
-
-    ws.commit(delta, metadata.cloned(), Some(message));
-    common::push_workspace(repo, ws).with_context(|| format!("push {message}"))?;
-    refresh_catalog(ws, catalog, catalog_head)
-        .with_context(|| format!("refresh catalog after {message}"))?;
-    Ok(true)
 }
 
 fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
@@ -167,7 +122,7 @@ fn import_codex_file(
     repo: &mut common::Repo,
     ws: &mut common::Ws,
     catalog: &mut TribleSet,
-    catalog_head: &mut Option<CommitHandle>,
+    catalog_head: &mut Option<common::CommitHandle>,
     json_tree_metadata: &TribleSet,
 ) -> Result<ImportStats> {
     let raw_text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -203,7 +158,7 @@ fn import_codex_file(
         let root = fragment
             .root()
             .ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
-        if commit_delta(
+        if common::commit_delta(
             repo,
             ws,
             catalog,
@@ -305,7 +260,7 @@ fn import_codex_file(
         stats.conversations += 1;
     }
 
-    if commit_delta(
+    if common::commit_delta(
         repo,
         ws,
         catalog,

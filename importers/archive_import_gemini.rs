@@ -63,6 +63,12 @@ struct MessageRecord {
 }
 
 fn import_gemini_path(path: &std::path::Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+    let mut catalog = ws.checkout(..).context("checkout workspace")?;
+    let mut catalog_head = ws.head();
+
     if path.is_dir() {
         let mut files = Vec::new();
         collect_gemini_files(path, &mut files)
@@ -82,7 +88,13 @@ fn import_gemini_path(path: &std::path::Path, repo: &mut common::Repo, branch_id
                 total_files,
                 file.display()
             );
-            let stats = import_gemini_file(file, repo, branch_id)
+            let stats = import_gemini_file(
+                file,
+                repo,
+                &mut ws,
+                &mut catalog,
+                &mut catalog_head,
+            )
                 .with_context(|| format!("import {}", file.display()))?;
             total.files += stats.files;
             total.conversations += stats.conversations;
@@ -91,15 +103,23 @@ fn import_gemini_path(path: &std::path::Path, repo: &mut common::Repo, branch_id
         }
         return Ok(total);
     }
-    import_gemini_file(path, repo, branch_id)
+    import_gemini_file(
+        path,
+        repo,
+        &mut ws,
+        &mut catalog,
+        &mut catalog_head,
+    )
 }
 
-fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
+fn import_gemini_file(
+    path: &std::path::Path,
+    repo: &mut common::Repo,
+    ws: &mut common::Ws,
+    catalog: &mut TribleSet,
+    catalog_head: &mut Option<common::CommitHandle>,
+) -> Result<ImportStats> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let catalog = ws.checkout(..).context("checkout workspace")?;
 
     let mut stats = ImportStats {
         files: 1,
@@ -158,7 +178,7 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
             id
         } else {
             let (id, author_change) =
-                common::ensure_author(&mut ws, &catalog, &message.author, &message.role)?;
+                common::ensure_author(ws, catalog, &message.author, &message.role)?;
             change += author_change;
             author_cache.insert(author_key, id);
             id
@@ -185,10 +205,15 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
         stats.messages += 1;
     }
 
-    let delta = change.difference(&catalog);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("import gemini"));
-        common::push_workspace(repo, &mut ws).context("push gemini import")?;
+    if common::commit_delta(
+        repo,
+        ws,
+        catalog,
+        catalog_head,
+        change,
+        None,
+        "import gemini",
+    )? {
         stats.commits += 1;
     }
     Ok(stats)

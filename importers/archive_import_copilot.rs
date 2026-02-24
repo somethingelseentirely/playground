@@ -67,6 +67,16 @@ fn import_copilot_path(
     repo: &mut common::Repo,
     branch_id: Id,
 ) -> Result<ImportStats> {
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+    let mut catalog = ws.checkout(..).context("checkout workspace")?;
+    let mut catalog_head = ws.head();
+    let json_tree_metadata =
+        triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
+            .into_facts();
+
     if path.is_dir() {
         let mut files = Vec::new();
         collect_copilot_files(path, &mut files)
@@ -86,7 +96,14 @@ fn import_copilot_path(
                 total_files,
                 file.display()
             );
-            let stats = import_copilot_file(file, repo, branch_id)
+            let stats = import_copilot_file(
+                file,
+                repo,
+                &mut ws,
+                &mut catalog,
+                &mut catalog_head,
+                &json_tree_metadata,
+            )
                 .with_context(|| format!("import {}", file.display()))?;
             total.files += stats.files;
             total.conversations += stats.conversations;
@@ -95,13 +112,23 @@ fn import_copilot_path(
         }
         return Ok(total);
     }
-    import_copilot_file(path, repo, branch_id)
+    import_copilot_file(
+        path,
+        repo,
+        &mut ws,
+        &mut catalog,
+        &mut catalog_head,
+        &json_tree_metadata,
+    )
 }
 
 fn import_copilot_file(
     path: &std::path::Path,
     repo: &mut common::Repo,
-    branch_id: Id,
+    ws: &mut common::Ws,
+    catalog: &mut TribleSet,
+    catalog_head: &mut Option<common::CommitHandle>,
+    json_tree_metadata: &TribleSet,
 ) -> Result<ImportStats> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let root: JsonValue = serde_json::from_str(&raw).context("parse copilot json")?;
@@ -115,20 +142,10 @@ fn import_copilot_file(
         records.len()
     );
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let mut catalog = ws.checkout(..).context("checkout workspace")?;
-
     let mut stats = ImportStats {
         files: 1,
         ..ImportStats::default()
     };
-
-    let json_tree_metadata =
-        triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
-            .into_facts();
 
     let raw_root = {
         let mut importer = JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
@@ -141,15 +158,15 @@ fn import_copilot_file(
         let root = fragment
             .root()
             .ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
-        let delta = fragment.facts().difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(
-                delta.clone(),
-                Some(json_tree_metadata.clone()),
-                Some("import copilot json tree"),
-            );
-            common::push_workspace(repo, &mut ws).context("push copilot json tree")?;
-            catalog += delta;
+        if common::commit_delta(
+            repo,
+            ws,
+            catalog,
+            catalog_head,
+            fragment.facts().clone(),
+            Some(json_tree_metadata),
+            "import copilot json tree",
+        )? {
             stats.commits += 1;
         }
         root
@@ -193,7 +210,7 @@ fn import_copilot_file(
             id
         } else {
             let (id, author_change) =
-                common::ensure_author(&mut ws, &catalog, &message.author, &message.role)?;
+                common::ensure_author(ws, catalog, &message.author, &message.role)?;
             change += author_change;
             author_cache.insert(author_key, id);
             id
@@ -221,10 +238,15 @@ fn import_copilot_file(
         stats.messages += 1;
     }
 
-    let delta = change.difference(&catalog);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("import copilot"));
-        common::push_workspace(repo, &mut ws).context("push copilot import")?;
+    if common::commit_delta(
+        repo,
+        ws,
+        catalog,
+        catalog_head,
+        change,
+        None,
+        "import copilot",
+    )? {
         stats.commits += 1;
     }
     if stats.messages > 0 {

@@ -54,6 +54,16 @@ fn import_chatgpt_path(
     repo: &mut common::Repo,
     branch_id: Id,
 ) -> Result<ImportStats> {
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+    let mut catalog = ws.checkout(..).context("checkout workspace")?;
+    let mut catalog_head = ws.head();
+    let json_tree_metadata =
+        triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
+            .into_facts();
+
     if path.is_dir() {
         let mut paths = Vec::new();
         collect_conversation_files(path, &mut paths)
@@ -73,7 +83,14 @@ fn import_chatgpt_path(
                 total_files,
                 convo_path.display()
             );
-            let stats = import_chatgpt_file(convo_path, repo, branch_id)
+            let stats = import_chatgpt_file(
+                convo_path,
+                repo,
+                &mut ws,
+                &mut catalog,
+                &mut catalog_head,
+                &json_tree_metadata,
+            )
                 .with_context(|| format!("import {}", convo_path.display()))?;
             total.conversations += stats.conversations;
             total.messages += stats.messages;
@@ -83,13 +100,23 @@ fn import_chatgpt_path(
         return Ok(total);
     }
 
-    import_chatgpt_file(path, repo, branch_id)
+    import_chatgpt_file(
+        path,
+        repo,
+        &mut ws,
+        &mut catalog,
+        &mut catalog_head,
+        &json_tree_metadata,
+    )
 }
 
 fn import_chatgpt_file(
     path: &Path,
     repo: &mut common::Repo,
-    branch_id: Id,
+    ws: &mut common::Ws,
+    catalog: &mut TribleSet,
+    catalog_head: &mut Option<common::CommitHandle>,
+    json_tree_metadata: &TribleSet,
 ) -> Result<ImportStats> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let root: JsonValue = serde_json::from_str(&raw).context("parse chatgpt json")?;
@@ -103,16 +130,6 @@ fn import_chatgpt_file(
         total_conversations
     );
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let mut catalog = ws.checkout(..).context("checkout workspace")?;
-
-    let json_tree_metadata =
-        triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
-            .into_facts();
-
     let export_root = path.parent().unwrap_or_else(|| Path::new("."));
     let export_files =
         index_export_files(export_root).with_context(|| format!("index {}", export_root.display()))?;
@@ -124,7 +141,7 @@ fn import_chatgpt_file(
             .unwrap_or("unknown");
 
         let convo_raw = serde_json::to_string(convo).context("serialize conversation json")?;
-        let (raw_root, raw_delta) = {
+        let (raw_root, raw_fragment) = {
             let mut raw_importer = JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
                 repo.storage_mut(),
                 None,
@@ -135,17 +152,17 @@ fn import_chatgpt_file(
             let raw_root = raw_fragment
                 .root()
                 .ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
-            let raw_delta = raw_fragment.facts().difference(&catalog);
-            (raw_root, raw_delta)
+            (raw_root, raw_fragment)
         };
-        if !raw_delta.is_empty() {
-            ws.commit(
-                raw_delta.clone(),
-                Some(json_tree_metadata.clone()),
-                Some("import chatgpt json tree"),
-            );
-            common::push_workspace(repo, &mut ws).context("push json tree")?;
-            catalog += raw_delta;
+        if common::commit_delta(
+            repo,
+            ws,
+            catalog,
+            catalog_head,
+            raw_fragment.facts().clone(),
+            Some(json_tree_metadata),
+            "import chatgpt json tree",
+        )? {
             stats.commits += 1;
         }
 
@@ -226,7 +243,7 @@ fn import_chatgpt_file(
             let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
                 id
             } else {
-                let (id, author_change) = common::ensure_author(&mut ws, &catalog, name, role)?;
+                let (id, author_change) = common::ensure_author(ws, catalog, name, role)?;
                 change += author_change;
                 author_cache.insert(author_key, id);
                 id
@@ -275,7 +292,7 @@ fn import_chatgpt_file(
                 let attachment_height = height_px;
                 let mut attachment_data = None;
 
-                let needs_data = attachment_data_handle(&catalog, attachment_id).is_none()
+                let needs_data = attachment_data_handle(catalog, attachment_id).is_none()
                     && attachment_data_handle(&change, attachment_id).is_none();
                 if needs_data {
                     if let Some(path) = export_files.get(&source_id) {
@@ -329,11 +346,15 @@ fn import_chatgpt_file(
             stats.messages += 1;
         }
 
-        let delta = change.difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(delta.clone(), None, Some("import chatgpt"));
-            common::push_workspace(repo, &mut ws).context("push import")?;
-            catalog += delta;
+        if common::commit_delta(
+            repo,
+            ws,
+            catalog,
+            catalog_head,
+            change,
+            None,
+            "import chatgpt",
+        )? {
             stats.commits += 1;
         }
         stats.conversations += 1;
