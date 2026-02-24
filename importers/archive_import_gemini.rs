@@ -6,8 +6,6 @@ use std::time::Instant;
 use crate::common;
 use anyhow::{Context, Result, anyhow};
 use hifitime::{Duration, Epoch};
-use rayon::ThreadPoolBuilder;
-use rayon::prelude::*;
 use scraper::{Html, Selector};
 use triblespace::prelude::*;
 
@@ -57,25 +55,8 @@ fn import_gemini_path(
             path.display(),
             scan_start.elapsed()
         );
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let parser_pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .context("build gemini parser thread pool")?;
-        let parse_start = Instant::now();
-        println!(
-            "gemini phase parse: {} file(s) using {} thread(s)",
-            total_files, threads
-        );
-        let parsed_files: Vec<(PathBuf, Result<Vec<MessageRecord>>)> = parser_pool.install(|| {
-            files
-                .par_iter()
-                .map(|file| (file.to_path_buf(), parse_gemini_file(file.as_path())))
-                .collect()
-        });
-        println!("gemini phase parse: done in {:?}", parse_start.elapsed());
+        let parsed_files: Vec<(PathBuf, Result<Vec<MessageRecord>>)> =
+            common::parse_paths_parallel("gemini", &files, parse_gemini_file)?;
 
         let mut total = ImportStats::default();
         for (index, (file, parsed_records)) in parsed_files.into_iter().enumerate() {

@@ -6,8 +6,6 @@ use std::time::Instant;
 use crate::common;
 use anyhow::{Context, Result, anyhow};
 use hifitime::Epoch;
-use rayon::ThreadPoolBuilder;
-use rayon::prelude::*;
 use serde_json::{Map, Value as JsonValue};
 use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::prelude::*;
@@ -60,25 +58,8 @@ fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
         );
         let mut total = ImportStats::default();
         let total_files = paths.len();
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let parser_pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .context("build codex parser thread pool")?;
-        let parse_start = Instant::now();
-        println!(
-            "codex phase parse: {} file(s) using {} thread(s)",
-            total_files, threads
-        );
-        let parsed_files: Vec<(PathBuf, Result<Vec<JsonValue>>)> = parser_pool.install(|| {
-            paths
-                .par_iter()
-                .map(|file| (file.to_path_buf(), parse_codex_jsonl(file)))
-                .collect()
-        });
-        println!("codex phase parse: done in {:?}", parse_start.elapsed());
+        let parsed_files: Vec<(PathBuf, Result<Vec<JsonValue>>)> =
+            common::parse_paths_parallel("codex", &paths, parse_codex_jsonl)?;
 
         for (index, (file, parsed_records)) in parsed_files.into_iter().enumerate() {
             let processed = index + 1;

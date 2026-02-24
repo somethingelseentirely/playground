@@ -5,8 +5,6 @@ use std::time::Instant;
 
 use crate::common;
 use anyhow::{Context, Result, anyhow};
-use rayon::ThreadPoolBuilder;
-use rayon::prelude::*;
 use serde_json::Value as JsonValue;
 use triblespace::core::blob::Bytes;
 use triblespace::core::import::json_tree::JsonTreeImporter;
@@ -53,30 +51,8 @@ fn import_chatgpt_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> R
             path.display(),
             scan_start.elapsed()
         );
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let parser_pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .context("build chatgpt parser thread pool")?;
-        let parse_start = Instant::now();
-        println!(
-            "chatgpt phase parse: {} file(s) using {} thread(s)",
-            total_files, threads
-        );
-        let parsed_files: Vec<(PathBuf, Result<ParsedChatgptFile>)> = parser_pool.install(|| {
-            paths
-                .par_iter()
-                .map(|convo_path| {
-                    (
-                        convo_path.to_path_buf(),
-                        parse_chatgpt_file(convo_path.as_path()),
-                    )
-                })
-                .collect()
-        });
-        println!("chatgpt phase parse: done in {:?}", parse_start.elapsed());
+        let parsed_files: Vec<(PathBuf, Result<ParsedChatgptFile>)> =
+            common::parse_paths_parallel("chatgpt", &paths, parse_chatgpt_file)?;
 
         let mut total = ImportStats::default();
         for (index, (convo_path, parsed_file)) in parsed_files.into_iter().enumerate() {

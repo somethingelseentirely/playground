@@ -6,8 +6,6 @@ use std::time::Instant;
 use crate::common;
 use anyhow::{Context, Result, anyhow};
 use hifitime::Epoch;
-use rayon::ThreadPoolBuilder;
-use rayon::prelude::*;
 use serde_json::{Map, Value as JsonValue};
 use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::prelude::*;
@@ -69,25 +67,8 @@ fn import_copilot_path(
             path.display(),
             scan_start.elapsed()
         );
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let parser_pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .context("build copilot parser thread pool")?;
-        let parse_start = Instant::now();
-        println!(
-            "copilot phase parse: {} file(s) using {} thread(s)",
-            total_files, threads
-        );
-        let parsed_files: Vec<(PathBuf, Result<ParsedCopilotFile>)> = parser_pool.install(|| {
-            files
-                .par_iter()
-                .map(|file| (file.to_path_buf(), parse_copilot_file(file.as_path())))
-                .collect()
-        });
-        println!("copilot phase parse: done in {:?}", parse_start.elapsed());
+        let parsed_files: Vec<(PathBuf, Result<ParsedCopilotFile>)> =
+            common::parse_paths_parallel("copilot", &files, parse_copilot_file)?;
 
         let mut total = ImportStats::default();
         for (index, (file, parsed_file)) in parsed_files.into_iter().enumerate() {
