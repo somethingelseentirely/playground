@@ -59,9 +59,21 @@ fn import_chatgpt_path(
         collect_conversation_files(path, &mut paths)
             .with_context(|| format!("scan {}", path.display()))?;
         paths.sort();
+        let total_files = paths.len();
+        println!(
+            "chatgpt: found {} conversations.json file(s) under {}",
+            total_files,
+            path.display()
+        );
         let mut total = ImportStats::default();
-        for convo_path in paths {
-            let stats = import_chatgpt_file(&convo_path, repo, branch_id)
+        for (index, convo_path) in paths.iter().enumerate() {
+            println!(
+                "chatgpt file {}/{}: {}",
+                index + 1,
+                total_files,
+                convo_path.display()
+            );
+            let stats = import_chatgpt_file(convo_path, repo, branch_id)
                 .with_context(|| format!("import {}", convo_path.display()))?;
             total.conversations += stats.conversations;
             total.messages += stats.messages;
@@ -84,6 +96,12 @@ fn import_chatgpt_file(
     let conversations = root
         .as_array()
         .ok_or_else(|| anyhow!("chatgpt export must be a JSON array"))?;
+    let total_conversations = conversations.len();
+    println!(
+        "chatgpt {}: {} conversation(s) in export",
+        path.display(),
+        total_conversations
+    );
 
     let mut ws = repo
         .pull(branch_id)
@@ -99,7 +117,7 @@ fn import_chatgpt_file(
     let export_files =
         index_export_files(export_root).with_context(|| format!("index {}", export_root.display()))?;
     let mut stats = ImportStats::default();
-    for convo in conversations {
+    for (index, convo) in conversations.iter().enumerate() {
         let convo_id = convo
             .get("id")
             .and_then(JsonValue::as_str)
@@ -319,6 +337,17 @@ fn import_chatgpt_file(
             stats.commits += 1;
         }
         stats.conversations += 1;
+        let processed = index + 1;
+        if processed % 100 == 0 || processed == total_conversations {
+            println!(
+                "chatgpt progress {}/{} conversations (messages {}, attachments {}, commits {})",
+                processed,
+                total_conversations,
+                stats.messages,
+                stats.attachments,
+                stats.commits
+            );
+        }
     }
 
     Ok(stats)

@@ -72,9 +72,21 @@ fn import_copilot_path(
         collect_copilot_files(path, &mut files)
             .with_context(|| format!("scan {}", path.display()))?;
         files.sort();
+        let total_files = files.len();
+        println!(
+            "copilot: found {} file(s) under {}",
+            total_files,
+            path.display()
+        );
         let mut total = ImportStats::default();
-        for file in files {
-            let stats = import_copilot_file(&file, repo, branch_id)
+        for (index, file) in files.iter().enumerate() {
+            println!(
+                "copilot file {}/{}: {}",
+                index + 1,
+                total_files,
+                file.display()
+            );
+            let stats = import_copilot_file(file, repo, branch_id)
                 .with_context(|| format!("import {}", file.display()))?;
             total.files += stats.files;
             total.conversations += stats.conversations;
@@ -97,6 +109,11 @@ fn import_copilot_file(
         .as_object()
         .ok_or_else(|| anyhow!("copilot export must be a JSON object"))?;
     let mut records = parse_copilot_records(object)?;
+    println!(
+        "copilot {}: parsed {} message record(s)",
+        path.display(),
+        records.len()
+    );
 
     let mut ws = repo
         .pull(branch_id)

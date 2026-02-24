@@ -121,6 +121,11 @@ fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
         collect_jsonl_files(path, &mut paths)
             .with_context(|| format!("scan {}", path.display()))?;
         paths.sort();
+        println!(
+            "codex: found {} jsonl file(s) under {}",
+            paths.len(),
+            path.display()
+        );
         let mut total = ImportStats::default();
         let total_files = paths.len();
         for (index, file) in paths.iter().enumerate() {
@@ -223,6 +228,12 @@ fn import_codex_file(
             .or_default()
             .push(message);
     }
+    println!(
+        "codex {}: parsed {} message(s) across {} conversation(s)",
+        path.display(),
+        by_conversation.values().map(|records| records.len()).sum::<usize>(),
+        by_conversation.len()
+    );
 
     let mut change = TribleSet::new();
     let mut author_cache: HashMap<String, Id> = HashMap::new();

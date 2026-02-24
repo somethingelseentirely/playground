@@ -68,9 +68,21 @@ fn import_gemini_path(path: &std::path::Path, repo: &mut common::Repo, branch_id
         collect_gemini_files(path, &mut files)
             .with_context(|| format!("scan {}", path.display()))?;
         files.sort();
+        let total_files = files.len();
+        println!(
+            "gemini: found {} html file(s) under {}",
+            total_files,
+            path.display()
+        );
         let mut total = ImportStats::default();
-        for file in files {
-            let stats = import_gemini_file(&file, repo, branch_id)
+        for (index, file) in files.iter().enumerate() {
+            println!(
+                "gemini file {}/{}: {}",
+                index + 1,
+                total_files,
+                file.display()
+            );
+            let stats = import_gemini_file(file, repo, branch_id)
                 .with_context(|| format!("import {}", file.display()))?;
             total.files += stats.files;
             total.conversations += stats.conversations;
@@ -102,6 +114,11 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
         ));
     }
     let mut records = parse_gemini_activity_html(&raw);
+    println!(
+        "gemini {}: parsed {} activity message(s)",
+        path.display(),
+        records.len()
+    );
 
     records.sort_by_key(|r| r.order);
     if records.is_empty() {
