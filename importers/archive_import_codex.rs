@@ -1,52 +1,16 @@
-#!/usr/bin/env -S rust-script
-//! ```cargo
-//! [dependencies]
-//! anyhow = "1.0"
-//! clap = { version = "4.5.4", features = ["derive"] }
-//! ed25519-dalek = "2.1.1"
-//! hifitime = "4"
-//! rand_core = "0.6.4"
-//! rayon = "1.10"
-//! serde_json = "1"
-//! triblespace = "0.16.0"
-//! ```
-
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::common;
 use anyhow::{Context, Result, anyhow};
-use clap::{CommandFactory, Parser};
 use hifitime::Epoch;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use serde_json::{Map, Value as JsonValue};
 use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::prelude::*;
-
-#[path = "../faculties/archive_common.rs"]
-mod common;
-
-#[derive(Parser)]
-#[command(
-    name = "archive-import-codex",
-    about = "Import Codex exports into TribleSpace"
-)]
-struct Cli {
-    /// Path to the pile file to write into.
-    #[arg(long, global = true)]
-    pile: Option<PathBuf>,
-    /// Branch name to write into (created if missing).
-    #[arg(long, default_value = "archive", global = true)]
-    branch: String,
-    /// Branch id to write into (hex). Overrides config/env branch id.
-    #[arg(long, global = true)]
-    branch_id: Option<String>,
-    /// File or directory containing Codex exports.
-    #[arg(value_name = "PATH")]
-    path: Option<PathBuf>,
-}
 
 #[derive(Debug, Default, Clone)]
 struct ImportStats {
@@ -669,22 +633,14 @@ fn json_f64(value: &JsonValue) -> Option<f64> {
         .or_else(|| value.as_u64().map(|v| v as f64))
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let pile_path = cli.pile.clone().unwrap_or_else(common::default_pile_path);
-    if let Err(err) = common::emit_schema_to_atlas(&pile_path) {
-        eprintln!("atlas emit: {err}");
-    }
-    let Some(path) = cli.path else {
-        let mut command = Cli::command();
-        command.print_help()?;
-        println!();
-        return Ok(());
-    };
-    let branch_id =
-        common::resolve_archive_branch_id(&pile_path, &cli.branch, cli.branch_id.as_deref())?;
-    let (mut repo, branch_id) = common::open_repo_for_write(&pile_path, branch_id, &cli.branch)?;
-    let res = import_codex_path(&path, &mut repo, branch_id);
+pub fn import_into_archive(
+    path: &Path,
+    pile_path: &Path,
+    branch_name: &str,
+    branch_id: Id,
+) -> Result<()> {
+    let (mut repo, branch_id) = common::open_repo_for_write(pile_path, branch_id, branch_name)?;
+    let res = import_codex_path(path, &mut repo, branch_id);
     let close_res = repo
         .close()
         .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
