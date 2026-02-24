@@ -13,19 +13,23 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
 use serde_json::Value as JsonValue;
-use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::core::blob::Bytes;
+use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::prelude::*;
 
 #[path = "../faculties/archive_common.rs"]
 mod common;
 
 #[derive(Parser)]
-#[command(name = "archive-import-chatgpt", about = "Import ChatGPT exports into TribleSpace")]
+#[command(
+    name = "archive-import-chatgpt",
+    about = "Import ChatGPT exports into TribleSpace"
+)]
 struct Cli {
     /// Path to the pile file to write into.
     #[arg(long, global = true)]
@@ -49,11 +53,9 @@ struct ImportStats {
     commits: usize,
 }
 
-fn import_chatgpt_path(
-    path: &Path,
-    repo: &mut common::Repo,
-    branch_id: Id,
-) -> Result<ImportStats> {
+fn import_chatgpt_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
+    let start = Instant::now();
+    println!("chatgpt phase pull: {}", path.display());
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -63,20 +65,25 @@ fn import_chatgpt_path(
         triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
             .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
             .into_facts();
+    println!("chatgpt phase pull: done in {:?}", start.elapsed());
 
     if path.is_dir() {
+        let scan_start = Instant::now();
+        println!("chatgpt phase scan: {}", path.display());
         let mut paths = Vec::new();
         collect_conversation_files(path, &mut paths)
             .with_context(|| format!("scan {}", path.display()))?;
         paths.sort();
         let total_files = paths.len();
         println!(
-            "chatgpt: found {} conversations.json file(s) under {}",
+            "chatgpt phase scan: found {} conversations.json file(s) under {} in {:?}",
             total_files,
-            path.display()
+            path.display(),
+            scan_start.elapsed()
         );
         let mut total = ImportStats::default();
         for (index, convo_path) in paths.iter().enumerate() {
+            let file_start = Instant::now();
             println!(
                 "chatgpt file {}/{}: {}",
                 index + 1,
@@ -91,11 +98,21 @@ fn import_chatgpt_path(
                 &mut catalog_head,
                 &json_tree_metadata,
             )
-                .with_context(|| format!("import {}", convo_path.display()))?;
+            .with_context(|| format!("import {}", convo_path.display()))?;
             total.conversations += stats.conversations;
             total.messages += stats.messages;
             total.attachments += stats.attachments;
             total.commits += stats.commits;
+            println!(
+                "chatgpt progress files {}/{} (conversations {}, messages {}, attachments {}, commits {}) in {:?}",
+                index + 1,
+                total_files,
+                total.conversations,
+                total.messages,
+                total.attachments,
+                total.commits,
+                file_start.elapsed()
+            );
         }
         return Ok(total);
     }
@@ -118,6 +135,8 @@ fn import_chatgpt_file(
     catalog_head: &mut Option<common::CommitHandle>,
     json_tree_metadata: &TribleSet,
 ) -> Result<ImportStats> {
+    let parse_start = Instant::now();
+    println!("chatgpt phase parse: {}", path.display());
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let root: JsonValue = serde_json::from_str(&raw).context("parse chatgpt json")?;
     let conversations = root
@@ -125,16 +144,25 @@ fn import_chatgpt_file(
         .ok_or_else(|| anyhow!("chatgpt export must be a JSON array"))?;
     let total_conversations = conversations.len();
     println!(
-        "chatgpt {}: {} conversation(s) in export",
+        "chatgpt {}: {} conversation(s) in export (parsed in {:?})",
         path.display(),
-        total_conversations
+        total_conversations,
+        parse_start.elapsed()
     );
 
+    let index_start = Instant::now();
     let export_root = path.parent().unwrap_or_else(|| Path::new("."));
-    let export_files =
-        index_export_files(export_root).with_context(|| format!("index {}", export_root.display()))?;
+    let export_files = index_export_files(export_root)
+        .with_context(|| format!("index {}", export_root.display()))?;
+    println!(
+        "chatgpt phase index-attachments: {} file(s) indexed in {:?}",
+        export_files.len(),
+        index_start.elapsed()
+    );
     let mut stats = ImportStats::default();
+    let semantic_start = Instant::now();
     for (index, convo) in conversations.iter().enumerate() {
+        let processed = index + 1;
         let convo_id = convo
             .get("id")
             .and_then(JsonValue::as_str)
@@ -142,16 +170,27 @@ fn import_chatgpt_file(
 
         let convo_raw = serde_json::to_string(convo).context("serialize conversation json")?;
         let (raw_root, raw_fragment) = {
-            let mut raw_importer = JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
-                repo.storage_mut(),
-                None,
-            );
+            let raw_tree_start = Instant::now();
+            let mut raw_importer =
+                JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
+                    repo.storage_mut(),
+                    None,
+                );
             let raw_fragment = raw_importer
                 .import_str(&convo_raw)
                 .with_context(|| format!("import json tree for conversation {convo_id}"))?;
             let raw_root = raw_fragment
                 .root()
                 .ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
+            if processed % 100 == 0 || processed == total_conversations {
+                println!(
+                    "chatgpt raw-tree progress {}/{} (latest {}, {:?})",
+                    processed,
+                    total_conversations,
+                    convo_id,
+                    raw_tree_start.elapsed()
+                );
+            }
             (raw_root, raw_fragment)
         };
         if common::commit_delta(
@@ -218,8 +257,7 @@ fn import_chatgpt_file(
                 continue;
             }
             let content = extract_message_text(message).unwrap_or_default();
-            let Some(message_id) = node_to_message.get(node_id.as_str()).copied()
-            else {
+            let Some(message_id) = node_to_message.get(node_id.as_str()).copied() else {
                 continue;
             };
             let message_entity = message_id
@@ -358,18 +396,20 @@ fn import_chatgpt_file(
             stats.commits += 1;
         }
         stats.conversations += 1;
-        let processed = index + 1;
         if processed % 100 == 0 || processed == total_conversations {
             println!(
                 "chatgpt progress {}/{} conversations (messages {}, attachments {}, commits {})",
-                processed,
-                total_conversations,
-                stats.messages,
-                stats.attachments,
-                stats.commits
+                processed, total_conversations, stats.messages, stats.attachments, stats.commits
             );
         }
     }
+    println!(
+        "chatgpt phase semantic-build: {} conversation(s), {} message(s), {} attachment(s) in {:?}",
+        stats.conversations,
+        stats.messages,
+        stats.attachments,
+        semantic_start.elapsed()
+    );
 
     Ok(stats)
 }
@@ -393,8 +433,7 @@ fn collect_conversation_files(path: &Path, out: &mut Vec<std::path::PathBuf>) ->
         if file_type.is_dir() {
             collect_conversation_files(&entry_path, out)?;
         } else if file_type.is_file() {
-            if entry_path.file_name().and_then(|name| name.to_str()) == Some("conversations.json")
-            {
+            if entry_path.file_name().and_then(|name| name.to_str()) == Some("conversations.json") {
                 out.push(entry_path);
             }
         }
@@ -537,10 +576,12 @@ fn collect_attachments(message: &serde_json::Map<String, JsonValue>) -> Vec<Atta
             let Some(id) = obj.get("id").and_then(JsonValue::as_str) else {
                 continue;
             };
-            let entry = by_id.entry(id.to_string()).or_insert_with(|| AttachmentFields {
-                source_id: id.to_string(),
-                ..Default::default()
-            });
+            let entry = by_id
+                .entry(id.to_string())
+                .or_insert_with(|| AttachmentFields {
+                    source_id: id.to_string(),
+                    ..Default::default()
+                });
 
             if let Some(name) = obj.get("name").and_then(JsonValue::as_str) {
                 entry.name.get_or_insert_with(|| name.to_string());
@@ -580,10 +621,12 @@ fn collect_attachments(message: &serde_json::Map<String, JsonValue>) -> Vec<Atta
                 continue;
             };
 
-            let entry = by_id.entry(file_id.to_string()).or_insert_with(|| AttachmentFields {
-                source_id: file_id.to_string(),
-                ..Default::default()
-            });
+            let entry = by_id
+                .entry(file_id.to_string())
+                .or_insert_with(|| AttachmentFields {
+                    source_id: file_id.to_string(),
+                    ..Default::default()
+                });
 
             entry
                 .source_pointer
@@ -643,7 +686,14 @@ fn extract_message_text(message: &serde_json::Map<String, JsonValue>) -> Option<
 fn attachment_data_handle(
     catalog: &TribleSet,
     attachment_id: Id,
-) -> Option<Value<triblespace::prelude::valueschemas::Handle<triblespace::prelude::valueschemas::Blake3, common::archive_schema::FileBytes>>> {
+) -> Option<
+    Value<
+        triblespace::prelude::valueschemas::Handle<
+            triblespace::prelude::valueschemas::Blake3,
+            common::archive_schema::FileBytes,
+        >,
+    >,
+> {
     find!(
         (handle: Value<triblespace::prelude::valueschemas::Handle<triblespace::prelude::valueschemas::Blake3, common::archive_schema::FileBytes>>),
         pattern!(catalog, [{ attachment_id @ common::archive::attachment_data: ?handle }])
@@ -665,11 +715,8 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
-    let branch_id = common::resolve_archive_branch_id(
-        &pile_path,
-        &cli.branch,
-        cli.branch_id.as_deref(),
-    )?;
+    let branch_id =
+        common::resolve_archive_branch_id(&pile_path, &cli.branch, cli.branch_id.as_deref())?;
     let (mut repo, branch_id) = common::open_repo_for_write(&pile_path, branch_id, &cli.branch)?;
     let res = import_chatgpt_path(&path, &mut repo, branch_id);
     let close_res = repo

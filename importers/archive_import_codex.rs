@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
@@ -25,7 +26,10 @@ use triblespace::prelude::*;
 mod common;
 
 #[derive(Parser)]
-#[command(name = "archive-import-codex", about = "Import Codex exports into TribleSpace")]
+#[command(
+    name = "archive-import-codex",
+    about = "Import Codex exports into TribleSpace"
+)]
 struct Cli {
     /// Path to the pile file to write into.
     #[arg(long, global = true)]
@@ -61,6 +65,8 @@ struct MessageRecord {
 }
 
 fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
+    let start = Instant::now();
+    println!("codex phase pull: {}", path.display());
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -70,20 +76,25 @@ fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
         triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
             .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
             .into_facts();
+    println!("codex phase pull: done in {:?}", start.elapsed());
 
     if path.is_dir() {
+        let scan_start = Instant::now();
+        println!("codex phase scan: {}", path.display());
         let mut paths = Vec::new();
         collect_jsonl_files(path, &mut paths)
             .with_context(|| format!("scan {}", path.display()))?;
         paths.sort();
         println!(
-            "codex: found {} jsonl file(s) under {}",
+            "codex phase scan: found {} jsonl file(s) under {} in {:?}",
             paths.len(),
-            path.display()
+            path.display(),
+            scan_start.elapsed()
         );
         let mut total = ImportStats::default();
         let total_files = paths.len();
         for (index, file) in paths.iter().enumerate() {
+            let file_start = Instant::now();
             println!(
                 "import codex file {}/{}: {}",
                 index + 1,
@@ -103,6 +114,15 @@ fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
             total.conversations += stats.conversations;
             total.messages += stats.messages;
             total.commits += stats.commits;
+            println!(
+                "codex progress files {}/{} (conversations {}, messages {}, commits {}) in {:?}",
+                index + 1,
+                total_files,
+                total.conversations,
+                total.messages,
+                total.commits,
+                file_start.elapsed()
+            );
         }
         return Ok(total);
     }
@@ -125,6 +145,8 @@ fn import_codex_file(
     catalog_head: &mut Option<common::CommitHandle>,
     json_tree_metadata: &TribleSet,
 ) -> Result<ImportStats> {
+    let parse_start = Instant::now();
+    println!("codex phase parse: {}", path.display());
     let raw_text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut raw_records = Vec::new();
     for (line_idx, line) in raw_text.lines().enumerate() {
@@ -136,6 +158,11 @@ fn import_codex_file(
             .with_context(|| format!("parse jsonl line {}", line_idx + 1))?;
         raw_records.push(value);
     }
+    println!(
+        "codex phase parse: {} line record(s) in {:?}",
+        raw_records.len(),
+        parse_start.elapsed()
+    );
 
     let mut stats = ImportStats {
         files: 1,
@@ -147,6 +174,8 @@ fn import_codex_file(
     }
 
     let raw_root = {
+        let raw_tree_start = Instant::now();
+        println!("codex phase raw-tree: {}", path.display());
         let raw_payload = serde_json::to_string(&raw_records).context("serialize codex jsonl")?;
         let mut importer = JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
             repo.storage_mut(),
@@ -169,9 +198,14 @@ fn import_codex_file(
         )? {
             stats.commits += 1;
         }
+        println!(
+            "codex phase raw-tree: done in {:?}",
+            raw_tree_start.elapsed()
+        );
         root
     };
 
+    let semantic_start = Instant::now();
     let conversation_hint = detect_file_conversation_hint(&raw_records, raw_root);
     let mut messages = collect_codex_messages(&raw_records, &conversation_hint);
     messages.sort_by_key(|m| m.order);
@@ -186,14 +220,18 @@ fn import_codex_file(
     println!(
         "codex {}: parsed {} message(s) across {} conversation(s)",
         path.display(),
-        by_conversation.values().map(|records| records.len()).sum::<usize>(),
+        by_conversation
+            .values()
+            .map(|records| records.len())
+            .sum::<usize>(),
         by_conversation.len()
     );
 
     let mut change = TribleSet::new();
     let mut author_cache: HashMap<String, Id> = HashMap::new();
+    let total_conversations = by_conversation.len();
 
-    for (conversation_id, mut convo_messages) in by_conversation {
+    for (index, (conversation_id, mut convo_messages)) in by_conversation.into_iter().enumerate() {
         convo_messages.sort_by_key(|m| m.order);
         let conversation_fragment = entity! { _ @
             common::import_schema::kind: common::import_schema::kind_conversation,
@@ -258,8 +296,23 @@ fn import_codex_file(
         }
 
         stats.conversations += 1;
+        let processed = index + 1;
+        if processed % 50 == 0 || processed == total_conversations {
+            println!(
+                "codex progress conversations {}/{} (messages {}, staged commits {})",
+                processed, total_conversations, stats.messages, stats.commits
+            );
+        }
     }
 
+    println!(
+        "codex phase semantic-build: {} conversation(s), {} message(s) in {:?}",
+        stats.conversations,
+        stats.messages,
+        semantic_start.elapsed()
+    );
+
+    let commit_start = Instant::now();
     if common::commit_delta(
         repo,
         ws,
@@ -271,6 +324,11 @@ fn import_codex_file(
     )? {
         stats.commits += 1;
     }
+    println!(
+        "codex phase semantic-commit: done in {:?} (total commits {})",
+        commit_start.elapsed(),
+        stats.commits
+    );
 
     Ok(stats)
 }
@@ -591,11 +649,8 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
-    let branch_id = common::resolve_archive_branch_id(
-        &pile_path,
-        &cli.branch,
-        cli.branch_id.as_deref(),
-    )?;
+    let branch_id =
+        common::resolve_archive_branch_id(&pile_path, &cli.branch, cli.branch_id.as_deref())?;
     let (mut repo, branch_id) = common::open_repo_for_write(&pile_path, branch_id, &cli.branch)?;
     let res = import_codex_path(&path, &mut repo, branch_id);
     let close_res = repo

@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
@@ -67,6 +68,8 @@ fn import_copilot_path(
     repo: &mut common::Repo,
     branch_id: Id,
 ) -> Result<ImportStats> {
+    let start = Instant::now();
+    println!("copilot phase pull: {}", path.display());
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -76,20 +79,25 @@ fn import_copilot_path(
         triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
             .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
             .into_facts();
+    println!("copilot phase pull: done in {:?}", start.elapsed());
 
     if path.is_dir() {
+        let scan_start = Instant::now();
+        println!("copilot phase scan: {}", path.display());
         let mut files = Vec::new();
         collect_copilot_files(path, &mut files)
             .with_context(|| format!("scan {}", path.display()))?;
         files.sort();
         let total_files = files.len();
         println!(
-            "copilot: found {} file(s) under {}",
+            "copilot phase scan: found {} file(s) under {} in {:?}",
             total_files,
-            path.display()
+            path.display(),
+            scan_start.elapsed()
         );
         let mut total = ImportStats::default();
         for (index, file) in files.iter().enumerate() {
+            let file_start = Instant::now();
             println!(
                 "copilot file {}/{}: {}",
                 index + 1,
@@ -104,11 +112,20 @@ fn import_copilot_path(
                 &mut catalog_head,
                 &json_tree_metadata,
             )
-                .with_context(|| format!("import {}", file.display()))?;
+            .with_context(|| format!("import {}", file.display()))?;
             total.files += stats.files;
             total.conversations += stats.conversations;
             total.messages += stats.messages;
             total.commits += stats.commits;
+            println!(
+                "copilot progress files {}/{} (conversations {}, messages {}, commits {}) in {:?}",
+                index + 1,
+                total_files,
+                total.conversations,
+                total.messages,
+                total.commits,
+                file_start.elapsed()
+            );
         }
         return Ok(total);
     }
@@ -130,6 +147,8 @@ fn import_copilot_file(
     catalog_head: &mut Option<common::CommitHandle>,
     json_tree_metadata: &TribleSet,
 ) -> Result<ImportStats> {
+    let parse_start = Instant::now();
+    println!("copilot phase parse: {}", path.display());
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let root: JsonValue = serde_json::from_str(&raw).context("parse copilot json")?;
     let object = root
@@ -137,9 +156,10 @@ fn import_copilot_file(
         .ok_or_else(|| anyhow!("copilot export must be a JSON object"))?;
     let mut records = parse_copilot_records(object)?;
     println!(
-        "copilot {}: parsed {} message record(s)",
+        "copilot {}: parsed {} message record(s) in {:?}",
         path.display(),
-        records.len()
+        records.len(),
+        parse_start.elapsed()
     );
 
     let mut stats = ImportStats {
@@ -148,6 +168,8 @@ fn import_copilot_file(
     };
 
     let raw_root = {
+        let raw_tree_start = Instant::now();
+        println!("copilot phase raw-tree: {}", path.display());
         let mut importer = JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
             repo.storage_mut(),
             None,
@@ -169,6 +191,10 @@ fn import_copilot_file(
         )? {
             stats.commits += 1;
         }
+        println!(
+            "copilot phase raw-tree: done in {:?}",
+            raw_tree_start.elapsed()
+        );
         root
     };
 
@@ -191,7 +217,9 @@ fn import_copilot_file(
 
     let mut author_cache: HashMap<String, Id> = HashMap::new();
     let mut previous: Option<(Id, String)> = None;
-    for message in records {
+    let semantic_start = Instant::now();
+    let total_records = records.len();
+    for (index, message) in records.into_iter().enumerate() {
         let source_message_id_handle = ws.put(message.source_message_id.clone());
         let message_fragment = entity! { _ @
             common::import_schema::conversation: conversation_id,
@@ -236,8 +264,21 @@ fn import_copilot_file(
         };
         previous = Some((message_id, message.source_message_id.clone()));
         stats.messages += 1;
+        let processed = index + 1;
+        if processed % 250 == 0 || processed == total_records {
+            println!(
+                "copilot progress records {}/{} (messages {}, staged commits {})",
+                processed, total_records, stats.messages, stats.commits
+            );
+        }
     }
+    println!(
+        "copilot phase semantic-build: {} message(s) in {:?}",
+        stats.messages,
+        semantic_start.elapsed()
+    );
 
+    let commit_start = Instant::now();
     if common::commit_delta(
         repo,
         ws,
@@ -249,6 +290,11 @@ fn import_copilot_file(
     )? {
         stats.commits += 1;
     }
+    println!(
+        "copilot phase semantic-commit: done in {:?} (total commits {})",
+        commit_start.elapsed(),
+        stats.commits
+    );
     if stats.messages > 0 {
         stats.conversations = 1;
     }
