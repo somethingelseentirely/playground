@@ -85,6 +85,20 @@ mod compass {
     }
 }
 
+mod reason_events {
+    use triblespace::prelude::attributes;
+    use triblespace::prelude::blobschemas;
+    use triblespace::prelude::valueschemas;
+
+    attributes! {
+        "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "FBA9BC32A457C7BFFDB7E0181D3E82A4" as created_at: valueschemas::NsTAIInterval;
+        "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
+        "721DED6DA776F2CF4FB91C54D9F82358" as worker: valueschemas::GenId;
+        "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+    }
+}
+
 type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 const ACTIVITY_TIMELINE_HEIGHT: f32 = 980.0;
 const CONTEXT_TREE_HEIGHT: f32 = 720.0;
@@ -118,6 +132,7 @@ const RELATIONS_KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726")
 const COMPASS_KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
 const COMPASS_KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
 const COMPASS_KIND_NOTE_ID: Id = id_hex!("D4E49A6F02A14E66B62076AE4C01715F");
+const REASON_KIND_EVENT_ID: Id = id_hex!("9D43BB36D8B4A6275CAF38A1D5DACF36");
 
 const COMPASS_DEFAULT_STATUSES: [&str; 4] = ["todo", "doing", "blocked", "done"];
 
@@ -323,6 +338,15 @@ struct ReasoningSummaryRow {
 }
 
 #[derive(Debug, Clone)]
+struct ReasonRow {
+    created_at: Option<i128>,
+    text: String,
+    turn_id: Option<Id>,
+    worker_id: Option<Id>,
+    command_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct ContextChunkRow {
     id: Id,
     level: u64,
@@ -380,6 +404,12 @@ enum TimelineEvent {
     },
     Cognition {
         summary: String,
+    },
+    Reason {
+        text: String,
+        turn_id: Option<Id>,
+        worker_label: Option<String>,
+        command_text: Option<String>,
     },
     Teams {
         author: String,
@@ -1214,6 +1244,7 @@ fn build_snapshot(
     let agent_config = collect_agent_config(&config_data, ws);
     let exec_rows = collect_exec_rows(&exec_data, ws);
     let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
+    let reason_rows = collect_reason_rows(&exec_data, ws);
     let context_chunks = collect_context_chunks(&exec_data);
     let context_selected = build_context_selected(
         ws,
@@ -1235,6 +1266,7 @@ fn build_snapshot(
     let timeline_rows = build_activity_timeline(
         &exec_rows,
         &reasoning_summaries,
+        &reason_rows,
         &local_message_rows,
         local_me_id,
         &relations_labels,
@@ -2396,6 +2428,78 @@ fn collect_reasoning_summaries(
     rows
 }
 
+fn collect_reason_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ReasonRow> {
+    let mut rows = Vec::new();
+    let mut turn_by_reason: HashMap<Id, Id> = HashMap::new();
+    let mut worker_by_reason: HashMap<Id, Id> = HashMap::new();
+    let mut command_by_reason: HashMap<Id, String> = HashMap::new();
+
+    for (reason_id, turn_id) in find!(
+        (reason_id: Id, turn_id: Id),
+        pattern!(data, [{
+            ?reason_id @
+            metadata::tag: &REASON_KIND_EVENT_ID,
+            reason_events::about_turn: ?turn_id,
+        }])
+    ) {
+        turn_by_reason.insert(reason_id, turn_id);
+    }
+
+    for (reason_id, worker_id) in find!(
+        (reason_id: Id, worker_id: Id),
+        pattern!(data, [{
+            ?reason_id @
+            metadata::tag: &REASON_KIND_EVENT_ID,
+            reason_events::worker: ?worker_id,
+        }])
+    ) {
+        worker_by_reason.insert(reason_id, worker_id);
+    }
+
+    for (reason_id, command_handle) in find!(
+        (reason_id: Id, command_handle: Value<Handle<Blake3, LongString>>),
+        pattern!(data, [{
+            ?reason_id @
+            metadata::tag: &REASON_KIND_EVENT_ID,
+            reason_events::command_text: ?command_handle,
+        }])
+    ) {
+        let Some(command_text) = load_text(ws, command_handle) else {
+            continue;
+        };
+        command_by_reason.insert(reason_id, command_text);
+    }
+
+    for (reason_id, text_handle, created_at) in find!(
+        (
+            reason_id: Id,
+            text_handle: Value<Handle<Blake3, LongString>>,
+            created_at: Value<NsTAIInterval>
+        ),
+        pattern!(data, [{
+            ?reason_id @
+            metadata::tag: &REASON_KIND_EVENT_ID,
+            reason_events::text: ?text_handle,
+            reason_events::created_at: ?created_at,
+        }])
+    ) {
+        let Some(text) = load_text(ws, text_handle) else {
+            continue;
+        };
+        rows.push(ReasonRow {
+            created_at: Some(interval_key(created_at)),
+            text,
+            turn_id: turn_by_reason.get(&reason_id).copied(),
+            worker_id: worker_by_reason.get(&reason_id).copied(),
+            command_text: command_by_reason.get(&reason_id).cloned(),
+        });
+    }
+
+    rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
+    rows.reverse();
+    rows
+}
+
 fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
     let mut rows: HashMap<Id, ContextChunkRow> = HashMap::new();
 
@@ -2582,6 +2686,7 @@ fn build_context_selected(
 fn build_activity_timeline(
     exec_rows: &[ExecRow],
     reasoning_rows: &[ReasoningSummaryRow],
+    reason_rows: &[ReasonRow],
     local_rows: &[LocalMessageRow],
     local_me_id: Option<Id>,
     relation_labels: &HashMap<Id, String>,
@@ -2617,6 +2722,19 @@ fn build_activity_timeline(
             source: TimelineSource::Cognition,
             event: TimelineEvent::Cognition {
                 summary: row.summary.clone(),
+            },
+        });
+    }
+
+    for row in reason_rows {
+        rows.push(TimelineRow {
+            at: row.created_at,
+            source: TimelineSource::Cognition,
+            event: TimelineEvent::Reason {
+                text: row.text.clone(),
+                turn_id: row.turn_id,
+                worker_label: row.worker_id.map(|worker_id| format_id(labels, worker_id)),
+                command_text: row.command_text.clone(),
             },
         });
     }
@@ -4483,6 +4601,31 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) {
                 egui::Label::new(egui::RichText::new(summary).monospace())
                     .wrap_mode(egui::TextWrapMode::Wrap),
             );
+        }
+        TimelineEvent::Reason {
+            text,
+            turn_id,
+            worker_label,
+            command_text,
+        } => {
+            ui.small("reason");
+            ui.add(
+                egui::Label::new(egui::RichText::new(text).monospace())
+                    .wrap_mode(egui::TextWrapMode::Wrap),
+            );
+            let mut details = Vec::new();
+            if let Some(turn_id) = turn_id {
+                details.push(format!("turn {}", id_prefix(*turn_id)));
+            }
+            if let Some(worker_label) = worker_label.as_deref() {
+                details.push(format!("worker {worker_label}"));
+            }
+            if !details.is_empty() {
+                ui.small(details.join(" · "));
+            }
+            if let Some(command_text) = command_text {
+                ui.small(format!("act: {command_text}"));
+            }
         }
         TimelineEvent::Teams {
             author,
