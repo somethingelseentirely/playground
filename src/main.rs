@@ -559,7 +559,10 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
         println!("  merge_arity: {}", merge_arity);
         println!("  pending_archive: {}", pending_archive);
         println!("  pending_exec: {}", pending_exec);
-        println!("  archive_kind_messages: {}", archive_coverage.kind_message_total);
+        println!(
+            "  archive_kind_messages: {}",
+            archive_coverage.kind_message_total
+        );
         println!(
             "  archive_imported_messages: {}",
             archive_coverage.imported_message_total
@@ -697,7 +700,10 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
             }
         );
         println!("  merge_arity: {}", merge_arity);
-        println!("  archive_kind_messages: {}", archive_coverage.kind_message_total);
+        println!(
+            "  archive_kind_messages: {}",
+            archive_coverage.kind_message_total
+        );
         println!(
             "  archive_imported_messages: {}",
             archive_coverage.imported_message_total
@@ -2950,8 +2956,12 @@ fn ingest_exec_context_chunks(
         let command = load_command_for_result(ws, core_index, result)?;
         let reasoning_text = load_reasoning_for_exec_result(ws, core_index, result)?;
         let exec_output = load_exec_result(ws, result.clone())?;
-        let leaf_summary =
-            format_exec_output(command.as_str(), exec_output, reasoning_text.as_deref());
+        let leaf_summary = format_exec_output(
+            result.id,
+            command.as_str(),
+            exec_output,
+            reasoning_text.as_deref(),
+        );
         let leaf_summary_handle = ws.put(leaf_summary);
         let now = epoch_interval(now_epoch());
         let chunk_id = ufoid();
@@ -3285,7 +3295,7 @@ fn is_better_split_candidate(candidate: &SplitCandidate, current: Option<&SplitC
 fn format_memory_output(ws: &mut Workspace<Pile>, chunk: &ContextChunk) -> Result<String> {
     let mut header = format!("mem {} lvl={}", id_prefix(chunk.id), chunk.level);
     if let Some(exec_id) = chunk.about_exec_result {
-        header.push_str(&format!(" exec={}", id_prefix(exec_id)));
+        header.push_str(&format!(" turn_id={exec_id:x}"));
     }
     if let Some(message_id) = chunk.about_archive_message {
         header.push_str(&format!(" archive_msg={}", id_prefix(message_id)));
@@ -3486,7 +3496,9 @@ fn load_archive_messages(catalog: &TribleSet) -> Result<Vec<ArchiveMessageInfo>>
             ?author_id @ playground_archive::author_name: ?author_name,
         }])
     ) {
-        author_name_by_author.entry(author_id).or_insert(author_name);
+        author_name_by_author
+            .entry(author_id)
+            .or_insert(author_name);
     }
 
     let mut source_format_by_batch = HashMap::new();
@@ -4490,8 +4502,14 @@ fn load_exec_result(ws: &mut Workspace<Pile>, result: CommandResultInfo) -> Resu
     })
 }
 
-fn format_exec_output(command: &str, result: ExecResult, reasoning_text: Option<&str>) -> String {
+fn format_exec_output(
+    turn_id: Id,
+    command: &str,
+    result: ExecResult,
+    reasoning_text: Option<&str>,
+) -> String {
     let mut text = String::new();
+    append_section(&mut text, "turn_id", format!("{turn_id:x}").as_str());
     append_section(&mut text, "command", command);
     if let Some(reasoning_text) = reasoning_text {
         append_section(&mut text, "reasoning", reasoning_text);
