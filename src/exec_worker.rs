@@ -27,6 +27,8 @@ use crate::schema::playground_exec;
 use crate::time_util::{epoch_interval, interval_key, now_epoch};
 use crate::workspace_snapshot::{DEFAULT_WORKSPACE_BRANCH, restore_snapshot_merge};
 
+const CONFIG_BRANCH_ID_HEX: &str = "4790808CF044F979FC7C2E47FCCB4A64";
+
 #[derive(Debug, Clone)]
 struct CommandRequest {
     id: Id,
@@ -53,6 +55,14 @@ struct ExecOutput {
     stdout_text: Option<String>,
     stderr_text: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ExecCommandEnv {
+    pile: String,
+    config_branch_id: String,
+    worker_id: String,
+    turn_id: String,
 }
 
 pub(crate) fn run_exec_loop(
@@ -107,6 +117,12 @@ pub(crate) fn run_exec_loop(
             };
             let stdin = load_stdin(&mut ws, &request).context("load stdin")?;
             let attempt: u64 = 1;
+            let env = ExecCommandEnv {
+                pile: config.pile_path.to_string_lossy().to_string(),
+                config_branch_id: CONFIG_BRANCH_ID_HEX.to_string(),
+                worker_id: format!("{worker_id:x}"),
+                turn_id: format!("{request_id:x}", request_id = request.id),
+            };
 
             let started_at = epoch_interval(now_epoch());
             let in_progress_id = ufoid();
@@ -122,7 +138,7 @@ pub(crate) fn run_exec_loop(
             push_workspace(&mut repo, &mut ws).context("push in_progress")?;
 
             let started = Instant::now();
-            let output = execute_command(&command, cwd.as_deref(), stdin);
+            let output = execute_command(&command, cwd.as_deref(), stdin, &env);
             let ExecOutput {
                 stdout,
                 stderr,
@@ -192,7 +208,12 @@ fn stop_requested(stop: &Option<Arc<AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
-fn execute_command(command: &str, cwd: Option<&str>, stdin: Option<Bytes>) -> ExecOutput {
+fn execute_command(
+    command: &str,
+    cwd: Option<&str>,
+    stdin: Option<Bytes>,
+    env: &ExecCommandEnv,
+) -> ExecOutput {
     let mut cmd = Command::new("sh");
     cmd.arg("-lc").arg(command);
     // Make faculties available as plain commands (e.g. `orient`, `memory`) without requiring
@@ -205,6 +226,10 @@ fn execute_command(command: &str, cwd: Option<&str>, stdin: Option<Bytes>) -> Ex
         format!("{extra_path}:{base_path}")
     };
     cmd.env("PATH", merged_path);
+    cmd.env("PILE", &env.pile);
+    cmd.env("CONFIG_BRANCH_ID", &env.config_branch_id);
+    cmd.env("WORKER_ID", &env.worker_id);
+    cmd.env("TURN_ID", &env.turn_id);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }

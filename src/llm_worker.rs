@@ -755,8 +755,8 @@ fn extract_reasoning_text(response: &JsonValue) -> Option<String> {
 
 fn collect_chat_reasoning_chunks(node: &JsonValue, out: &mut Vec<String>) {
     for key in ["thinking", "reasoning", "reasoning_content"] {
-        if let Some(text) = node.get(key).and_then(JsonValue::as_str) {
-            push_clean(out, text);
+        if let Some(value) = node.get(key) {
+            collect_reasoning_value(value, out);
         }
     }
 
@@ -767,16 +767,23 @@ fn collect_chat_reasoning_chunks(node: &JsonValue, out: &mut Vec<String>) {
                     .get("type")
                     .and_then(JsonValue::as_str)
                     .unwrap_or_default();
-                if (kind == "thinking"
+                if kind == "thinking"
                     || kind == "reasoning"
                     || kind == "reasoning_content"
-                    || kind == "summary_text")
-                    && let Some(text) = part
+                    || kind == "summary_text"
+                {
+                    if let Some(text) = part
                         .get("text")
                         .and_then(JsonValue::as_str)
                         .or_else(|| part.get("content").and_then(JsonValue::as_str))
-                {
-                    push_clean(out, text);
+                    {
+                        push_clean(out, text);
+                    }
+                    for key in ["thinking", "reasoning", "reasoning_content"] {
+                        if let Some(value) = part.get(key) {
+                            collect_reasoning_value(value, out);
+                        }
+                    }
                 }
             }
         }
@@ -789,6 +796,27 @@ fn collect_chat_reasoning_chunks(node: &JsonValue, out: &mut Vec<String>) {
             {
                 push_clean(out, text);
             }
+        }
+    }
+}
+
+fn collect_reasoning_value(value: &JsonValue, out: &mut Vec<String>) {
+    if let Some(text) = value.as_str() {
+        push_clean(out, text);
+        return;
+    }
+    if let Some(array) = value.as_array() {
+        for item in array {
+            collect_reasoning_value(item, out);
+        }
+        return;
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(text) = object.get("text").and_then(JsonValue::as_str) {
+            push_clean(out, text);
+        }
+        if let Some(content) = object.get("content") {
+            collect_reasoning_value(content, out);
         }
     }
 }
@@ -916,6 +944,30 @@ mod tests {
         });
         let reasoning = extract_reasoning_text(&response).expect("reasoning");
         assert_eq!(reasoning, "Need to inspect config first");
+    }
+
+    #[test]
+    fn extracts_nested_chat_thinking_chunks() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": [
+                                    {"type": "text", "text": "Step 1"},
+                                    {"type": "text", "text": "Step 2"}
+                                ]
+                            },
+                            {"type": "text", "text": "memory 1234"}
+                        ]
+                    }
+                }
+            ]
+        });
+        let reasoning = extract_reasoning_text(&response).expect("reasoning");
+        assert_eq!(reasoning, "Step 1\n\nStep 2");
     }
 
     #[test]

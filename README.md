@@ -183,5 +183,11 @@ This command:
 - Runs the core loop + LLM worker on the host.
 - Runs the exec worker inside the VM, pointed at the same pile.
 
+Commands executed by the exec worker receive:
+- `PILE` (active pile path),
+- `CONFIG_BRANCH_ID` (`4790808CF044F979FC7C2E47FCCB4A64`),
+- `WORKER_ID` (exec worker id),
+- `TURN_ID` (current exec request id).
+
 Pass a pile path as the first argument if you want a non-default location. To apply Lima config
 template changes, set `PLAYGROUND_LIMA_RECREATE=1` before re-running the command.

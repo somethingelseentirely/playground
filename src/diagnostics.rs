@@ -5232,32 +5232,112 @@ fn parse_response_json(raw: &str) -> Option<JsonValue> {
 
 fn extract_reasoning_summaries(response: &JsonValue) -> Vec<String> {
     let mut summaries = Vec::new();
-    let Some(output) = response.get("output").and_then(JsonValue::as_array) else {
-        return summaries;
-    };
-
-    for item in output {
-        let Some(item_type) = item.get("type").and_then(JsonValue::as_str) else {
-            continue;
-        };
-        if item_type != "reasoning" {
-            continue;
-        }
-
-        let Some(summary_items) = item.get("summary").and_then(JsonValue::as_array) else {
-            continue;
-        };
-        for entry in summary_items {
-            if entry.get("type").and_then(JsonValue::as_str) != Some("summary_text") {
+    if let Some(output) = response.get("output").and_then(JsonValue::as_array) {
+        for item in output {
+            let Some(item_type) = item.get("type").and_then(JsonValue::as_str) else {
+                continue;
+            };
+            if item_type != "reasoning" {
                 continue;
             }
-            if let Some(text) = entry.get("text").and_then(JsonValue::as_str) {
-                summaries.push(text.to_string());
+
+            let Some(summary_items) = item.get("summary").and_then(JsonValue::as_array) else {
+                continue;
+            };
+            for entry in summary_items {
+                if entry.get("type").and_then(JsonValue::as_str) != Some("summary_text") {
+                    continue;
+                }
+                if let Some(text) = entry.get("text").and_then(JsonValue::as_str) {
+                    summaries.push(text.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(choices) = response.get("choices").and_then(JsonValue::as_array) {
+        for choice in choices {
+            if let Some(message) = choice.get("message") {
+                collect_chat_reasoning_chunks(message, &mut summaries);
+            }
+            if let Some(delta) = choice.get("delta") {
+                collect_chat_reasoning_chunks(delta, &mut summaries);
             }
         }
     }
 
     summaries
+}
+
+fn collect_chat_reasoning_chunks(node: &JsonValue, out: &mut Vec<String>) {
+    for key in ["thinking", "reasoning", "reasoning_content"] {
+        if let Some(value) = node.get(key) {
+            collect_reasoning_value(value, out);
+        }
+    }
+    if let Some(content) = node.get("content").and_then(JsonValue::as_array) {
+        for part in content {
+            let kind = part
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default();
+            if kind == "thinking"
+                || kind == "reasoning"
+                || kind == "reasoning_content"
+                || kind == "summary_text"
+            {
+                if let Some(text) = part
+                    .get("text")
+                    .and_then(JsonValue::as_str)
+                    .or_else(|| part.get("content").and_then(JsonValue::as_str))
+                {
+                    push_reasoning(out, text);
+                }
+                for key in ["thinking", "reasoning", "reasoning_content"] {
+                    if let Some(value) = part.get(key) {
+                        collect_reasoning_value(value, out);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(summary_items) = node.get("summary").and_then(JsonValue::as_array) {
+        for entry in summary_items {
+            if entry.get("type").and_then(JsonValue::as_str) == Some("summary_text")
+                && let Some(text) = entry.get("text").and_then(JsonValue::as_str)
+            {
+                push_reasoning(out, text);
+            }
+        }
+    }
+}
+
+fn collect_reasoning_value(value: &JsonValue, out: &mut Vec<String>) {
+    if let Some(text) = value.as_str() {
+        push_reasoning(out, text);
+        return;
+    }
+    if let Some(array) = value.as_array() {
+        for item in array {
+            collect_reasoning_value(item, out);
+        }
+        return;
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(text) = object.get("text").and_then(JsonValue::as_str) {
+            push_reasoning(out, text);
+        }
+        if let Some(content) = object.get("content") {
+            collect_reasoning_value(content, out);
+        }
+    }
+}
+
+fn push_reasoning(out: &mut Vec<String>, text: &str) {
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        out.push(trimmed.to_string());
+    }
 }
 
 fn exec_status_text(status: ExecStatus) -> &'static str {
