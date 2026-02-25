@@ -192,12 +192,12 @@ Commands executed by the exec worker receive:
 Reason notes (useful when a model/provider does not expose reasoning output):
 
 ```bash
-./playground/faculties/reason add "Why this action makes sense"
-./playground/faculties/reason act "Why this command now" -- git status
+./playground/faculties/reason "Why this action makes sense"
+./playground/faculties/reason "Why this command now" -- git status
 ```
 
 `reason` logs a structured rationale event into the active exec/cognition branch
-and (for `act`) then runs the command.
+and (when a command is provided) then runs it.
 
 Pass a pile path as the first argument if you want a non-default location. To apply Lima config
 template changes, set `PLAYGROUND_LIMA_RECREATE=1` before re-running the command.
