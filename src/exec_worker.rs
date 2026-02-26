@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -28,6 +30,8 @@ use crate::time_util::{epoch_interval, interval_key, now_epoch};
 use crate::workspace_snapshot::{DEFAULT_WORKSPACE_BRANCH, restore_snapshot_merge};
 
 const CONFIG_BRANCH_ID_HEX: &str = "4790808CF044F979FC7C2E47FCCB4A64";
+const DEFAULT_EXEC_TIMEOUT_MS: u64 = 300_000;
+const EXEC_CONTROL_POLL_MS: u64 = 100;
 
 #[derive(Debug, Clone)]
 struct CommandRequest {
@@ -137,8 +141,41 @@ pub(crate) fn run_exec_loop(
             ws.commit(change, None, Some("playground_exec in_progress"));
             push_workspace(&mut repo, &mut ws).context("push in_progress")?;
 
+            let initial_timeout_ms = request
+                .timeout_ms
+                .and_then(u256be_to_u64)
+                .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS);
+            let initial_timeout = Duration::from_millis(initial_timeout_ms);
             let started = Instant::now();
-            let output = execute_command(&command, cwd.as_deref(), stdin, &env);
+            let output = execute_command(
+                &command,
+                cwd.as_deref(),
+                stdin,
+                &env,
+                initial_timeout,
+                &stop,
+                || {
+                    if stop_requested(&stop) {
+                        return Ok(None);
+                    }
+
+                    let branch_head = current_branch_head(&mut repo, branch_id)?;
+                    if branch_head == cached_head {
+                        return Ok(None);
+                    }
+
+                    let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace for control")?;
+                    let delta =
+                        refresh_cached_checkout(&mut ws, &mut cached_head, &mut cached_catalog)?;
+                    request_index.apply_delta(&cached_catalog, &delta, worker_id);
+                    Ok(collect_timeout_extension_ms(
+                        &cached_catalog,
+                        &delta,
+                        request.id,
+                        worker_id,
+                    ))
+                },
+            );
             let ExecOutput {
                 stdout,
                 stderr,
@@ -213,6 +250,9 @@ fn execute_command(
     cwd: Option<&str>,
     stdin: Option<Bytes>,
     env: &ExecCommandEnv,
+    initial_timeout: Duration,
+    stop: &Option<Arc<AtomicBool>>,
+    mut poll_timeout_extension: impl FnMut() -> Result<Option<u64>>,
 ) -> ExecOutput {
     let mut cmd = Command::new("sh");
     cmd.arg("-lc").arg(command);
@@ -241,6 +281,19 @@ fn execute_command(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    #[cfg(unix)]
+    // Spawn each command in its own process group so timeout cancellation can terminate
+    // the whole subtree, not only the top-level shell process.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -255,37 +308,154 @@ fn execute_command(
         }
     };
 
+    let mut stdout_reader = child.stdout.take().map(spawn_output_reader);
+    let mut stderr_reader = child.stderr.take().map(spawn_output_reader);
+
     if let Some(stdin) = stdin {
         if let Some(mut handle) = child.stdin.take() {
             let _ = handle.write_all(stdin.as_ref());
         }
     }
 
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(err) => {
-            return ExecOutput {
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                exit_code: None,
-                stdout_text: None,
-                stderr_text: None,
-                error: Some(format!("wait failed: {err}")),
-            };
+    let mut deadline = Instant::now() + initial_timeout;
+    let wait_started = Instant::now();
+    let mut timed_out = false;
+    let mut timed_out_after: Option<Duration> = None;
+    let mut killed_for_stop = false;
+    let mut wait_error: Option<String> = None;
+    let mut status_code: Option<i32> = None;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                status_code = status.code();
+                break;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                wait_error = Some(format!("wait failed: {err}"));
+                let _ = terminate_process_tree(&mut child);
+                break;
+            }
         }
+
+        match poll_timeout_extension() {
+            Ok(Some(extension_ms)) => {
+                let extension = Duration::from_millis(extension_ms);
+                deadline = deadline.max(Instant::now() + extension);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("warning: timeout extension poll failed: {err:#}");
+            }
+        }
+
+        if stop_requested(stop) {
+            killed_for_stop = true;
+            let _ = terminate_process_tree(&mut child);
+            let _ = child.wait();
+            status_code = Some(130);
+            break;
+        }
+
+        if Instant::now() >= deadline {
+            timed_out = true;
+            timed_out_after = Some(wait_started.elapsed());
+            let _ = terminate_process_tree(&mut child);
+            let _ = child.wait();
+            status_code = Some(124);
+            break;
+        }
+
+        sleep(Duration::from_millis(EXEC_CONTROL_POLL_MS));
+    }
+
+    let stdout = stdout_reader
+        .take()
+        .map(join_output_reader)
+        .unwrap_or_default();
+    let mut stderr = stderr_reader
+        .take()
+        .map(join_output_reader)
+        .unwrap_or_default();
+
+    if timed_out {
+        let timeout_hint = format_timeout_hint(
+            timed_out_after.unwrap_or_else(|| wait_started.elapsed()),
+        );
+        let mut msg = format!("{timeout_hint}\n").into_bytes();
+        msg.extend_from_slice(&stderr);
+        stderr = msg;
+    } else if killed_for_stop {
+        let mut msg = b"command interrupted: worker stop requested\n".to_vec();
+        msg.extend_from_slice(&stderr);
+        stderr = msg;
+    }
+
+    let stdout_text = std::str::from_utf8(&stdout).ok().map(str::to_string);
+    let stderr_text = std::str::from_utf8(&stderr).ok().map(str::to_string);
+
+    let error = if timed_out {
+        Some(format_timeout_hint(
+            timed_out_after.unwrap_or_else(|| wait_started.elapsed()),
+        ))
+    } else if killed_for_stop {
+        Some("command interrupted: worker stop requested".to_string())
+    } else {
+        wait_error
     };
 
-    let stdout_text = std::str::from_utf8(&output.stdout).ok().map(str::to_string);
-    let stderr_text = std::str::from_utf8(&output.stderr).ok().map(str::to_string);
-
     ExecOutput {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.code(),
+        stdout,
+        stderr,
+        exit_code: status_code,
         stdout_text,
         stderr_text,
-        error: None,
+        error,
     }
+}
+
+fn spawn_output_reader<R>(mut reader: R) -> thread::JoinHandle<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+fn join_output_reader(handle: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    handle.join().unwrap_or_default()
+}
+
+fn terminate_process_tree(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // Negative pid targets the entire process group created in pre_exec.
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+        }
+        sleep(Duration::from_millis(50));
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        child.kill()
+    }
+}
+
+fn format_timeout_hint(duration: Duration) -> String {
+    format!(
+        "command timed out after {:.1}s; for long-running work, retry with `patience <duration> -- <command>`",
+        duration.as_secs_f64()
+    )
 }
 
 fn maybe_bootstrap_workspace(repo: &mut Repository<Pile>, config: &Config) -> Result<()> {
@@ -443,6 +613,43 @@ impl CommandRequestIndex {
         candidates.sort_by_key(|req| req.requested_at.map(interval_key).unwrap_or(i128::MIN));
         candidates.into_iter().next()
     }
+}
+
+fn collect_timeout_extension_ms(
+    updated: &TribleSet,
+    delta: &TribleSet,
+    request_id: Id,
+    worker_id: Id,
+) -> Option<u64> {
+    let mut extension_ms: Option<u64> = None;
+    for (_event_id, timeout_ms) in find!(
+        (_event_id: Id, timeout_ms: Value<U256BE>),
+        pattern_changes!(updated, delta, [{
+            ?_event_id @
+            playground_exec::kind: playground_exec::kind_timeout_extension,
+            playground_exec::about_request: request_id,
+            playground_exec::worker: worker_id,
+            playground_exec::timeout_ms: ?timeout_ms,
+        }])
+    ) {
+        let Some(timeout_ms) = u256be_to_u64(timeout_ms) else {
+            continue;
+        };
+        if timeout_ms == 0 {
+            continue;
+        }
+        extension_ms = Some(extension_ms.map_or(timeout_ms, |current| current.max(timeout_ms)));
+    }
+    extension_ms
+}
+
+fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
+    let raw = value.raw;
+    if raw[..24].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    let bytes: [u8; 8] = raw[24..32].try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
 }
 
 fn load_stdin(ws: &mut Workspace<Pile>, request: &CommandRequest) -> Result<Option<Bytes>> {

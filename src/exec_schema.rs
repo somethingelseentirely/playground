@@ -46,6 +46,9 @@ pub mod playground_exec {
     /// Tag for command result entities.
     #[allow(non_upper_case_globals)]
     pub const kind_command_result: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
+    /// Tag for timeout extension control events.
+    #[allow(non_upper_case_globals)]
+    pub const kind_timeout_extension: Id = id_hex!("75BC66A1C39131B9A0975613AC9B59FD");
 
     /// Tag for playground_exec protocol metadata.
     #[allow(non_upper_case_globals)]
@@ -127,6 +130,14 @@ where
         metadata::name: blobs.put("kind_command_result".to_string())?,
         metadata::description: blobs.put(
             "Command result entity kind.".to_string(),
+        )?,
+        metadata::tag: playground_exec::tag_kind,
+    };
+
+    tribles += entity! { ExclusiveId::force_ref(&playground_exec::kind_timeout_extension) @
+        metadata::name: blobs.put("kind_timeout_extension".to_string())?,
+        metadata::description: blobs.put(
+            "Control event that extends the deadline for an in-flight command.".to_string(),
         )?,
         metadata::tag: playground_exec::tag_kind,
     };

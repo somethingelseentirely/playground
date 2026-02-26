@@ -3782,6 +3782,7 @@ dependencies = [
  "eframe",
  "egui_plot",
  "hifitime",
+ "libc",
  "rand 0.8.5",
  "rand_core 0.9.5",
  "reqwest",
