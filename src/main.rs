@@ -1812,16 +1812,25 @@ fn create_thought_and_request(
     }
 
     let now = epoch_interval(now_epoch());
-    let archive_catalog = load_optional_catalog(
-        repo,
-        config.archive_branch_id,
-        "pull archive workspace for context history",
-    )?;
-    let relations_catalog = load_optional_catalog(
-        repo,
-        config.relations_branch_id,
-        "pull relations workspace for context history",
-    )?;
+    let needs_archive_seed = !has_archive_context_chunks(&catalog);
+    let archive_catalog = if needs_archive_seed {
+        load_optional_catalog(
+            repo,
+            config.archive_branch_id,
+            "pull archive workspace for context history",
+        )?
+    } else {
+        TribleSet::new()
+    };
+    let relations_catalog = if needs_archive_seed {
+        load_optional_catalog(
+            repo,
+            config.relations_branch_id,
+            "pull relations workspace for context history",
+        )?
+    } else {
+        TribleSet::new()
+    };
     let (prompt, compact_change) = if let Some(exec_result_id) = about_exec_result {
         prompt_for_exec_result_with_history(
             &mut ws,
@@ -1868,6 +1877,16 @@ fn create_thought_and_request(
         id: *request_id,
         thought_id: Some(*thought_id),
     })
+}
+
+fn has_archive_context_chunks(catalog: &TribleSet) -> bool {
+    find!(
+        (chunk_id: Id),
+        pattern!(catalog, [{ ?chunk_id @ playground_context::about_archive_message: _?message_id }])
+    )
+    .into_iter()
+    .next()
+    .is_some()
 }
 
 fn create_request_for_thought_from_index(
@@ -3071,24 +3090,26 @@ fn build_prompt_messages_with_compaction(
         .context("exec result missing finished_at")?;
     let current_finished_key = interval_key(current_finished_at);
     let results = results[..=current_pos].to_vec();
-    let relations = load_relations_index(ws, relations_catalog)?;
-    let archive_messages = load_archive_messages(archive_catalog)?;
 
     let mut compact_change = TribleSet::new();
     let mut compaction_stats = CompactionRunStats::default();
-    ingest_archive_context_chunks(
-        ws,
-        &mut index,
-        &mut compact_change,
-        archive_messages.as_slice(),
-        &relations,
-        Some(current_finished_key),
-        None,
-        merge_arity,
-        &semantic_compactor,
-        &mut compaction_stats,
-        None,
-    )?;
+    if index.chunk_for_archive_message.is_empty() && !archive_catalog.is_empty() {
+        let relations = load_relations_index(ws, relations_catalog)?;
+        let archive_messages = load_archive_messages(archive_catalog)?;
+        ingest_archive_context_chunks(
+            ws,
+            &mut index,
+            &mut compact_change,
+            archive_messages.as_slice(),
+            &relations,
+            Some(current_finished_key),
+            None,
+            merge_arity,
+            &semantic_compactor,
+            &mut compaction_stats,
+            None,
+        )?;
+    }
     ingest_exec_context_chunks(
         ws,
         core_index,
@@ -3102,7 +3123,10 @@ fn build_prompt_messages_with_compaction(
         None,
     )?;
 
-    let (messages, _used_chars) = build_memory_cover_messages(ws, &index, body_budget_chars)?;
+    let (mut messages, _used_chars) = build_memory_cover_messages(ws, &index, body_budget_chars)?;
+    if let Some(guard) = memory_loop_guard_message(ws, core_index, results.as_slice(), current_pos)? {
+        messages.push(ChatMessage::user(guard));
+    }
     Ok((messages, compact_change))
 }
 
@@ -3261,7 +3285,7 @@ fn memory_cover_turn(
         .chunks
         .get(&chunk_id)
         .with_context(|| format!("missing context chunk {:x}", chunk_id))?;
-    let command = format!("memory {id:x}", id = chunk.id);
+    let command = format!("memory {}", memory_ref(chunk.id));
     let output = format_memory_output(ws, chunk)?;
     let cost = command
         .chars()
@@ -3293,7 +3317,7 @@ fn is_better_split_candidate(candidate: &SplitCandidate, current: Option<&SplitC
 }
 
 fn format_memory_output(ws: &mut Workspace<Pile>, chunk: &ContextChunk) -> Result<String> {
-    let mut header = format!("mem {} lvl={}", id_prefix(chunk.id), chunk.level);
+    let mut header = format!("mem {} lvl={}", memory_ref(chunk.id), chunk.level);
     if let Some(exec_id) = chunk.about_exec_result {
         header.push_str(&format!(" turn_id={exec_id:x}"));
     }
@@ -3315,7 +3339,7 @@ fn format_memory_output(ws: &mut Workspace<Pile>, chunk: &ContextChunk) -> Resul
             if idx > 0 {
                 header.push(',');
             }
-            header.push_str(id_prefix(*child_id).as_str());
+            header.push_str(memory_ref(*child_id).as_str());
         }
     }
     if let Some(source_format) = chunk.archive_source_format.as_deref() {
@@ -3341,6 +3365,73 @@ fn id_prefix(id: Id) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+fn memory_ref(id: Id) -> String {
+    let hex = format!("{id:x}");
+    let end = usize::min(12, hex.len());
+    hex[..end].to_string()
+}
+
+fn memory_command_id(command: &str) -> Option<&str> {
+    let mut parts = command.split_whitespace();
+    let first = parts.next()?;
+    if first != "memory" && !first.ends_with("/memory.rs") && !first.ends_with("/memory") {
+        return None;
+    }
+    parts.next()
+}
+
+fn memory_lookup_failed_result(command: &str, result: &ExecResult) -> bool {
+    if memory_command_id(command).is_none() {
+        return false;
+    }
+
+    let stderr = format_output_text(result.stderr_text.clone(), result.stderr.clone());
+    let error = result.error.clone().unwrap_or_default();
+    let failure_text = if error.is_empty() {
+        stderr
+    } else if stderr.is_empty() {
+        error
+    } else {
+        format!("{stderr}\n{error}")
+    };
+    failure_text
+        .to_ascii_lowercase()
+        .contains("memory lookup failed")
+}
+
+fn memory_loop_guard_message(
+    ws: &mut Workspace<Pile>,
+    core_index: &CoreIndex,
+    results: &[CommandResultInfo],
+    current_pos: usize,
+) -> Result<Option<String>> {
+    const MEMORY_FAILURE_LOOKBACK: usize = 3;
+
+    let window_start = current_pos.saturating_sub(MEMORY_FAILURE_LOOKBACK - 1);
+    let mut streak_len = 0usize;
+    for result in results[window_start..=current_pos].iter().rev() {
+        let command = load_command_for_result(ws, core_index, result)?;
+        let Some(id_hint) = memory_command_id(command.as_str()) else {
+            break;
+        };
+        let exec_output = load_exec_result(ws, result.clone())?;
+        if !memory_lookup_failed_result(command.as_str(), &exec_output) {
+            break;
+        }
+        streak_len = streak_len.saturating_add(1);
+        if streak_len >= MEMORY_FAILURE_LOOKBACK {
+            return Ok(Some(format!(
+                "Memory lookup failed repeatedly on recent turns.\n\
+                 Do not guess ids.\n\
+                 Only run `memory <id>` for ids already visible in this context (`mem <id>` / `children=...`).\n\
+                 If no valid id is available, stop memory lookups and run `orient show` or another concrete action.\n\
+                 Last failed id hint: {id_hint}"
+            )));
+        }
+    }
+    Ok(None)
 }
 
 fn load_command_for_result(
