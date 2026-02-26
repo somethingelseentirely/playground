@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::Engine as _;
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde_json::Value as JsonValue;
 use triblespace::core::blob::Bytes;
@@ -57,8 +58,11 @@ struct ChatCompletionsClient {
     stream: bool,
 }
 
-const SEND_MAX_ATTEMPTS: usize = 5;
-const SEND_RETRY_BASE_MS: u64 = 500;
+const SEND_MAX_ATTEMPTS: usize = 8;
+const SEND_RETRY_BASE_MS: u64 = 1_000;
+const SEND_RETRY_MAX_MS: u64 = 30_000;
+const LLM_CONNECT_TIMEOUT_SECS: u64 = 20;
+const LLM_REQUEST_TIMEOUT_SECS: u64 = 240;
 const MAX_INLINE_IMAGES_PER_PROMPT: usize = 4;
 const MAX_INLINE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
@@ -75,7 +79,11 @@ fn chat_completions_url(api_base_url: &str) -> String {
 
 impl ChatCompletionsClient {
     fn new(api_base_url: &str, api_key: Option<String>, stream: bool) -> Result<Self> {
-        let client = Client::builder().build().context("build http client")?;
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(LLM_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS))
+            .build()
+            .context("build http client")?;
         let endpoint_url = chat_completions_url(api_base_url);
         Ok(Self {
             client,
@@ -86,19 +94,27 @@ impl ChatCompletionsClient {
     }
 
     fn send_payload(&self, payload: &JsonValue) -> Result<OpenAIResult> {
-        let mut last_error = None;
+        let mut last_error: Option<anyhow::Error> = None;
         for attempt in 1..=SEND_MAX_ATTEMPTS {
             match self.send_payload_once(payload) {
                 Ok(result) => return Ok(result),
-                Err(err) => {
+                Err(failure) => {
                     eprintln!(
                         "warning: llm send attempt {attempt}/{SEND_MAX_ATTEMPTS} to {} failed: {err:#}",
                         self.endpoint_url
+                        ,err = failure.error
                     );
-                    last_error = Some(err);
+                    last_error = Some(failure.error);
+                    if !failure.retryable {
+                        break;
+                    }
                     if attempt < SEND_MAX_ATTEMPTS {
-                        let backoff_ms = SEND_RETRY_BASE_MS * (1_u64 << (attempt - 1));
-                        sleep(Duration::from_millis(backoff_ms));
+                        let exp = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+                        let scale = 1_u64.checked_shl(exp).unwrap_or(u64::MAX);
+                        let backoff_ms = SEND_RETRY_BASE_MS
+                            .saturating_mul(scale)
+                            .min(SEND_RETRY_MAX_MS);
+                        sleep(Duration::from_millis(backoff_ms.max(1)));
                     }
                 }
             }
@@ -106,10 +122,16 @@ impl ChatCompletionsClient {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("request failed without error detail")))
     }
 
-    fn send_payload_once(&self, payload: &JsonValue) -> Result<OpenAIResult> {
-        let response = self.send_request(payload).context("send request")?;
+    fn send_payload_once(&self, payload: &JsonValue) -> std::result::Result<OpenAIResult, SendFailure> {
+        let response = self.send_request(payload).map_err(|err| SendFailure {
+            retryable: is_retryable_transport_error(&err),
+            error: err,
+        })?;
         if response.status().is_success() {
-            return self.parse_response(response);
+            return self.parse_response(response).map_err(|err| SendFailure {
+                retryable: false,
+                error: err,
+            });
         }
 
         let status = response.status();
@@ -118,7 +140,7 @@ impl ChatCompletionsClient {
             .text()
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
 
-        bail!(
+        let error = anyhow::anyhow!(
             "request failed: HTTP {} for url ({}){}",
             status,
             self.endpoint_url,
@@ -128,6 +150,10 @@ impl ChatCompletionsClient {
                 format!(": {}", body.trim())
             }
         );
+        Err(SendFailure {
+            retryable: is_retryable_http_status(status),
+            error,
+        })
     }
 
     fn send_request(&self, payload: &JsonValue) -> Result<reqwest::blocking::Response> {
@@ -155,6 +181,24 @@ impl ChatCompletionsClient {
             })
         }
     }
+}
+
+#[derive(Debug)]
+struct SendFailure {
+    retryable: bool,
+    error: anyhow::Error,
+}
+
+fn is_retryable_http_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn is_retryable_transport_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|req_err| req_err.is_timeout() || req_err.is_connect() || req_err.is_request())
 }
 
 pub(crate) fn run_llm_loop(
