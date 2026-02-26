@@ -18,7 +18,7 @@ use triblespace::core::trible::TribleSet;
 use triblespace::core::value::Value;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::schemas::time::NsTAIInterval;
-use triblespace::macros::{entity, find, id_hex, pattern};
+use triblespace::macros::{entity, find, id_hex, pattern, pattern_changes};
 use triblespace::prelude::valueschemas::{GenId, U256BE};
 use triblespace::prelude::{
     Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, ToValue, TryFromValue, View,
@@ -101,7 +101,10 @@ mod reason_events {
 
 type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 const ACTIVITY_TIMELINE_HEIGHT: f32 = 980.0;
-const ACTIVITY_TIMELINE_ROW_HEIGHT: f32 = 180.0;
+const TIMELINE_DEFAULT_LIMIT: usize = 300;
+const TIMELINE_LIMIT_PRESETS: [usize; 4] = [100, 300, 1000, 3000];
+const TIMELINE_LIMIT_MIN: usize = 10;
+const TIMELINE_LIMIT_MAX: usize = 50_000;
 const CONTEXT_TREE_HEIGHT: f32 = 720.0;
 const CONTEXT_ORIGIN_LIMIT: usize = 64;
 const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
@@ -230,6 +233,7 @@ struct DashboardState {
     context_selection_stack: Vec<Id>,
     context_show_children: bool,
     context_show_origins: bool,
+    timeline_limit: usize,
     last_snapshot_refresh_at: Option<Instant>,
 }
 
@@ -265,6 +269,7 @@ impl Default for DashboardState {
             context_selection_stack: Vec::new(),
             context_show_children: false,
             context_show_origins: false,
+            timeline_limit: TIMELINE_DEFAULT_LIMIT,
             last_snapshot_refresh_at: None,
         }
     }
@@ -337,12 +342,14 @@ struct TeamsChatRow {
 
 #[derive(Debug, Clone)]
 struct ReasoningSummaryRow {
+    result_id: Id,
     created_at: Option<i128>,
     summary: String,
 }
 
 #[derive(Debug, Clone)]
 struct ReasonRow {
+    id: Id,
     created_at: Option<i128>,
     text: String,
     turn_id: Option<Id>,
@@ -550,7 +557,13 @@ struct DashboardSnapshot {
     agent_config_error: Option<String>,
     context_chunks: Vec<ContextChunkRow>,
     context_selected: Option<ContextSelectedRow>,
+    exec_rows: Vec<ExecRow>,
+    reasoning_summaries: Vec<ReasoningSummaryRow>,
+    reason_rows: Vec<ReasonRow>,
+    local_message_rows: Vec<LocalMessageRow>,
+    compass_status_rows: Vec<CompassStatusRow>,
     timeline_rows: Vec<TimelineRow>,
+    timeline_total_rows: usize,
     compass_rows: Vec<(CompassTaskRow, usize)>,
     compass_notes: HashMap<Id, Vec<CompassNoteRow>>,
     compass_error: Option<String>,
@@ -566,6 +579,7 @@ struct DashboardSnapshot {
     workspace_snapshots: Vec<WorkspaceSnapshotRow>,
     workspace_entries: Vec<WorkspaceEntryRow>,
     workspace_error: Option<String>,
+    labels: HashMap<Id, String>,
     now_key: i128,
 }
 
@@ -598,6 +612,7 @@ enum WorkspaceEntryKind {
 struct BranchSnapshot {
     head: Option<CommitHandle>,
     data: TribleSet,
+    delta: TribleSet,
 }
 
 fn diagnostics_ui(nb: &mut NotebookCtx) {
@@ -824,20 +839,68 @@ _Live view of the agent pile, exec queue, and message activity._"
     });
 
     nb.view(move |ui| {
-        let state = dashboard.read(ui);
+        let mut state = dashboard.read_mut(ui);
         with_padding(ui, padding, |ui| {
             ui.heading("Activity timeline");
-            let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                return;
+            let mut timeline_limit_changed = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.small("Recent events:");
+                for preset in TIMELINE_LIMIT_PRESETS {
+                    let selected = state.timeline_limit == preset;
+                    let label = if selected {
+                        format!("[{preset}]")
+                    } else {
+                        preset.to_string()
+                    };
+                    if ui.add(Button::new(label)).clicked() && !selected {
+                        state.timeline_limit = preset;
+                        timeline_limit_changed = true;
+                    }
+                }
+                ui.small("custom");
+                let mut custom_limit = state.timeline_limit as u64;
+                if ui
+                    .add(egui::DragValue::new(&mut custom_limit).range(
+                        TIMELINE_LIMIT_MIN as u64..=TIMELINE_LIMIT_MAX as u64,
+                    ))
+                    .changed()
+                {
+                    state.timeline_limit = custom_limit as usize;
+                    timeline_limit_changed = true;
+                }
+            });
+            if timeline_limit_changed {
+                refresh_snapshot(&mut state);
+                state.last_snapshot_refresh_at = Some(Instant::now());
+            }
+
+            let snapshot = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                snapshot.clone()
             };
+
+            if snapshot.timeline_rows.is_empty() {
+                ui.small("No activity yet.");
+            } else if snapshot.timeline_rows.len() < snapshot.timeline_total_rows {
+                ui.small(format!(
+                    "Showing latest {} of {} events.",
+                    snapshot.timeline_rows.len(),
+                    snapshot.timeline_total_rows
+                ));
+            } else {
+                ui.small(format!("{} events.", snapshot.timeline_total_rows));
+            }
+
             if let Some(err) = &snapshot.exec_error {
                 ui.colored_label(egui::Color32::RED, format!("Exec branch: {err}"));
             }
             if snapshot.timeline_rows.is_empty() {
                 ui.label("No activity yet.");
-            } else {
-                render_activity_timeline(ui, snapshot.now_key, &snapshot.timeline_rows);
+                return;
             }
+            render_activity_timeline(ui, snapshot.now_key, &snapshot.timeline_rows);
         });
     });
 
@@ -1026,6 +1089,7 @@ fn refresh_snapshot(state: &mut DashboardState) {
     let context_selected = state.context_selected_chunk;
     let context_show_children = state.context_show_children;
     let context_show_origins = state.context_show_origins;
+    let timeline_limit = state.timeline_limit;
     let repo = match state.repo.as_mut() {
         Some(repo) => repo,
         None => {
@@ -1041,6 +1105,7 @@ fn refresh_snapshot(state: &mut DashboardState) {
         context_selected,
         context_show_children,
         context_show_origins,
+        timeline_limit,
     );
     if let Ok(snapshot) = &result {
         if let Some(agent_config) = snapshot.agent_config.as_ref() {
@@ -1096,12 +1161,14 @@ fn load_snapshot(
     context_selected_chunk: Option<Id>,
     context_show_children: bool,
     context_show_origins: bool,
+    timeline_limit: usize,
 ) -> Result<DashboardSnapshot, String> {
     let pile_path = PathBuf::from(&config.pile_path);
-    let branches = list_branches(repo.storage_mut())?;
-    let mut previous_map = previous
+    let previous_for_reuse = previous
         .as_ref()
-        .filter(|snapshot| snapshot.pile_path == pile_path)
+        .filter(|snapshot| snapshot.pile_path == pile_path);
+    let branches = list_branches(repo.storage_mut())?;
+    let mut previous_map = previous_for_reuse
         .map(|snapshot| snapshot.branch_data.clone())
         .unwrap_or_default();
 
@@ -1168,6 +1235,13 @@ fn load_snapshot(
     let relations_data = union_branches(&branch_data, &relations_ids);
     let teams_data = union_branches(&branch_data, &teams_ids);
     let workspace_data = union_branches(&branch_data, &workspace_ids);
+    let config_delta = union_branch_deltas(&branch_data, &config_ids);
+    let exec_delta = union_branch_deltas(&branch_data, &exec_ids);
+    let compass_delta = union_branch_deltas(&branch_data, &compass_ids);
+    let local_delta = union_branch_deltas(&branch_data, &local_ids);
+    let relations_delta = union_branch_deltas(&branch_data, &relations_ids);
+    let teams_delta = union_branch_deltas(&branch_data, &teams_ids);
+    let workspace_delta = union_branch_deltas(&branch_data, &workspace_ids);
 
     let mut reader_ws = if let Some(ws) = reader_ws {
         ws
@@ -1182,7 +1256,13 @@ fn load_snapshot(
             agent_config_error,
             context_chunks: Vec::new(),
             context_selected: None,
+            exec_rows: Vec::new(),
+            reasoning_summaries: Vec::new(),
+            reason_rows: Vec::new(),
+            local_message_rows: Vec::new(),
+            compass_status_rows: Vec::new(),
             timeline_rows: Vec::new(),
+            timeline_total_rows: 0,
             compass_rows: Vec::new(),
             compass_notes: HashMap::new(),
             compass_error,
@@ -1198,6 +1278,7 @@ fn load_snapshot(
             workspace_snapshots: Vec::new(),
             workspace_entries: Vec::new(),
             workspace_error,
+            labels: HashMap::new(),
             now_key,
         });
     };
@@ -1222,10 +1303,19 @@ fn load_snapshot(
         workspace_error,
         config,
         &mut reader_ws,
+        previous_for_reuse,
+        &config_delta,
+        &exec_delta,
+        &compass_delta,
+        &local_delta,
+        &relations_delta,
+        &teams_delta,
+        &workspace_delta,
         workspace_selected_snapshot,
         context_selected_chunk,
         context_show_children,
         context_show_origins,
+        timeline_limit,
     ))
 }
 
@@ -1249,21 +1339,69 @@ fn build_snapshot(
     workspace_error: Option<String>,
     config: &DashboardConfig,
     ws: &mut Workspace<Pile>,
+    previous: Option<&DashboardSnapshot>,
+    config_delta: &TribleSet,
+    exec_delta: &TribleSet,
+    compass_delta: &TribleSet,
+    local_delta: &TribleSet,
+    relations_delta: &TribleSet,
+    teams_delta: &TribleSet,
+    workspace_delta: &TribleSet,
     workspace_selected_snapshot: Option<Id>,
     context_selected_chunk: Option<Id>,
     context_show_children: bool,
     context_show_origins: bool,
+    timeline_limit: usize,
 ) -> DashboardSnapshot {
     let now_key = epoch_key(now_epoch());
-    let relations_people = collect_relations_people(&relations_data, ws);
-    let relations_labels = collect_relations_labels(&relations_people);
+    let (relations_people, relations_labels) = if relations_delta.is_empty() {
+        if let Some(previous) = previous {
+            (
+                previous.relations_people.clone(),
+                previous.relations_labels.clone(),
+            )
+        } else {
+            let rows = collect_relations_people(&relations_data, ws);
+            let labels = collect_relations_labels(&rows);
+            (rows, labels)
+        }
+    } else {
+        let rows = collect_relations_people(&relations_data, ws);
+        let labels = collect_relations_labels(&rows);
+        (rows, labels)
+    };
     let local_me_id = resolve_person_ref(&relations_people, &config.local_me);
     let local_peer_id = resolve_person_ref(&relations_people, &config.local_peer);
-    let agent_config = collect_agent_config(&config_data, ws);
-    let exec_rows = collect_exec_rows(&exec_data, ws);
-    let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
-    let reason_rows = collect_reason_rows(&exec_data, ws);
-    let context_chunks = collect_context_chunks(&exec_data);
+    let agent_config = if config_delta.is_empty() {
+        previous.and_then(|snapshot| snapshot.agent_config.clone())
+    } else {
+        collect_agent_config(&config_data, ws)
+    };
+    let exec_rows = collect_exec_rows_incremental(
+        &exec_data,
+        exec_delta,
+        previous.map(|snapshot| snapshot.exec_rows.as_slice()),
+        ws,
+    );
+    let reasoning_summaries = collect_reasoning_summaries_incremental(
+        &exec_data,
+        exec_delta,
+        previous.map(|snapshot| snapshot.reasoning_summaries.as_slice()),
+        ws,
+    );
+    let reason_rows = collect_reason_rows_incremental(
+        &exec_data,
+        exec_delta,
+        previous.map(|snapshot| snapshot.reason_rows.as_slice()),
+        ws,
+    );
+    let context_chunks = if exec_delta.is_empty() {
+        previous
+            .map(|snapshot| snapshot.context_chunks.clone())
+            .unwrap_or_else(|| collect_context_chunks(&exec_data))
+    } else {
+        collect_context_chunks(&exec_data)
+    };
     let context_selected = build_context_selected(
         ws,
         &context_chunks,
@@ -1271,17 +1409,63 @@ fn build_snapshot(
         context_show_children,
         context_show_origins,
     );
-    let compass_rows = collect_compass_rows(&compass_data, ws);
-    let compass_status_rows = collect_compass_status_rows(&compass_data);
-    let compass_notes = collect_compass_notes(&compass_data, ws);
-    let local_message_rows = collect_local_messages(&local_data, ws);
-    let (teams_messages, teams_chats) = collect_teams_messages(&teams_data, ws);
-    let workspace_snapshots = collect_workspace_snapshots(&workspace_data, ws);
+    let (compass_rows, compass_status_rows, compass_notes) = if compass_delta.is_empty() {
+        if let Some(previous) = previous {
+            (
+                previous.compass_rows.clone(),
+                previous.compass_status_rows.clone(),
+                previous.compass_notes.clone(),
+            )
+        } else {
+            (
+                collect_compass_rows(&compass_data, ws),
+                collect_compass_status_rows(&compass_data),
+                collect_compass_notes(&compass_data, ws),
+            )
+        }
+    } else {
+        (
+            collect_compass_rows(&compass_data, ws),
+            collect_compass_status_rows(&compass_data),
+            collect_compass_notes(&compass_data, ws),
+        )
+    };
+    let local_message_rows = collect_local_messages_incremental(
+        &local_data,
+        local_delta,
+        previous.map(|snapshot| snapshot.local_message_rows.as_slice()),
+        ws,
+    );
+    let (teams_messages, teams_chats) = if teams_delta.is_empty() {
+        if let Some(previous) = previous {
+            (
+                previous.teams_messages.clone(),
+                previous.teams_chats.clone(),
+            )
+        } else {
+            collect_teams_messages(&teams_data, ws)
+        }
+    } else {
+        collect_teams_messages(&teams_data, ws)
+    };
+    let workspace_snapshots = if workspace_delta.is_empty() {
+        previous
+            .map(|snapshot| snapshot.workspace_snapshots.clone())
+            .unwrap_or_else(|| collect_workspace_snapshots(&workspace_data, ws))
+    } else {
+        collect_workspace_snapshots(&workspace_data, ws)
+    };
     let workspace_latest_id = workspace_snapshots.first().map(|row| row.id);
     let workspace_preview_id = workspace_selected_snapshot.or(workspace_latest_id);
     let workspace_entries = collect_workspace_entries(&workspace_data, ws, workspace_preview_id);
-    let labels = collect_labels(&exec_data, ws);
-    let timeline_rows = build_activity_timeline(
+    let labels = if exec_delta.is_empty() {
+        previous
+            .map(|snapshot| snapshot.labels.clone())
+            .unwrap_or_else(|| collect_labels(&exec_data, ws))
+    } else {
+        collect_labels(&exec_data, ws)
+    };
+    let (timeline_rows, timeline_total_rows) = build_activity_timeline(
         &exec_rows,
         &reasoning_summaries,
         &reason_rows,
@@ -1294,6 +1478,7 @@ fn build_snapshot(
         &compass_status_rows,
         &compass_notes,
         &labels,
+        timeline_limit,
     );
 
     DashboardSnapshot {
@@ -1305,7 +1490,13 @@ fn build_snapshot(
         agent_config_error,
         context_chunks,
         context_selected,
+        exec_rows,
+        reasoning_summaries,
+        reason_rows,
+        local_message_rows,
+        compass_status_rows,
         timeline_rows,
+        timeline_total_rows,
         compass_rows,
         compass_notes,
         compass_error,
@@ -1321,6 +1512,7 @@ fn build_snapshot(
         workspace_snapshots,
         workspace_entries,
         workspace_error,
+        labels,
         now_key,
     }
 }
@@ -1493,32 +1685,38 @@ fn load_branch_snapshot(
         .pull(branch_id)
         .map_err(|err| format!("pull branch: {err:?}"))?;
     let head = ws.head();
-    let data = if let Some(prev_snapshot) = previous {
+    let (data, delta) = if let Some(prev_snapshot) = previous {
         if prev_snapshot.head == head {
-            prev_snapshot.data
+            (prev_snapshot.data, TribleSet::new())
         } else if let (Some(prev_head), Some(_)) = (prev_snapshot.head, head) {
             match ws.checkout(prev_head..) {
                 Ok(delta) => {
                     let mut data = prev_snapshot.data;
                     if !delta.is_empty() {
-                        data += delta;
+                        data += delta.clone();
                     }
-                    data
+                    (data, delta)
                 }
-                Err(_) => ws.checkout(..).map_err(|err| format!("checkout: {err}"))?,
+                Err(_) => {
+                    let data = ws.checkout(..).map_err(|err| format!("checkout: {err}"))?;
+                    let delta = data.difference(&prev_snapshot.data);
+                    (data, delta)
+                }
             }
         } else if head.is_none() {
-            TribleSet::new()
+            (TribleSet::new(), TribleSet::new())
         } else {
-            ws.checkout(..).map_err(|err| format!("checkout: {err}"))?
+            let data = ws.checkout(..).map_err(|err| format!("checkout: {err}"))?;
+            (data.clone(), data)
         }
     } else if head.is_none() {
-        TribleSet::new()
+        (TribleSet::new(), TribleSet::new())
     } else {
-        ws.checkout(..).map_err(|err| format!("checkout: {err}"))?
+        let data = ws.checkout(..).map_err(|err| format!("checkout: {err}"))?;
+        (data.clone(), data)
     };
 
-    Ok(BranchSnapshot { head, data })
+    Ok(BranchSnapshot { head, data, delta })
 }
 
 fn union_branches(branch_data: &HashMap<Id, BranchSnapshot>, ids: &[Id]) -> TribleSet {
@@ -1526,6 +1724,16 @@ fn union_branches(branch_data: &HashMap<Id, BranchSnapshot>, ids: &[Id]) -> Trib
     for id in ids {
         if let Some(snapshot) = branch_data.get(id) {
             union += snapshot.data.clone();
+        }
+    }
+    union
+}
+
+fn union_branch_deltas(branch_data: &HashMap<Id, BranchSnapshot>, ids: &[Id]) -> TribleSet {
+    let mut union = TribleSet::new();
+    for id in ids {
+        if let Some(snapshot) = branch_data.get(id) {
+            union += snapshot.delta.clone();
         }
     }
     union
@@ -1752,21 +1960,205 @@ fn latest_llm_profile_entry_id(data: &TribleSet, profile_id: Id) -> Option<Id> {
 
 fn load_optional_id_attr(data: &TribleSet, entity_id: Id, attr: Attribute<GenId>) -> Option<Id> {
     find!(
-        (entity: Id, value: Value<GenId>),
-        pattern!(data, [{ ?entity @ attr: ?value }])
+        (value: Value<GenId>),
+        pattern!(data, [{ entity_id @ attr: ?value }])
     )
     .into_iter()
-    .find_map(|(entity, value)| (entity == entity_id).then_some(Id::try_from_value(&value).ok())?)
+    .find_map(|(value,)| Id::try_from_value(&value).ok())
 }
 
 fn load_optional_u64_attr(data: &TribleSet, entity_id: Id, attr: Attribute<U256BE>) -> Option<u64> {
     find!(
-        (entity: Id, value: Value<U256BE>),
-        pattern!(data, [{ ?entity @ attr: ?value }])
+        (value: Value<U256BE>),
+        pattern!(data, [{ entity_id @ attr: ?value }])
     )
     .into_iter()
-    .find_map(|(entity, value)| (entity == entity_id).then_some(value))
+    .next()
+    .map(|(value,)| value)
     .and_then(u256be_to_u64)
+}
+
+fn load_optional_interval_attr(
+    data: &TribleSet,
+    entity_id: Id,
+    attr: Attribute<NsTAIInterval>,
+) -> Option<i128> {
+    find!(
+        (value: Value<NsTAIInterval>),
+        pattern!(data, [{ entity_id @ attr: ?value }])
+    )
+    .into_iter()
+    .next()
+    .map(|(value,)| interval_key(value))
+}
+
+fn collect_exec_rows_incremental(
+    data: &TribleSet,
+    delta: &TribleSet,
+    previous: Option<&[ExecRow]>,
+    ws: &mut Workspace<Pile>,
+) -> Vec<ExecRow> {
+    let Some(previous_rows) = previous else {
+        return collect_exec_rows(data, ws);
+    };
+    if delta.is_empty() {
+        return previous_rows.to_vec();
+    }
+
+    let changed_request_ids = collect_changed_exec_request_ids(data, delta);
+    if changed_request_ids.is_empty() {
+        return previous_rows.to_vec();
+    }
+
+    let mut rows: HashMap<Id, ExecRow> = previous_rows
+        .iter()
+        .cloned()
+        .map(|row| (row.request_id, row))
+        .collect();
+    for request_id in changed_request_ids {
+        if let Some(row) = collect_exec_row(data, ws, request_id) {
+            rows.insert(request_id, row);
+        }
+    }
+    sort_exec_rows(rows)
+}
+
+fn collect_changed_exec_request_ids(data: &TribleSet, delta: &TribleSet) -> HashSet<Id> {
+    let mut ids = HashSet::new();
+    for (request_id,) in find!(
+        (request_id: Id),
+        pattern_changes!(data, delta, [{
+            ?request_id @
+            playground_exec::kind: playground_exec::kind_command_request,
+        }])
+    ) {
+        ids.insert(request_id);
+    }
+    for (request_id,) in find!(
+        (request_id: Id),
+        pattern_changes!(data, delta, [{ ?request_id @ playground_exec::requested_at: _?requested_at }])
+    ) {
+        ids.insert(request_id);
+    }
+    for (request_id,) in find!(
+        (request_id: Id),
+        pattern_changes!(data, delta, [{ _?event_id @ playground_exec::about_request: ?request_id }])
+    ) {
+        ids.insert(request_id);
+    }
+    ids
+}
+
+fn collect_exec_row(data: &TribleSet, ws: &mut Workspace<Pile>, request_id: Id) -> Option<ExecRow> {
+    let command_handle = find!(
+        (command: Value<Handle<Blake3, LongString>>),
+        pattern!(data, [{
+            request_id @
+            playground_exec::kind: playground_exec::kind_command_request,
+            playground_exec::command_text: ?command,
+        }])
+    )
+    .into_iter()
+    .next()
+    .map(|(command,)| command)?;
+    let command = load_text(ws, command_handle).unwrap_or_else(|| "<missing>".to_string());
+    let requested_at = load_optional_interval_attr(data, request_id, playground_exec::requested_at);
+
+    let mut progress: Option<ProgressInfo> = None;
+    for (event_id,) in find!(
+        (event_id: Id),
+        pattern!(data, [{
+            ?event_id @
+            playground_exec::kind: playground_exec::kind_in_progress,
+            playground_exec::about_request: request_id,
+        }])
+    ) {
+        let info = ProgressInfo {
+            attempt: load_optional_u64_attr(data, event_id, playground_exec::attempt).unwrap_or(0),
+            started_at: load_optional_interval_attr(data, event_id, playground_exec::started_at),
+            worker: load_optional_id_attr(data, event_id, playground_exec::worker),
+        };
+        let replace = progress.as_ref().is_none_or(|existing| {
+            info.attempt > existing.attempt
+                || (info.attempt == existing.attempt
+                    && info.started_at.unwrap_or(i128::MIN)
+                        > existing.started_at.unwrap_or(i128::MIN))
+        });
+        if replace {
+            progress = Some(info);
+        }
+    }
+
+    let mut result: Option<ResultInfo> = None;
+    for (event_id,) in find!(
+        (event_id: Id),
+        pattern!(data, [{
+            ?event_id @
+            playground_exec::kind: playground_exec::kind_command_result,
+            playground_exec::about_request: request_id,
+        }])
+    ) {
+        let info = ResultInfo {
+            attempt: load_optional_u64_attr(data, event_id, playground_exec::attempt).unwrap_or(0),
+            finished_at: load_optional_interval_attr(data, event_id, playground_exec::finished_at),
+            exit_code: load_optional_u64_attr(data, event_id, playground_exec::exit_code),
+            stdout_text: load_optional_string_attr(
+                data,
+                ws,
+                event_id,
+                playground_exec::stdout_text,
+            ),
+            stderr_text: load_optional_string_attr(
+                data,
+                ws,
+                event_id,
+                playground_exec::stderr_text,
+            ),
+            error: load_optional_string_attr(data, ws, event_id, playground_exec::error),
+        };
+        let replace = result.as_ref().is_none_or(|existing| {
+            info.attempt > existing.attempt
+                || (info.attempt == existing.attempt
+                    && info.finished_at.unwrap_or(i128::MIN)
+                        > existing.finished_at.unwrap_or(i128::MIN))
+        });
+        if replace {
+            result = Some(info);
+        }
+    }
+
+    let status = if let Some(result) = result.as_ref() {
+        if result.error.is_some() {
+            ExecStatus::Failed
+        } else {
+            ExecStatus::Done
+        }
+    } else if progress.is_some() {
+        ExecStatus::Running
+    } else {
+        ExecStatus::Pending
+    };
+
+    Some(ExecRow {
+        request_id,
+        command,
+        status,
+        requested_at,
+        started_at: progress.as_ref().and_then(|info| info.started_at),
+        finished_at: result.as_ref().and_then(|info| info.finished_at),
+        exit_code: result.as_ref().and_then(|info| info.exit_code),
+        worker: progress.as_ref().and_then(|info| info.worker),
+        stdout_text: result.as_ref().and_then(|info| info.stdout_text.clone()),
+        stderr_text: result.as_ref().and_then(|info| info.stderr_text.clone()),
+        error: result.as_ref().and_then(|info| info.error.clone()),
+    })
+}
+
+fn sort_exec_rows(rows: HashMap<Id, ExecRow>) -> Vec<ExecRow> {
+    let mut list: Vec<ExecRow> = rows.into_values().collect();
+    list.sort_by_key(|row| row.requested_at.unwrap_or(i128::MIN));
+    list.reverse();
+    list
 }
 
 fn collect_exec_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ExecRow> {
@@ -1851,10 +2243,114 @@ fn collect_exec_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ExecRow>
         };
     }
 
-    let mut list: Vec<ExecRow> = rows.into_values().collect();
-    list.sort_by_key(|row| row.requested_at.unwrap_or(i128::MIN));
-    list.reverse();
+    sort_exec_rows(rows)
+}
+
+fn collect_local_messages_incremental(
+    data: &TribleSet,
+    delta: &TribleSet,
+    previous: Option<&[LocalMessageRow]>,
+    ws: &mut Workspace<Pile>,
+) -> Vec<LocalMessageRow> {
+    let Some(previous_rows) = previous else {
+        return collect_local_messages(data, ws);
+    };
+    if delta.is_empty() {
+        return previous_rows.to_vec();
+    }
+    let changed_message_ids = collect_changed_local_message_ids(data, delta);
+    if changed_message_ids.is_empty() {
+        return previous_rows.to_vec();
+    }
+    let mut rows: HashMap<Id, LocalMessageRow> = previous_rows
+        .iter()
+        .cloned()
+        .map(|row| (row.id, row))
+        .collect();
+    for message_id in changed_message_ids {
+        if let Some(row) = collect_local_message_row(data, ws, message_id) {
+            rows.insert(message_id, row);
+        }
+    }
+    let mut list: Vec<LocalMessageRow> = rows.into_values().collect();
+    list.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
     list
+}
+
+fn collect_changed_local_message_ids(data: &TribleSet, delta: &TribleSet) -> HashSet<Id> {
+    let mut ids = HashSet::new();
+    for (message_id,) in find!(
+        (message_id: Id),
+        pattern_changes!(data, delta, [{
+            ?message_id @
+            metadata::tag: &LOCAL_KIND_MESSAGE_ID,
+        }])
+    ) {
+        ids.insert(message_id);
+    }
+    for (message_id,) in find!(
+        (message_id: Id),
+        pattern_changes!(data, delta, [{
+            _?read_id @
+            metadata::tag: &LOCAL_KIND_READ_ID,
+            local_messages::about_message: ?message_id,
+        }])
+    ) {
+        ids.insert(message_id);
+    }
+    ids
+}
+
+fn collect_local_message_row(
+    data: &TribleSet,
+    ws: &mut Workspace<Pile>,
+    message_id: Id,
+) -> Option<LocalMessageRow> {
+    let message = find!(
+        (
+            from: Id,
+            to: Id,
+            body_handle: Value<Handle<Blake3, LongString>>,
+            created_at: Value<NsTAIInterval>
+        ),
+        pattern!(&data, [{
+            message_id @
+            metadata::tag: &LOCAL_KIND_MESSAGE_ID,
+            local_messages::from: ?from,
+            local_messages::to: ?to,
+            local_messages::body: ?body_handle,
+            local_messages::created_at: ?created_at,
+        }])
+    )
+    .into_iter()
+    .next()?;
+    let (from, to, body_handle, created_at) = message;
+    let body = load_text(ws, body_handle).unwrap_or_else(|| "<missing>".to_string());
+
+    let mut readers: HashSet<Id> = HashSet::new();
+    for (reader_id,) in find!(
+        (reader_id: Id),
+        pattern!(&data, [{
+            _?read_id @
+            metadata::tag: &LOCAL_KIND_READ_ID,
+            local_messages::about_message: message_id,
+            local_messages::reader: ?reader_id,
+            local_messages::read_at: _?read_at,
+        }])
+    ) {
+        readers.insert(reader_id);
+    }
+
+    let mut reader_list: Vec<Id> = readers.into_iter().collect();
+    reader_list.sort_by_key(|id| format!("{id:x}"));
+    Some(LocalMessageRow {
+        id: message_id,
+        created_at: Some(interval_key(created_at)),
+        from_id: from,
+        to_id: to,
+        body,
+        readers: reader_list,
+    })
 }
 
 fn collect_local_messages(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<LocalMessageRow> {
@@ -2372,6 +2868,134 @@ fn load_optional_archive_handle_attr(
     .map(|(handle,)| handle)
 }
 
+fn sort_reasoning_summaries(rows: HashMap<Id, ReasoningSummaryRow>) -> Vec<ReasoningSummaryRow> {
+    let mut list: Vec<ReasoningSummaryRow> = rows.into_values().collect();
+    list.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
+    list.reverse();
+    list
+}
+
+fn collect_reasoning_summaries_incremental(
+    data: &TribleSet,
+    delta: &TribleSet,
+    previous: Option<&[ReasoningSummaryRow]>,
+    ws: &mut Workspace<Pile>,
+) -> Vec<ReasoningSummaryRow> {
+    let Some(previous_rows) = previous else {
+        return collect_reasoning_summaries(data, ws);
+    };
+    if delta.is_empty() {
+        return previous_rows.to_vec();
+    }
+    let changed_result_ids = collect_changed_result_ids(data, delta);
+    if changed_result_ids.is_empty() {
+        return previous_rows.to_vec();
+    }
+
+    let mut rows: HashMap<Id, ReasoningSummaryRow> = previous_rows
+        .iter()
+        .cloned()
+        .map(|row| (row.result_id, row))
+        .collect();
+    for result_id in changed_result_ids {
+        if let Some(row) = collect_reasoning_summary_row(data, ws, result_id) {
+            rows.insert(result_id, row);
+        }
+    }
+    sort_reasoning_summaries(rows)
+}
+
+fn collect_changed_result_ids(data: &TribleSet, delta: &TribleSet) -> HashSet<Id> {
+    let mut ids = HashSet::new();
+    for (result_id,) in find!(
+        (result_id: Id),
+        pattern_changes!(data, delta, [{ ?result_id @ llm_chat::kind: llm_chat::kind_result }])
+    ) {
+        ids.insert(result_id);
+    }
+    for (result_id,) in find!(
+        (result_id: Id),
+        pattern_changes!(data, delta, [{ ?result_id @ llm_chat::reasoning_text: _?reasoning_handle }])
+    ) {
+        ids.insert(result_id);
+    }
+    for (result_id,) in find!(
+        (result_id: Id),
+        pattern_changes!(data, delta, [{ ?result_id @ llm_chat::response_raw: _?raw_handle }])
+    ) {
+        ids.insert(result_id);
+    }
+    for (result_id,) in find!(
+        (result_id: Id),
+        pattern_changes!(data, delta, [{ ?result_id @ llm_chat::finished_at: _?finished_at }])
+    ) {
+        ids.insert(result_id);
+    }
+    ids
+}
+
+fn collect_reasoning_summary_row(
+    data: &TribleSet,
+    ws: &mut Workspace<Pile>,
+    result_id: Id,
+) -> Option<ReasoningSummaryRow> {
+    let finished_at = find!(
+        (finished_at: Value<NsTAIInterval>),
+        pattern!(data, [{
+            result_id @
+            llm_chat::kind: llm_chat::kind_result,
+            llm_chat::finished_at: ?finished_at,
+        }])
+    )
+    .into_iter()
+    .next()
+    .map(|(finished_at,)| interval_key(finished_at))?;
+
+    let summary = if let Some((reasoning_handle,)) = find!(
+        (reasoning_handle: Value<Handle<Blake3, LongString>>),
+        pattern!(data, [{
+            result_id @
+            llm_chat::kind: llm_chat::kind_result,
+            llm_chat::reasoning_text: ?reasoning_handle,
+        }])
+    )
+    .into_iter()
+    .next()
+    {
+        load_text(ws, reasoning_handle).unwrap_or_default()
+    } else if let Some((raw_handle,)) = find!(
+        (raw_handle: Value<Handle<Blake3, LongString>>),
+        pattern!(data, [{
+            result_id @
+            llm_chat::kind: llm_chat::kind_result,
+            llm_chat::response_raw: ?raw_handle,
+        }])
+    )
+    .into_iter()
+    .next()
+    {
+        let raw = load_text(ws, raw_handle).unwrap_or_default();
+        let response_json = parse_response_json(&raw)?;
+        let summaries = extract_reasoning_summaries(&response_json);
+        if summaries.is_empty() {
+            return None;
+        }
+        summaries.join("\n")
+    } else {
+        return None;
+    };
+
+    if summary.trim().is_empty() {
+        return None;
+    }
+
+    Some(ReasoningSummaryRow {
+        result_id,
+        created_at: Some(finished_at),
+        summary,
+    })
+}
+
 fn collect_reasoning_summaries(
     data: &TribleSet,
     ws: &mut Workspace<Pile>,
@@ -2436,14 +3060,155 @@ fn collect_reasoning_summaries(
         }
 
         rows.push(ReasoningSummaryRow {
+            result_id,
             created_at: Some(interval_key(finished_at)),
             summary,
         });
     }
-
     rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
     rows.reverse();
     rows
+}
+
+fn sort_reason_rows(rows: HashMap<Id, ReasonRow>) -> Vec<ReasonRow> {
+    let mut list: Vec<ReasonRow> = rows.into_values().collect();
+    list.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
+    list.reverse();
+    list
+}
+
+fn collect_reason_rows_incremental(
+    data: &TribleSet,
+    delta: &TribleSet,
+    previous: Option<&[ReasonRow]>,
+    ws: &mut Workspace<Pile>,
+) -> Vec<ReasonRow> {
+    let Some(previous_rows) = previous else {
+        return collect_reason_rows(data, ws);
+    };
+    if delta.is_empty() {
+        return previous_rows.to_vec();
+    }
+    let changed_reason_ids = collect_changed_reason_ids(data, delta);
+    if changed_reason_ids.is_empty() {
+        return previous_rows.to_vec();
+    }
+    let mut rows: HashMap<Id, ReasonRow> = previous_rows
+        .iter()
+        .cloned()
+        .map(|row| (row.id, row))
+        .collect();
+    for reason_id in changed_reason_ids {
+        if let Some(row) = collect_reason_row(data, ws, reason_id) {
+            rows.insert(reason_id, row);
+        }
+    }
+    sort_reason_rows(rows)
+}
+
+fn collect_changed_reason_ids(data: &TribleSet, delta: &TribleSet) -> HashSet<Id> {
+    let mut ids = HashSet::new();
+    for (reason_id,) in find!(
+        (reason_id: Id),
+        pattern_changes!(data, delta, [{ ?reason_id @ metadata::tag: &REASON_KIND_EVENT_ID }])
+    ) {
+        ids.insert(reason_id);
+    }
+    for (reason_id,) in find!(
+        (reason_id: Id),
+        pattern_changes!(data, delta, [{ ?reason_id @ reason_events::text: _?text }])
+    ) {
+        ids.insert(reason_id);
+    }
+    for (reason_id,) in find!(
+        (reason_id: Id),
+        pattern_changes!(data, delta, [{ ?reason_id @ reason_events::created_at: _?at }])
+    ) {
+        ids.insert(reason_id);
+    }
+    for (reason_id,) in find!(
+        (reason_id: Id),
+        pattern_changes!(data, delta, [{ ?reason_id @ reason_events::about_turn: _?turn_id }])
+    ) {
+        ids.insert(reason_id);
+    }
+    for (reason_id,) in find!(
+        (reason_id: Id),
+        pattern_changes!(data, delta, [{ ?reason_id @ reason_events::worker: _?worker_id }])
+    ) {
+        ids.insert(reason_id);
+    }
+    for (reason_id,) in find!(
+        (reason_id: Id),
+        pattern_changes!(data, delta, [{ ?reason_id @ reason_events::command_text: _?command_handle }])
+    ) {
+        ids.insert(reason_id);
+    }
+    ids
+}
+
+fn collect_reason_row(
+    data: &TribleSet,
+    ws: &mut Workspace<Pile>,
+    reason_id: Id,
+) -> Option<ReasonRow> {
+    let (text_handle, created_at) = find!(
+        (
+            text_handle: Value<Handle<Blake3, LongString>>,
+            created_at: Value<NsTAIInterval>
+        ),
+        pattern!(data, [{
+            reason_id @
+            metadata::tag: &REASON_KIND_EVENT_ID,
+            reason_events::text: ?text_handle,
+            reason_events::created_at: ?created_at,
+        }])
+    )
+    .into_iter()
+    .next()?;
+    let text = load_text(ws, text_handle)?;
+    let turn_id = find!(
+        (turn_id: Id),
+        pattern!(data, [{
+            reason_id @
+            metadata::tag: &REASON_KIND_EVENT_ID,
+            reason_events::about_turn: ?turn_id,
+        }])
+    )
+    .into_iter()
+    .next()
+    .map(|(turn_id,)| turn_id);
+    let worker_id = find!(
+        (worker_id: Id),
+        pattern!(data, [{
+            reason_id @
+            metadata::tag: &REASON_KIND_EVENT_ID,
+            reason_events::worker: ?worker_id,
+        }])
+    )
+    .into_iter()
+    .next()
+    .map(|(worker_id,)| worker_id);
+    let command_text = find!(
+        (command_handle: Value<Handle<Blake3, LongString>>),
+        pattern!(data, [{
+            reason_id @
+            metadata::tag: &REASON_KIND_EVENT_ID,
+            reason_events::command_text: ?command_handle,
+        }])
+    )
+    .into_iter()
+    .next()
+    .and_then(|(command_handle,)| load_text(ws, command_handle));
+
+    Some(ReasonRow {
+        id: reason_id,
+        created_at: Some(interval_key(created_at)),
+        text,
+        turn_id,
+        worker_id,
+        command_text,
+    })
 }
 
 fn collect_reason_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ReasonRow> {
@@ -2505,6 +3270,7 @@ fn collect_reason_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Reason
             continue;
         };
         rows.push(ReasonRow {
+            id: reason_id,
             created_at: Some(interval_key(created_at)),
             text,
             turn_id: turn_by_reason.get(&reason_id).copied(),
@@ -2512,7 +3278,6 @@ fn collect_reason_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Reason
             command_text: command_by_reason.get(&reason_id).cloned(),
         });
     }
-
     rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
     rows.reverse();
     rows
@@ -2714,7 +3479,9 @@ fn build_activity_timeline(
     compass_status_rows: &[CompassStatusRow],
     compass_notes: &HashMap<Id, Vec<CompassNoteRow>>,
     labels: &HashMap<Id, String>,
-) -> Vec<TimelineRow> {
+    limit: usize,
+) -> (Vec<TimelineRow>, usize) {
+    let limit = limit.max(1);
     let mut rows = Vec::new();
 
     for row in exec_rows {
@@ -2855,7 +3622,11 @@ fn build_activity_timeline(
 
     rows.sort_by_key(|row| row.at.unwrap_or(i128::MIN));
     rows.reverse();
-    rows
+    let total_rows = rows.len();
+    if rows.len() > limit {
+        rows.truncate(limit);
+    }
+    (rows, total_rows)
 }
 
 fn parse_compass_stamp(stamp: &str) -> Option<i128> {
@@ -4192,33 +4963,17 @@ fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRo
     } else {
         ACTIVITY_TIMELINE_HEIGHT
     };
-    if diagnostics_is_headless() {
-        egui::ScrollArea::vertical()
-            .id_salt("activity_timeline_scroll")
-            .auto_shrink([false, false])
-            .min_scrolled_height(min_scrolled_height)
-            .max_height(max_height)
-            .show(ui, |ui| {
-                for row in rows {
-                    render_timeline_row(ui, now_key, row);
-                    ui.add_space(8.0);
-                }
-            });
-    } else {
-        egui::ScrollArea::vertical()
-            .id_salt("activity_timeline_scroll")
-            .auto_shrink([false, false])
-            .min_scrolled_height(min_scrolled_height)
-            .max_height(max_height)
-            .show_rows(ui, ACTIVITY_TIMELINE_ROW_HEIGHT, rows.len(), |ui, row_range| {
-                ui.spacing_mut().item_spacing.y = 8.0;
-                for row_index in row_range {
-                    if let Some(row) = rows.get(row_index) {
-                        render_timeline_row(ui, now_key, row);
-                    }
-                }
-            });
-    }
+    egui::ScrollArea::vertical()
+        .id_salt("activity_timeline_scroll")
+        .auto_shrink([false, false])
+        .min_scrolled_height(min_scrolled_height)
+        .max_height(max_height)
+        .show(ui, |ui| {
+            for row in rows {
+                render_timeline_row(ui, now_key, row);
+                ui.add_space(8.0);
+            }
+        });
 }
 
 fn render_context_compaction(
