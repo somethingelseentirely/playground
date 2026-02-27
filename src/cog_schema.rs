@@ -12,6 +12,7 @@ pub mod playground_cog {
         "FA6090FB00EEE2F5EF1E51F1F68EA5B8" as pub prompt: Handle<Blake3, LongString>;
         "99F834C6A6A050DECBE42D639288B559" as pub created_at: NsTAIInterval;
         "D986EF113EFA588E6247420A06DA87BA" as pub about_exec_result: GenId;
+        "CC8828B7462BFDA45A296C0A12C6333C" as pub moment_boundary_turn_id: GenId;
     }
 
     /// Root id for describing the playground_cog protocol.
@@ -21,6 +22,9 @@ pub mod playground_cog {
     /// Tag for thought entities.
     #[allow(non_upper_case_globals)]
     pub const kind_thought: Id = id_hex!("26FA0606BCF4AA73F868B029596828DB");
+    /// Tag for moment-boundary marker entities.
+    #[allow(non_upper_case_globals)]
+    pub const kind_moment_boundary: Id = id_hex!("C1E52577C5F7C9066B10FBC7EA844B17");
 
     /// Tag for playground_cog protocol metadata.
     #[allow(non_upper_case_globals)]
@@ -90,6 +94,14 @@ where
         metadata::tag: playground_cog::tag_kind,
     };
 
+    tribles += entity! { ExclusiveId::force_ref(&playground_cog::kind_moment_boundary) @
+        metadata::name: blobs.put("kind_moment_boundary".to_string())?,
+        metadata::description: blobs.put(
+            "Moment-boundary marker entity kind.".to_string(),
+        )?,
+        metadata::tag: playground_cog::tag_kind,
+    };
+
     Ok(tribles)
 }
 
@@ -109,6 +121,7 @@ where
     metadata += describe_attribute(blobs, &playground_cog::prompt)?;
     metadata += describe_attribute(blobs, &playground_cog::created_at)?;
     metadata += describe_attribute(blobs, &playground_cog::about_exec_result)?;
+    metadata += describe_attribute(blobs, &playground_cog::moment_boundary_turn_id)?;
 
     Ok(metadata)
 }

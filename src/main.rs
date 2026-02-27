@@ -112,6 +112,8 @@ enum MemoryCommand {
         about = "Backfill context memory chunks from archive/exec without creating LLM requests"
     )]
     Build(MemoryBuildArgs),
+    #[command(about = "Flush current moment into memory by setting the moment boundary turn")]
+    FlushMoment(MemoryFlushMomentArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -138,6 +140,13 @@ struct MemoryBuildArgs {
     max_archive_leaves: Option<usize>,
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct MemoryFlushMomentArgs {
+    /// Optional explicit turn id. If omitted, uses the latest finished exec turn.
+    #[arg(long)]
+    turn_id: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -408,6 +417,7 @@ fn run_memory_command(config: Config, command: MemoryCommand) -> Result<()> {
     match command {
         MemoryCommand::Estimate(args) => run_memory_estimate(config, args),
         MemoryCommand::Build(args) => run_memory_build(config, args),
+        MemoryCommand::FlushMoment(args) => run_memory_flush_moment(config, args),
     }
 }
 
@@ -829,6 +839,53 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
     }
 
     result
+}
+
+fn run_memory_flush_moment(config: Config, args: MemoryFlushMomentArgs) -> Result<()> {
+    let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
+    let result = (|| -> Result<Id> {
+        let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace for flush-moment")?;
+        let catalog = ws.checkout(..).context("checkout workspace")?;
+        let mut core_index = CoreIndex::default();
+        core_index.apply_delta(&catalog, &catalog);
+
+        let target_turn_id = if let Some(raw) = args.turn_id.as_deref() {
+            let turn_id = parse_hex_id(raw, "turn_id")?;
+            if !core_index.has_finished_command_result(turn_id) {
+                return Err(anyhow!("turn_id {turn_id:x} is not a finished exec turn"));
+            }
+            turn_id
+        } else {
+            sorted_finished_command_results(&core_index)
+                .into_iter()
+                .last()
+                .ok_or_else(|| anyhow!("no finished exec turns found"))?
+                .id
+        };
+
+        let now = epoch_interval(now_epoch());
+        let boundary_id = ufoid();
+        let mut change = TribleSet::new();
+        change += entity! { &boundary_id @
+            playground_cog::kind: playground_cog::kind_moment_boundary,
+            playground_cog::created_at: now,
+            playground_cog::moment_boundary_turn_id: target_turn_id,
+        };
+        ws.commit(change, None, Some("flush moment boundary"));
+        push_workspace(&mut repo, &mut ws).context("push moment boundary")?;
+        Ok(target_turn_id)
+    })();
+
+    if let Err(err) = close_repo(repo) {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+
+    let target_turn_id = result?;
+    println!("moment boundary turn set to {:x}", target_turn_id);
+    Ok(())
 }
 
 fn resolve_compaction_profile_info(config: &Config) -> CompactionProfileInfo {
@@ -1783,6 +1840,13 @@ struct CoreThought {
 }
 
 #[derive(Debug, Clone)]
+struct CoreMomentBoundary {
+    id: Id,
+    created_at: Option<Value<NsTAIInterval>>,
+    turn_id: Option<Id>,
+}
+
+#[derive(Debug, Clone)]
 struct CoreCommandRequest {
     id: Id,
     requested_at: Option<Value<NsTAIInterval>>,
@@ -1806,6 +1870,7 @@ struct CoreIndex {
     llm_done_requests: HashSet<Id>,
     request_for_thought: HashMap<Id, Id>,
     thoughts: HashMap<Id, CoreThought>,
+    moment_boundaries: HashMap<Id, CoreMomentBoundary>,
     thought_for_exec_result: HashMap<Id, Id>,
     requested_thoughts: HashSet<Id>,
     llm_results: HashMap<Id, LlmResultEntry>,
@@ -2146,6 +2211,21 @@ impl CoreIndex {
             });
         }
 
+        for (boundary_id,) in find!(
+            (boundary_id: Id),
+            pattern_changes!(updated, delta, [{
+                ?boundary_id @ playground_cog::kind: playground_cog::kind_moment_boundary
+            }])
+        ) {
+            self.moment_boundaries
+                .entry(boundary_id)
+                .or_insert(CoreMomentBoundary {
+                    id: boundary_id,
+                    created_at: None,
+                    turn_id: None,
+                });
+        }
+
         for (thought_id, created_at) in find!(
             (thought_id: Id, created_at: Value<NsTAIInterval>),
             pattern_changes!(updated, delta, [{
@@ -2153,6 +2233,9 @@ impl CoreIndex {
             }])
         ) {
             if let Some(entry) = self.thoughts.get_mut(&thought_id) {
+                entry.created_at = Some(created_at);
+            }
+            if let Some(entry) = self.moment_boundaries.get_mut(&thought_id) {
                 entry.created_at = Some(created_at);
             }
         }
@@ -2177,6 +2260,17 @@ impl CoreIndex {
             self.thought_for_exec_result
                 .insert(exec_result_id, thought_id);
             self.used_exec_results.insert(exec_result_id);
+        }
+
+        for (boundary_id, turn_id) in find!(
+            (boundary_id: Id, turn_id: Id),
+            pattern_changes!(updated, delta, [{
+                ?boundary_id @ playground_cog::moment_boundary_turn_id: ?turn_id
+            }])
+        ) {
+            if let Some(entry) = self.moment_boundaries.get_mut(&boundary_id) {
+                entry.turn_id = Some(turn_id);
+            }
         }
 
         for (result_id, about_request) in find!(
@@ -2514,6 +2608,24 @@ impl CoreIndex {
             .filter(|result| !self.used_exec_results.contains(&result.id))
             .cloned()
             .max_by_key(|result| result.finished_at.map(interval_key).unwrap_or(i128::MIN))
+    }
+
+    fn latest_moment_boundary_turn_id(&self) -> Option<Id> {
+        self.moment_boundaries
+            .values()
+            .filter_map(|entry| {
+                let created = entry.created_at.map(interval_key)?;
+                let turn_id = entry.turn_id?;
+                Some((created, entry.id, turn_id))
+            })
+            .max_by_key(|(created, boundary_id, _)| (*created, *boundary_id))
+            .map(|(_, _, turn_id)| turn_id)
+    }
+
+    fn has_finished_command_result(&self, turn_id: Id) -> bool {
+        self.command_results
+            .get(&turn_id)
+            .is_some_and(|result| result.finished_at.is_some())
     }
 }
 
@@ -3214,7 +3326,16 @@ fn build_prompt_messages_with_compaction(
         None,
     )?;
 
-    let (mut messages, _used_chars) = build_memory_cover_messages(ws, &index, body_budget_chars)?;
+    let moment_boundary_end_key = resolve_moment_boundary_end_key(
+        results.as_slice(),
+        core_index.latest_moment_boundary_turn_id(),
+    );
+    let (mut messages, _used_chars) = build_memory_cover_messages(
+        ws,
+        &index,
+        body_budget_chars,
+        moment_boundary_end_key,
+    )?;
     if let Some(guard) = memory_loop_guard_message(ws, core_index, results.as_slice(), current_pos)?
     {
         messages.push(ChatMessage::user(guard));
@@ -3241,6 +3362,19 @@ fn u128_to_usize_saturating(value: u128) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
+fn resolve_moment_boundary_end_key(
+    results: &[CommandResultInfo],
+    moment_boundary_turn_id: Option<Id>,
+) -> Option<i128> {
+    let target = moment_boundary_turn_id?;
+    results.iter().find_map(|result| {
+        if result.id != target {
+            return None;
+        }
+        result.finished_at.map(interval_key)
+    })
+}
+
 #[derive(Debug, Clone)]
 struct MemoryCoverTurn {
     command: String,
@@ -3261,6 +3395,7 @@ fn build_memory_cover_messages(
     ws: &mut Workspace<Pile>,
     index: &ContextChunkIndex,
     budget_chars: usize,
+    moment_boundary_end_key: Option<i128>,
 ) -> Result<(Vec<ChatMessage>, usize)> {
     if budget_chars == 0 {
         return Ok((Vec::new(), 0));
@@ -3315,6 +3450,11 @@ fn build_memory_cover_messages(
             let Some(parent_chunk) = index.chunks.get(parent_id) else {
                 continue;
             };
+            if moment_boundary_end_key
+                .is_some_and(|boundary| interval_key(parent_chunk.end_at) <= boundary)
+            {
+                continue;
+            }
             if parent_chunk.children.len() < 2 {
                 continue;
             }
