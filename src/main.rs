@@ -66,6 +66,11 @@ enum CommandMode {
         #[command(subcommand)]
         command: MemoryCommand,
     },
+    #[command(about = "Manage active headspace (profile + lens settings)")]
+    Headspace {
+        #[command(subcommand)]
+        command: HeadspaceCommand,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -81,11 +86,6 @@ enum ConfigCommand {
     Set(ConfigSetArgs),
     #[command(about = "Clear an optional config field in the pile")]
     Unset(ConfigUnsetArgs),
-    #[command(about = "Manage LLM profiles (headspaces)")]
-    Profile {
-        #[command(subcommand)]
-        command: ProfileCommand,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -122,6 +122,36 @@ enum ProfileCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum HeadspaceCommand {
+    #[command(about = "Show active headspace settings and available profiles")]
+    Show {
+        #[arg(long, default_value_t = false)]
+        show_secrets: bool,
+    },
+    #[command(about = "List available profiles")]
+    List,
+    #[command(about = "Create a new profile and make it active")]
+    Add {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    #[command(about = "Switch active profile by id or name")]
+    Use {
+        #[arg(value_name = "PROFILE")]
+        profile: String,
+    },
+    #[command(about = "Set one field on the active profile")]
+    Set(HeadspaceSetArgs),
+    #[command(about = "Clear one optional field on the active profile")]
+    Unset(HeadspaceUnsetArgs),
+    #[command(about = "Manage memory lenses")]
+    Lens {
+        #[command(subcommand)]
+        command: LensCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum MemoryCommand {
     #[command(about = "Estimate pending compaction work and approximate token/cost usage")]
     Estimate(MemoryEstimateArgs),
@@ -131,11 +161,6 @@ enum MemoryCommand {
     Build(MemoryBuildArgs),
     #[command(about = "Consolidate current moment into memory by setting the moment boundary turn")]
     Consolidate(MemoryConsolidateArgs),
-    #[command(about = "Manage memory lenses")]
-    Lens {
-        #[command(subcommand)]
-        command: LensCommand,
-    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -245,6 +270,22 @@ struct ConfigUnsetArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+#[command(about = "Set one headspace field on the active profile")]
+struct HeadspaceSetArgs {
+    #[arg(value_enum, value_name = "FIELD")]
+    field: HeadspaceField,
+    #[arg(value_name = "VALUE")]
+    value: String,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(about = "Clear one optional headspace field on the active profile")]
+struct HeadspaceUnsetArgs {
+    #[arg(value_enum, value_name = "FIELD")]
+    field: OptionalHeadspaceField,
+}
+
+#[derive(Args, Debug, Clone)]
 #[command(about = "Add a memory lens")]
 struct LensAddArgs {
     #[arg(value_name = "NAME")]
@@ -331,6 +372,29 @@ enum OptionalConfigField {
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
 #[value(rename_all = "kebab-case")]
+enum HeadspaceField {
+    Model,
+    BaseUrl,
+    ApiKey,
+    ReasoningEffort,
+    Stream,
+    ContextWindowTokens,
+    MaxOutputTokens,
+    PromptSafetyMarginTokens,
+    PromptCharsPerToken,
+    CompactionProfileId,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[value(rename_all = "kebab-case")]
+enum OptionalHeadspaceField {
+    ApiKey,
+    ReasoningEffort,
+    CompactionProfileId,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[value(rename_all = "kebab-case")]
 enum LensField {
     Id,
     Prompt,
@@ -404,6 +468,11 @@ fn main() -> Result<()> {
             let config = Config::load(Some(pile_path.as_path())).context("load config")?;
             run_memory_command(config, command)
         }
+        CommandMode::Headspace { command } => {
+            let instance = default_instance_name();
+            let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
+            handle_headspace(Some(pile_path.as_path()), command)
+        }
         CommandMode::Config { command } => {
             let instance = default_instance_name();
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
@@ -465,19 +534,11 @@ struct MergeSimulation {
     final_runs_by_level: BTreeMap<u64, usize>,
 }
 
-fn run_memory_command(mut config: Config, command: MemoryCommand) -> Result<()> {
+fn run_memory_command(config: Config, command: MemoryCommand) -> Result<()> {
     match command {
         MemoryCommand::Estimate(args) => run_memory_estimate(config, args),
         MemoryCommand::Build(args) => run_memory_build(config, args),
         MemoryCommand::Consolidate(args) => run_memory_consolidate(config, args),
-        MemoryCommand::Lens { command } => {
-            let changed = apply_config_lens(&mut config, command)?;
-            if changed {
-                config.store().context("store config")?;
-                let _ = apply_config_lens(&mut config, LensCommand::List)?;
-            }
-            Ok(())
-        }
     }
 }
 
@@ -1193,36 +1254,154 @@ fn handle_config(pile: Option<&Path>, command: ConfigCommand) -> Result<()> {
             config.store().context("store config")?;
             print_config(&config, false);
         }
-        ConfigCommand::Profile { command } => match command {
-            ProfileCommand::List => {
-                let profiles = config::list_llm_profiles(config.pile_path.as_path())
-                    .context("list profiles")?;
-                for profile in profiles {
-                    let active = (config.llm_profile_id == Some(profile.id)).then_some("*");
-                    let active = active.unwrap_or(" ");
-                    println!("{active} {}\t{:x}", profile.name, profile.id);
-                }
-            }
-            ProfileCommand::Add { name } => {
-                config.llm_profile_id = Some(*genid());
-                config.llm_profile_name = name;
+    }
+    Ok(())
+}
+
+fn headspace_field_to_config(field: HeadspaceField) -> ConfigField {
+    match field {
+        HeadspaceField::Model => ConfigField::LlmModel,
+        HeadspaceField::BaseUrl => ConfigField::LlmBaseUrl,
+        HeadspaceField::ApiKey => ConfigField::LlmApiKey,
+        HeadspaceField::ReasoningEffort => ConfigField::LlmReasoningEffort,
+        HeadspaceField::Stream => ConfigField::LlmStream,
+        HeadspaceField::ContextWindowTokens => ConfigField::LlmContextWindowTokens,
+        HeadspaceField::MaxOutputTokens => ConfigField::LlmMaxOutputTokens,
+        HeadspaceField::PromptSafetyMarginTokens => ConfigField::LlmPromptSafetyMarginTokens,
+        HeadspaceField::PromptCharsPerToken => ConfigField::LlmPromptCharsPerToken,
+        HeadspaceField::CompactionProfileId => ConfigField::LlmCompactionProfileId,
+    }
+}
+
+fn optional_headspace_field_to_config(field: OptionalHeadspaceField) -> OptionalConfigField {
+    match field {
+        OptionalHeadspaceField::ApiKey => OptionalConfigField::LlmApiKey,
+        OptionalHeadspaceField::ReasoningEffort => OptionalConfigField::LlmReasoningEffort,
+        OptionalHeadspaceField::CompactionProfileId => OptionalConfigField::LlmCompactionProfileId,
+    }
+}
+
+fn print_profile_list(config: &Config) -> Result<()> {
+    let profiles =
+        config::list_llm_profiles(config.pile_path.as_path()).context("list profiles")?;
+    for profile in profiles {
+        let active = (config.llm_profile_id == Some(profile.id)).then_some("*");
+        let active = active.unwrap_or(" ");
+        println!("{active} {}\t{:x}", profile.name, profile.id);
+    }
+    Ok(())
+}
+
+fn format_option_quoted(value: Option<&str>) -> String {
+    value
+        .map(|v| format!("\"{v}\""))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn redact_option(value: Option<&str>) -> String {
+    match value {
+        Some(_) => "\"<redacted>\"".to_string(),
+        None => "null".to_string(),
+    }
+}
+
+fn print_headspace(config: &Config, show_secrets: bool) -> Result<()> {
+    println!("active:");
+    println!(
+        "  profile_id = {}",
+        config
+            .llm_profile_id
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_string())
+    );
+    println!("  profile_name = \"{}\"", config.llm_profile_name);
+    println!("  model = \"{}\"", config.llm.model);
+    println!("  base_url = \"{}\"", config.llm.base_url);
+    println!(
+        "  api_key = {}",
+        if show_secrets {
+            format_option_quoted(config.llm.api_key.as_deref())
+        } else {
+            redact_option(config.llm.api_key.as_deref())
+        }
+    );
+    println!(
+        "  reasoning_effort = {}",
+        format_option_quoted(config.llm.reasoning_effort.as_deref())
+    );
+    println!("  stream = {}", config.llm.stream);
+    println!(
+        "  context_window_tokens = {}",
+        config.llm.context_window_tokens
+    );
+    println!("  max_output_tokens = {}", config.llm.max_output_tokens);
+    println!(
+        "  prompt_safety_margin_tokens = {}",
+        config.llm.prompt_safety_margin_tokens
+    );
+    println!(
+        "  prompt_chars_per_token = {}",
+        config.llm.prompt_chars_per_token
+    );
+    println!(
+        "  compaction_profile_id = {}",
+        config
+            .llm_compaction_profile_id
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_string())
+    );
+    println!();
+    println!("profiles:");
+    print_profile_list(config)
+}
+
+fn handle_headspace(pile: Option<&Path>, command: HeadspaceCommand) -> Result<()> {
+    let mut config = Config::load(pile).context("load config")?;
+    match command {
+        HeadspaceCommand::Show { show_secrets } => {
+            print_headspace(&config, show_secrets)?;
+        }
+        HeadspaceCommand::List => {
+            print_profile_list(&config)?;
+        }
+        HeadspaceCommand::Add { name } => {
+            config.llm_profile_id = Some(*genid());
+            config.llm_profile_name = name;
+            config.store().context("store config")?;
+            print_headspace(&config, false)?;
+        }
+        HeadspaceCommand::Use { profile } => {
+            let profile_id = resolve_profile_selector(&config, profile.as_str())?;
+            let Some((llm, name)) =
+                config::load_llm_profile(config.pile_path.as_path(), profile_id)?
+            else {
+                return Err(anyhow!("unknown profile {profile_id:x}"));
+            };
+            config.llm_profile_id = Some(profile_id);
+            config.llm_profile_name = name;
+            config.llm = llm;
+            config.store().context("store config")?;
+            print_headspace(&config, false)?;
+        }
+        HeadspaceCommand::Set(args) => {
+            let field = headspace_field_to_config(args.field);
+            apply_config_set(&mut config, field, args.value.as_str())?;
+            config.store().context("store config")?;
+            print_headspace(&config, false)?;
+        }
+        HeadspaceCommand::Unset(args) => {
+            let field = optional_headspace_field_to_config(args.field);
+            apply_config_unset(&mut config, field)?;
+            config.store().context("store config")?;
+            print_headspace(&config, false)?;
+        }
+        HeadspaceCommand::Lens { command } => {
+            let changed = apply_config_lens(&mut config, command)?;
+            if changed {
                 config.store().context("store config")?;
-                print_config(&config, false);
             }
-            ProfileCommand::Use { profile } => {
-                let profile_id = resolve_profile_selector(&config, profile.as_str())?;
-                let Some((llm, name)) =
-                    config::load_llm_profile(config.pile_path.as_path(), profile_id)?
-                else {
-                    return Err(anyhow!("unknown profile {profile_id:x}"));
-                };
-                config.llm_profile_id = Some(profile_id);
-                config.llm_profile_name = name;
-                config.llm = llm;
-                config.store().context("store config")?;
-                print_config(&config, false);
-            }
-        },
+            let _ = apply_config_lens(&mut config, LensCommand::List)?;
+        }
     }
     Ok(())
 }
@@ -1315,7 +1494,7 @@ fn apply_memory_lens_reset(lens: &mut MemoryLensConfig, field: Option<LensField>
         Some(LensField::MaxOutputTokens) => lens.max_output_tokens = defaults.max_output_tokens,
         Some(LensField::Id) => {
             return Err(anyhow!(
-                "cannot reset lens id automatically; set it explicitly with `memory lens set <name> id <hex>`"
+                "cannot reset lens id automatically; set it explicitly with `headspace lens set <name> id <hex>`"
             ));
         }
     }

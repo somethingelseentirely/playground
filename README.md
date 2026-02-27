@@ -115,10 +115,10 @@ Prompts can also be loaded from files:
 
 ```bash
 cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set system-prompt @./system_prompt.txt
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory lens set factual prompt @./memory_lens_factual.txt
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory lens set factual compaction-prompt @./memory_lens_factual_compaction.txt
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory lens add reflective --prompt @./memory_lens_reflective.txt --compaction-prompt @./memory_lens_reflective_compaction.txt --max-output-tokens 160
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory lens list
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile headspace lens set factual prompt @./memory_lens_factual.txt
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile headspace lens set factual compaction-prompt @./memory_lens_factual_compaction.txt
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile headspace lens add reflective --prompt @./memory_lens_reflective.txt --compaction-prompt @./memory_lens_reflective_compaction.txt --max-output-tokens 160
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile headspace lens list
 ```
 
 Prompt files in `playground/prompts/*.md` are generated from templates in
@@ -141,8 +141,8 @@ Clear an optional config field:
 
 ```bash
 cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config unset llm-api-key
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory lens reset factual prompt
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory lens remove reflective
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile headspace lens reset factual prompt
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile headspace lens remove reflective
 ```
 
 Manage LLM profiles (headspaces):
