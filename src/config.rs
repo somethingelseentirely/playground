@@ -26,12 +26,17 @@ const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
 const DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS: u64 = 512;
 const DEFAULT_PROMPT_CHARS_PER_TOKEN: u64 = 4;
 const DEFAULT_COMPACTION_MERGE_ARITY: u64 = 8;
-const DEFAULT_MEMORY_LENS_FACTUAL_PROMPT: &str =
-    include_str!("../prompts/memory_lens_factual.md");
+const DEFAULT_MEMORY_LENS_FACTUAL_PROMPT: &str = include_str!("../prompts/memory_lens_factual.md");
 const DEFAULT_MEMORY_LENS_TECHNICAL_PROMPT: &str =
     include_str!("../prompts/memory_lens_technical.md");
 const DEFAULT_MEMORY_LENS_EMOTIONAL_PROMPT: &str =
     include_str!("../prompts/memory_lens_emotional.md");
+const DEFAULT_MEMORY_LENS_FACTUAL_COMPACTION_PROMPT: &str =
+    include_str!("../prompts/memory_lens_factual_compaction.md");
+const DEFAULT_MEMORY_LENS_TECHNICAL_COMPACTION_PROMPT: &str =
+    include_str!("../prompts/memory_lens_technical_compaction.md");
+const DEFAULT_MEMORY_LENS_EMOTIONAL_COMPACTION_PROMPT: &str =
+    include_str!("../prompts/memory_lens_emotional_compaction.md");
 const DEFAULT_MEMORY_LENS_FACTUAL_MAX_OUTPUT_TOKENS: u64 = 192;
 const DEFAULT_MEMORY_LENS_TECHNICAL_MAX_OUTPUT_TOKENS: u64 = 224;
 const DEFAULT_MEMORY_LENS_EMOTIONAL_MAX_OUTPUT_TOKENS: u64 = 96;
@@ -68,7 +73,6 @@ pub struct Config {
     pub llm_profile_id: Option<Id>,
     pub llm_profile_name: String,
     pub llm_compaction_profile_id: Option<Id>,
-    pub llm_compaction_prompt: Option<String>,
     pub llm_compaction_merge_arity: u64,
     pub memory_lenses: Vec<MemoryLensConfig>,
     pub tavily_api_key: Option<String>,
@@ -116,6 +120,7 @@ pub struct MemoryLensConfig {
     pub id: Id,
     pub name: String,
     pub prompt: String,
+    pub compaction_prompt: String,
     pub max_output_tokens: u64,
 }
 
@@ -263,7 +268,6 @@ fn default_config(pile_path: PathBuf) -> Config {
         llm_profile_id: None,
         llm_profile_name: "default".to_string(),
         llm_compaction_profile_id: None,
-        llm_compaction_prompt: None,
         llm_compaction_merge_arity: default_compaction_merge_arity(),
         memory_lenses: default_memory_lenses(),
         tavily_api_key: None,
@@ -424,14 +428,52 @@ fn ensure_registered_branches_exist(repo: &mut Repository<Pile>, config: &Config
 
 fn has_memory_lens_entries(catalog: &TribleSet) -> bool {
     find!(
-        (entity_id: Id),
+        (
+            entity_id: Id,
+            prompt: Value<Handle<Blake3, LongString>>,
+            compaction_prompt: Value<Handle<Blake3, LongString>>,
+            max_output_tokens: Value<U256BE>
+        ),
         pattern!(catalog, [{
-            ?entity_id @ playground_config::kind: playground_config::kind_memory_lens
+            ?entity_id @
+            playground_config::kind: playground_config::kind_memory_lens,
+            playground_config::memory_lens_prompt: ?prompt,
+            playground_config::memory_lens_compaction_prompt: ?compaction_prompt,
+            playground_config::memory_lens_max_output_tokens: ?max_output_tokens,
         }])
     )
     .into_iter()
     .next()
     .is_some()
+}
+
+fn latest_memory_lens_entries(catalog: &TribleSet) -> HashMap<Id, (Id, i128)> {
+    let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
+    for (entry_id, lens_id, updated_at) in find!(
+        (
+            entry_id: Id,
+            lens_id: Value<GenId>,
+            updated_at: Value<NsTAIInterval>
+        ),
+        pattern!(catalog, [{
+            ?entry_id @
+            playground_config::kind: playground_config::kind_memory_lens,
+            playground_config::updated_at: ?updated_at,
+            playground_config::memory_lens_id: ?lens_id,
+        }])
+    ) {
+        let lens_id = Id::from_value(&lens_id);
+        let key = interval_key(updated_at);
+        latest
+            .entry(lens_id)
+            .and_modify(|slot| {
+                if key > slot.1 {
+                    *slot = (entry_id, key);
+                }
+            })
+            .or_insert((entry_id, key));
+    }
+    latest
 }
 
 fn close_repo(repo: Repository<Pile>) -> Result<()> {
@@ -492,14 +534,6 @@ fn load_latest_config(
         playground_config::active_llm_compaction_profile_id,
     ) {
         config.llm_compaction_profile_id = Some(id);
-    }
-    if let Some(prompt) = load_string_attr(
-        ws,
-        catalog,
-        config_id,
-        playground_config::llm_compaction_prompt,
-    )? {
-        config.llm_compaction_prompt = Some(prompt);
     }
     if let Some(model) = load_string_attr(ws, catalog, config_id, playground_config::llm_model)? {
         config.llm.model = model;
@@ -728,39 +762,21 @@ fn load_latest_memory_lenses(
     ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
 ) -> Result<Vec<MemoryLensConfig>> {
-    let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-    for (entry_id, lens_id, updated_at) in find!(
-        (
-            entry_id: Id,
-            lens_id: Value<GenId>,
-            updated_at: Value<NsTAIInterval>
-        ),
-        pattern!(catalog, [{
-            ?entry_id @
-            playground_config::kind: playground_config::kind_memory_lens,
-            playground_config::updated_at: ?updated_at,
-            playground_config::memory_lens_id: ?lens_id,
-        }])
-    ) {
-        let lens_id = Id::from_value(&lens_id);
-        let key = interval_key(updated_at);
-        latest
-            .entry(lens_id)
-            .and_modify(|slot| {
-                if key > slot.1 {
-                    *slot = (entry_id, key);
-                }
-            })
-            .or_insert((entry_id, key));
-    }
-
-    let mut lenses = Vec::new();
-    for (lens_id, (entry_id, _)) in latest {
+    let latest = latest_memory_lens_entries(catalog);
+    let mut lenses_by_name: HashMap<String, (MemoryLensConfig, i128)> = HashMap::new();
+    for (lens_id, (entry_id, updated_key)) in latest {
         let name = load_string_attr(ws, catalog, entry_id, metadata::name)?
             .unwrap_or_else(|| format!("lens-{lens_id:x}"));
         let prompt =
             load_string_attr(ws, catalog, entry_id, playground_config::memory_lens_prompt)?
                 .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing prompt"))?;
+        let compaction_prompt = load_string_attr(
+            ws,
+            catalog,
+            entry_id,
+            playground_config::memory_lens_compaction_prompt,
+        )?
+        .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing compaction_prompt"))?;
         let max_output_tokens = load_u256_attr(
             catalog,
             entry_id,
@@ -768,13 +784,25 @@ fn load_latest_memory_lenses(
         )
         .and_then(u256be_to_u64)
         .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing max_output_tokens"))?;
-        lenses.push(MemoryLensConfig {
+        let lens = MemoryLensConfig {
             id: lens_id,
-            name,
+            name: name.clone(),
             prompt,
+            compaction_prompt,
             max_output_tokens,
-        });
+        };
+        let key = name.to_lowercase();
+        lenses_by_name
+            .entry(key)
+            .and_modify(|slot| {
+                if updated_key > slot.1 {
+                    *slot = (lens.clone(), updated_key);
+                }
+            })
+            .or_insert((lens, updated_key));
     }
+    let mut lenses: Vec<MemoryLensConfig> =
+        lenses_by_name.into_values().map(|(lens, _)| lens).collect();
     lenses.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
     Ok(lenses)
 }
@@ -785,11 +813,17 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let profile_id = config
         .llm_profile_id
         .ok_or_else(|| anyhow!("config missing active LLM profile id"))?;
-    let memory_lenses = if config.memory_lenses.is_empty() {
+    let mut memory_lenses = if config.memory_lenses.is_empty() {
         default_memory_lenses()
     } else {
         config.memory_lenses.clone()
     };
+    memory_lenses.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
     let system_prompt = ws.put(config.system_prompt.clone());
     let branch = ws.put(config.branch.clone());
@@ -850,10 +884,6 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     if let Some(id) = config.llm_compaction_profile_id {
         change += entity! { &config_id @ playground_config::active_llm_compaction_profile_id: id };
     }
-    if let Some(prompt) = config.llm_compaction_prompt.as_ref() {
-        let handle = ws.put(prompt.clone());
-        change += entity! { &config_id @ playground_config::llm_compaction_prompt: handle };
-    }
     if let Some(key) = config.tavily_api_key.as_ref() {
         let handle = ws.put(key.clone());
         change += entity! { &config_id @ playground_config::tavily_api_key: handle };
@@ -899,6 +929,7 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         let lens_entry_id = ufoid();
         let lens_name = ws.put(lens.name.clone());
         let lens_prompt = ws.put(lens.prompt.clone());
+        let lens_compaction_prompt = ws.put(lens.compaction_prompt.clone());
         let lens_max_output_tokens: Value<U256BE> = lens.max_output_tokens.to_value();
         change += entity! { &lens_entry_id @
             playground_config::kind: playground_config::kind_memory_lens,
@@ -906,6 +937,7 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
             playground_config::memory_lens_id: lens.id,
             metadata::name: lens_name,
             playground_config::memory_lens_prompt: lens_prompt,
+            playground_config::memory_lens_compaction_prompt: lens_compaction_prompt,
             playground_config::memory_lens_max_output_tokens: lens_max_output_tokens,
         };
     }
@@ -1021,18 +1053,21 @@ fn default_memory_lenses() -> Vec<MemoryLensConfig> {
             id: MEMORY_LENS_ID_FACTUAL,
             name: "factual".to_string(),
             prompt: DEFAULT_MEMORY_LENS_FACTUAL_PROMPT.to_string(),
+            compaction_prompt: DEFAULT_MEMORY_LENS_FACTUAL_COMPACTION_PROMPT.to_string(),
             max_output_tokens: DEFAULT_MEMORY_LENS_FACTUAL_MAX_OUTPUT_TOKENS,
         },
         MemoryLensConfig {
             id: MEMORY_LENS_ID_TECHNICAL,
             name: "technical".to_string(),
             prompt: DEFAULT_MEMORY_LENS_TECHNICAL_PROMPT.to_string(),
+            compaction_prompt: DEFAULT_MEMORY_LENS_TECHNICAL_COMPACTION_PROMPT.to_string(),
             max_output_tokens: DEFAULT_MEMORY_LENS_TECHNICAL_MAX_OUTPUT_TOKENS,
         },
         MemoryLensConfig {
             id: MEMORY_LENS_ID_EMOTIONAL,
             name: "emotional".to_string(),
             prompt: DEFAULT_MEMORY_LENS_EMOTIONAL_PROMPT.to_string(),
+            compaction_prompt: DEFAULT_MEMORY_LENS_EMOTIONAL_COMPACTION_PROMPT.to_string(),
             max_output_tokens: DEFAULT_MEMORY_LENS_EMOTIONAL_MAX_OUTPUT_TOKENS,
         },
     ]

@@ -26,6 +26,7 @@ pub mod playground_context {
         "2BEDFA649267106369790C09B02C6958" as pub archive_thread_root: GenId;
         "40487DA1794795FDDBFD128E0B746EE6" as pub archive_conversation: Handle<Blake3, LongString>;
         "49669D61D012A65A69999A214E8FFDA2" as pub archive_source_format: ShortString;
+        "2407DD8440508B474B073A5ECF098500" as pub lens_id: GenId;
     }
 
     /// Root id for describing the playground_context protocol.
@@ -137,6 +138,7 @@ where
     metadata += describe_attribute(blobs, &playground_context::archive_thread_root)?;
     metadata += describe_attribute(blobs, &playground_context::archive_conversation)?;
     metadata += describe_attribute(blobs, &playground_context::archive_source_format)?;
+    metadata += describe_attribute(blobs, &playground_context::lens_id)?;
 
     Ok(metadata)
 }

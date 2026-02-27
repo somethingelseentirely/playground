@@ -89,6 +89,23 @@ enum ConfigCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum LensCommand {
+    #[command(about = "List configured memory lenses")]
+    List,
+    #[command(about = "Add a memory lens")]
+    Add(LensAddArgs),
+    #[command(about = "Set one field on a memory lens")]
+    Set(LensSetArgs),
+    #[command(about = "Reset one field (or all fields) to defaults for a memory lens")]
+    Reset(LensResetArgs),
+    #[command(about = "Remove a memory lens")]
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ProfileCommand {
     #[command(about = "List available profiles")]
     List,
@@ -114,6 +131,11 @@ enum MemoryCommand {
     Build(MemoryBuildArgs),
     #[command(about = "Consolidate current moment into memory by setting the moment boundary turn")]
     Consolidate(MemoryConsolidateArgs),
+    #[command(about = "Manage memory lenses")]
+    Lens {
+        #[command(subcommand)]
+        command: LensCommand,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -222,6 +244,41 @@ struct ConfigUnsetArgs {
     field: OptionalConfigField,
 }
 
+#[derive(Args, Debug, Clone)]
+#[command(about = "Add a memory lens")]
+struct LensAddArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(long, value_name = "ID")]
+    id: Option<String>,
+    #[arg(long, value_name = "PROMPT")]
+    prompt: Option<String>,
+    #[arg(long = "compaction-prompt", value_name = "PROMPT")]
+    compaction_prompt: Option<String>,
+    #[arg(long = "max-output-tokens", value_name = "TOKENS")]
+    max_output_tokens: Option<u64>,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(about = "Set one field on a memory lens")]
+struct LensSetArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(value_enum, value_name = "FIELD")]
+    field: LensField,
+    #[arg(value_name = "VALUE")]
+    value: String,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(about = "Reset one field (or all fields) to defaults for a memory lens")]
+struct LensResetArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(value_enum, value_name = "FIELD")]
+    field: Option<LensField>,
+}
+
 #[derive(ValueEnum, Debug, Clone, Copy)]
 #[value(rename_all = "kebab-case")]
 enum ConfigField {
@@ -253,14 +310,7 @@ enum ConfigField {
     LlmPromptSafetyMarginTokens,
     LlmPromptCharsPerToken,
     LlmCompactionProfileId,
-    LlmCompactionPrompt,
     LlmCompactionMergeArity,
-    MemoryLensFactualPrompt,
-    MemoryLensTechnicalPrompt,
-    MemoryLensEmotionalPrompt,
-    MemoryLensFactualMaxOutputTokens,
-    MemoryLensTechnicalMaxOutputTokens,
-    MemoryLensEmotionalMaxOutputTokens,
     ExecDefaultCwd,
     ExecSandboxProfile,
 }
@@ -275,15 +325,17 @@ enum OptionalConfigField {
     ExaApiKey,
     LlmReasoningEffort,
     LlmCompactionProfileId,
-    LlmCompactionPrompt,
-    MemoryLensFactualPrompt,
-    MemoryLensTechnicalPrompt,
-    MemoryLensEmotionalPrompt,
-    MemoryLensFactualMaxOutputTokens,
-    MemoryLensTechnicalMaxOutputTokens,
-    MemoryLensEmotionalMaxOutputTokens,
     ExecDefaultCwd,
     ExecSandboxProfile,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[value(rename_all = "kebab-case")]
+enum LensField {
+    Id,
+    Prompt,
+    CompactionPrompt,
+    MaxOutputTokens,
 }
 
 #[derive(Parser, Debug)]
@@ -413,11 +465,19 @@ struct MergeSimulation {
     final_runs_by_level: BTreeMap<u64, usize>,
 }
 
-fn run_memory_command(config: Config, command: MemoryCommand) -> Result<()> {
+fn run_memory_command(mut config: Config, command: MemoryCommand) -> Result<()> {
     match command {
         MemoryCommand::Estimate(args) => run_memory_estimate(config, args),
         MemoryCommand::Build(args) => run_memory_build(config, args),
         MemoryCommand::Consolidate(args) => run_memory_consolidate(config, args),
+        MemoryCommand::Lens { command } => {
+            let changed = apply_config_lens(&mut config, command)?;
+            if changed {
+                config.store().context("store config")?;
+                let _ = apply_config_lens(&mut config, LensCommand::List)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -505,10 +565,20 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
             stage,
         );
 
-        let pending_archive_total = archive_messages
+        let lens_ids: Vec<Id> = config.memory_lenses.iter().map(|lens| lens.id).collect();
+        let pending_archive_total: usize = archive_messages
             .iter()
-            .filter(|msg| !index.chunk_for_archive_message.contains_key(&msg.id))
-            .count();
+            .map(|msg| {
+                lens_ids
+                    .iter()
+                    .filter(|lens_id| {
+                        !index
+                            .chunk_for_archive_message
+                            .contains_key(&(msg.id, **lens_id))
+                    })
+                    .count()
+            })
+            .sum();
         let pending_archive = args
             .max_archive_leaves
             .map(|limit| pending_archive_total.min(limit))
@@ -517,8 +587,17 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
         let pending_exec_total = if args.include_exec {
             sorted_finished_command_results(&core_index)
                 .into_iter()
-                .filter(|result| !index.chunk_for_exec_result.contains_key(&result.id))
-                .count()
+                .map(|result| {
+                    lens_ids
+                        .iter()
+                        .filter(|lens_id| {
+                            !index
+                                .chunk_for_exec_result
+                                .contains_key(&(result.id, **lens_id))
+                        })
+                        .count()
+                })
+                .sum()
         } else {
             0
         };
@@ -529,7 +608,34 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
             "simulating carry merges for {new_leaves} pending leaves (k={merge_arity})..."
         ));
         let stage = Instant::now();
-        let sim = simulate_kary_merges(&index.root_by_level, merge_arity, new_leaves);
+        let mut new_leaves_per_lens: HashMap<Id, usize> = HashMap::new();
+        for message in &archive_messages {
+            for lens_id in &lens_ids {
+                if !index
+                    .chunk_for_archive_message
+                    .contains_key(&(message.id, *lens_id))
+                {
+                    *new_leaves_per_lens.entry(*lens_id).or_insert(0) += 1;
+                }
+            }
+        }
+        if args.include_exec {
+            for result in sorted_finished_command_results(&core_index) {
+                for lens_id in &lens_ids {
+                    if !index
+                        .chunk_for_exec_result
+                        .contains_key(&(result.id, *lens_id))
+                    {
+                        *new_leaves_per_lens.entry(*lens_id).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let sim = simulate_kary_merges(
+            &index.roots_by_lens_level,
+            merge_arity,
+            &new_leaves_per_lens,
+        );
         memory_status_timed("merge simulation complete", stage);
 
         memory_status("sampling existing context leaf summaries...");
@@ -547,6 +653,7 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
             archive_messages.as_slice(),
             &index,
             &relations,
+            lens_ids.as_slice(),
             args.sample_leaves,
         )?;
         memory_status_timed(
@@ -844,7 +951,11 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
 fn run_memory_consolidate(config: Config, args: MemoryConsolidateArgs) -> Result<()> {
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
     let result = (|| -> Result<Id> {
-        let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace for memory consolidate")?;
+        let mut ws = pull_workspace(
+            &mut repo,
+            branch_id,
+            "pull workspace for memory consolidate",
+        )?;
         let catalog = ws.checkout(..).context("checkout workspace")?;
         let mut core_index = CoreIndex::default();
         core_index.apply_delta(&catalog, &catalog);
@@ -932,50 +1043,62 @@ fn looks_local_base_url(base_url: &str) -> bool {
 }
 
 fn simulate_kary_merges(
-    root_by_level: &HashMap<u64, Vec<Id>>,
+    roots_by_lens_level: &HashMap<(Id, u64), Vec<Id>>,
     merge_arity: usize,
-    new_leaves: usize,
+    new_leaves_per_lens: &HashMap<Id, usize>,
 ) -> MergeSimulation {
     let k = merge_arity.max(2);
-    let mut counts: BTreeMap<u64, usize> = root_by_level
-        .iter()
-        .filter_map(|(level, runs)| {
-            if runs.is_empty() {
-                None
-            } else {
-                Some((*level, runs.len()))
-            }
-        })
-        .collect();
+    let mut by_lens: BTreeMap<Id, BTreeMap<u64, usize>> = BTreeMap::new();
+    for ((lens_id, level), runs) in roots_by_lens_level {
+        if runs.is_empty() {
+            continue;
+        }
+        by_lens
+            .entry(*lens_id)
+            .or_default()
+            .insert(*level, runs.len());
+    }
     let mut sim = MergeSimulation::default();
 
-    for _ in 0..new_leaves {
-        *counts.entry(0).or_insert(0) += 1;
-        let mut level = 0u64;
-        loop {
-            let Some(count) = counts.get(&level).copied() else {
-                break;
-            };
-            if count < k {
-                break;
+    for (lens_id, new_leaves) in new_leaves_per_lens {
+        let counts = by_lens.entry(*lens_id).or_default();
+        for _ in 0..*new_leaves {
+            *counts.entry(0).or_insert(0) += 1;
+            let mut level = 0u64;
+            loop {
+                let Some(count) = counts.get(&level).copied() else {
+                    break;
+                };
+                if count < k {
+                    break;
+                }
+                let carry_count = count / k;
+                let remainder = count % k;
+                if remainder == 0 {
+                    counts.remove(&level);
+                } else {
+                    counts.insert(level, remainder);
+                }
+                *counts.entry(level + 1).or_insert(0) += carry_count;
+                sim.merge_calls = sim.merge_calls.saturating_add(carry_count);
+                sim.merged_children_total = sim
+                    .merged_children_total
+                    .saturating_add(carry_count.saturating_mul(k));
+                level = level.saturating_add(1);
             }
-            let carry_count = count / k;
-            let remainder = count % k;
-            if remainder == 0 {
-                counts.remove(&level);
-            } else {
-                counts.insert(level, remainder);
-            }
-            *counts.entry(level + 1).or_insert(0) += carry_count;
-            sim.merge_calls = sim.merge_calls.saturating_add(carry_count);
-            sim.merged_children_total = sim
-                .merged_children_total
-                .saturating_add(carry_count.saturating_mul(k));
-            level = level.saturating_add(1);
         }
     }
 
-    sim.final_runs_by_level = counts;
+    let mut combined: BTreeMap<u64, usize> = BTreeMap::new();
+    for counts in by_lens.values() {
+        for (level, count) in counts {
+            *combined.entry(*level).or_insert(0) += *count;
+        }
+    }
+    sim.final_runs_by_level = combined
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .collect();
     sim
 }
 
@@ -1007,6 +1130,7 @@ fn sample_pending_archive_leaf_summary_chars(
     archive_messages: &[ArchiveMessageInfo],
     index: &ContextChunkIndex,
     relations: &RelationsIndex,
+    lens_ids: &[Id],
     sample_size: usize,
 ) -> Result<(usize, usize)> {
     let mut total = 0usize;
@@ -1015,7 +1139,11 @@ fn sample_pending_archive_leaf_summary_chars(
         if count >= sample_size {
             break;
         }
-        if index.chunk_for_archive_message.contains_key(&message.id) {
+        if lens_ids.iter().all(|lens_id| {
+            index
+                .chunk_for_archive_message
+                .contains_key(&(message.id, *lens_id))
+        }) {
             continue;
         }
 
@@ -1056,7 +1184,7 @@ fn handle_config(pile: Option<&Path>, command: ConfigCommand) -> Result<()> {
             print_config(&config, show_secrets);
         }
         ConfigCommand::Set(args) => {
-            apply_config_set(&mut config, args)?;
+            apply_config_set(&mut config, args.field, args.value.as_str())?;
             config.store().context("store config")?;
             print_config(&config, false);
         }
@@ -1118,6 +1246,27 @@ fn resolve_profile_selector(config: &Config, raw: &str) -> Result<Id> {
     Ok(first.id)
 }
 
+fn default_memory_lens_template(name: &str) -> Result<MemoryLensConfig> {
+    if let Some(mut lens) = config::default_memory_lens_by_name(name) {
+        lens.id = *genid();
+        lens.name = name.to_string();
+        return Ok(lens);
+    }
+    let mut lens = config::default_memory_lens_by_name("factual")
+        .ok_or_else(|| anyhow!("missing default memory lens 'factual'"))?;
+    lens.id = *genid();
+    lens.name = name.to_string();
+    Ok(lens)
+}
+
+fn memory_lens_defaults(name: &str) -> Result<MemoryLensConfig> {
+    if let Some(lens) = config::default_memory_lens_by_name(name) {
+        return Ok(lens);
+    }
+    config::default_memory_lens_by_name("factual")
+        .ok_or_else(|| anyhow!("missing default memory lens 'factual'"))
+}
+
 fn get_memory_lens_mut<'a>(config: &'a mut Config, name: &str) -> Result<&'a mut MemoryLensConfig> {
     config
         .memory_lenses
@@ -1126,165 +1275,220 @@ fn get_memory_lens_mut<'a>(config: &'a mut Config, name: &str) -> Result<&'a mut
         .ok_or_else(|| anyhow!("memory lens '{name}' not configured"))
 }
 
-fn apply_config_set(config: &mut Config, args: ConfigSetArgs) -> Result<()> {
-    match args.field {
+fn sort_memory_lenses(config: &mut Config) {
+    config.memory_lenses.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+fn apply_memory_lens_set(lens: &mut MemoryLensConfig, field: LensField, value: &str) -> Result<()> {
+    match field {
+        LensField::Id => {
+            lens.id = parse_hex_id(value, "memory_lens_id")?;
+        }
+        LensField::Prompt => {
+            lens.prompt = load_value_or_file(value, "memory_lens_prompt")?;
+        }
+        LensField::CompactionPrompt => {
+            lens.compaction_prompt = load_value_or_file(value, "memory_lens_compaction_prompt")?;
+        }
+        LensField::MaxOutputTokens => {
+            lens.max_output_tokens = parse_u64(value, "memory_lens_max_output_tokens")?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_memory_lens_reset(lens: &mut MemoryLensConfig, field: Option<LensField>) -> Result<()> {
+    let defaults = memory_lens_defaults(lens.name.as_str())?;
+    match field {
+        None => {
+            lens.prompt = defaults.prompt;
+            lens.compaction_prompt = defaults.compaction_prompt;
+            lens.max_output_tokens = defaults.max_output_tokens;
+        }
+        Some(LensField::Prompt) => lens.prompt = defaults.prompt,
+        Some(LensField::CompactionPrompt) => lens.compaction_prompt = defaults.compaction_prompt,
+        Some(LensField::MaxOutputTokens) => lens.max_output_tokens = defaults.max_output_tokens,
+        Some(LensField::Id) => {
+            return Err(anyhow!(
+                "cannot reset lens id automatically; set it explicitly with `memory lens set <name> id <hex>`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_config_lens(config: &mut Config, command: LensCommand) -> Result<bool> {
+    match command {
+        LensCommand::List => {
+            sort_memory_lenses(config);
+            for lens in &config.memory_lenses {
+                println!(
+                    "{}\t{:x}\tmax_output_tokens={}",
+                    lens.name, lens.id, lens.max_output_tokens
+                );
+            }
+            Ok(false)
+        }
+        LensCommand::Add(args) => {
+            if config
+                .memory_lenses
+                .iter()
+                .any(|lens| lens.name.eq_ignore_ascii_case(args.name.as_str()))
+            {
+                return Err(anyhow!("memory lens '{}' already exists", args.name));
+            }
+            let mut lens = default_memory_lens_template(args.name.as_str())?;
+            if let Some(id) = args.id {
+                lens.id = parse_hex_id(id.as_str(), "memory_lens_id")?;
+            }
+            if let Some(prompt) = args.prompt {
+                lens.prompt = load_value_or_file(prompt.as_str(), "memory_lens_prompt")?;
+            }
+            if let Some(prompt) = args.compaction_prompt {
+                lens.compaction_prompt =
+                    load_value_or_file(prompt.as_str(), "memory_lens_compaction_prompt")?;
+            }
+            if let Some(tokens) = args.max_output_tokens {
+                lens.max_output_tokens = tokens;
+            }
+            config.memory_lenses.push(lens);
+            sort_memory_lenses(config);
+            Ok(true)
+        }
+        LensCommand::Set(args) => {
+            let lens = get_memory_lens_mut(config, args.name.as_str())?;
+            apply_memory_lens_set(lens, args.field, args.value.as_str())?;
+            Ok(true)
+        }
+        LensCommand::Reset(args) => {
+            let lens = get_memory_lens_mut(config, args.name.as_str())?;
+            apply_memory_lens_reset(lens, args.field)?;
+            Ok(true)
+        }
+        LensCommand::Remove { name } => {
+            if config.memory_lenses.len() <= 1 {
+                return Err(anyhow!("cannot remove the last memory lens"));
+            }
+            let before = config.memory_lenses.len();
+            config
+                .memory_lenses
+                .retain(|lens| !lens.name.eq_ignore_ascii_case(name.as_str()));
+            if config.memory_lenses.len() == before {
+                return Err(anyhow!("memory lens '{}' not configured", name));
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn apply_config_set(config: &mut Config, field: ConfigField, value: &str) -> Result<()> {
+    match field {
         ConfigField::SystemPrompt => {
-            config.system_prompt = load_value_or_file(args.value.as_str(), "system_prompt")?;
+            config.system_prompt = load_value_or_file(value, "system_prompt")?;
         }
         ConfigField::Branch => {
-            config.branch = load_value_or_file(args.value.as_str(), "branch")?;
+            config.branch = load_value_or_file(value, "branch")?;
         }
         ConfigField::BranchId => {
-            config.branch_id = Some(parse_hex_id(args.value.as_str(), "branch_id")?);
+            config.branch_id = Some(parse_hex_id(value, "branch_id")?);
         }
         ConfigField::CompassBranchId => {
-            config.compass_branch_id =
-                Some(parse_hex_id(args.value.as_str(), "compass_branch_id")?);
+            config.compass_branch_id = Some(parse_hex_id(value, "compass_branch_id")?);
         }
         ConfigField::ExecBranchId => {
-            config.exec_branch_id = Some(parse_hex_id(args.value.as_str(), "exec_branch_id")?);
+            config.exec_branch_id = Some(parse_hex_id(value, "exec_branch_id")?);
         }
         ConfigField::LocalMessagesBranchId => {
-            config.local_messages_branch_id = Some(parse_hex_id(
-                args.value.as_str(),
-                "local_messages_branch_id",
-            )?);
+            config.local_messages_branch_id =
+                Some(parse_hex_id(value, "local_messages_branch_id")?);
         }
         ConfigField::RelationsBranchId => {
-            config.relations_branch_id =
-                Some(parse_hex_id(args.value.as_str(), "relations_branch_id")?);
+            config.relations_branch_id = Some(parse_hex_id(value, "relations_branch_id")?);
         }
         ConfigField::TeamsBranchId => {
-            config.teams_branch_id = Some(parse_hex_id(args.value.as_str(), "teams_branch_id")?);
+            config.teams_branch_id = Some(parse_hex_id(value, "teams_branch_id")?);
         }
         ConfigField::WorkspaceBranchId => {
-            config.workspace_branch_id =
-                Some(parse_hex_id(args.value.as_str(), "workspace_branch_id")?);
+            config.workspace_branch_id = Some(parse_hex_id(value, "workspace_branch_id")?);
         }
         ConfigField::ArchiveBranchId => {
-            config.archive_branch_id =
-                Some(parse_hex_id(args.value.as_str(), "archive_branch_id")?);
+            config.archive_branch_id = Some(parse_hex_id(value, "archive_branch_id")?);
         }
         ConfigField::WebBranchId => {
-            config.web_branch_id = Some(parse_hex_id(args.value.as_str(), "web_branch_id")?);
+            config.web_branch_id = Some(parse_hex_id(value, "web_branch_id")?);
         }
         ConfigField::MediaBranchId => {
-            config.media_branch_id = Some(parse_hex_id(args.value.as_str(), "media_branch_id")?);
+            config.media_branch_id = Some(parse_hex_id(value, "media_branch_id")?);
         }
         ConfigField::Author => {
-            config.author = load_value_or_file(args.value.as_str(), "author")?;
+            config.author = load_value_or_file(value, "author")?;
         }
         ConfigField::AuthorRole => {
-            config.author_role = load_value_or_file(args.value.as_str(), "author_role")?;
+            config.author_role = load_value_or_file(value, "author_role")?;
         }
         ConfigField::PersonaId => {
-            config.persona_id = Some(parse_hex_id(args.value.as_str(), "persona_id")?);
+            config.persona_id = Some(parse_hex_id(value, "persona_id")?);
         }
         ConfigField::PollMs => {
-            config.poll_ms = parse_u64(args.value.as_str(), "poll_ms")?;
+            config.poll_ms = parse_u64(value, "poll_ms")?;
         }
         ConfigField::LlmModel => {
-            config.llm.model = load_value_or_file(args.value.as_str(), "llm_model")?;
+            config.llm.model = load_value_or_file(value, "llm_model")?;
         }
         ConfigField::LlmBaseUrl => {
-            config.llm.base_url = load_value_or_file(args.value.as_str(), "llm_base_url")?;
+            config.llm.base_url = load_value_or_file(value, "llm_base_url")?;
         }
         ConfigField::LlmApiKey => {
-            config.llm.api_key = Some(load_value_or_file_trimmed(
-                args.value.as_str(),
-                "llm_api_key",
-            )?);
+            config.llm.api_key = Some(load_value_or_file_trimmed(value, "llm_api_key")?);
         }
         ConfigField::TavilyApiKey => {
-            config.tavily_api_key = Some(load_value_or_file_trimmed(
-                args.value.as_str(),
-                "tavily_api_key",
-            )?);
+            config.tavily_api_key = Some(load_value_or_file_trimmed(value, "tavily_api_key")?);
         }
         ConfigField::ExaApiKey => {
-            config.exa_api_key = Some(load_value_or_file_trimmed(
-                args.value.as_str(),
-                "exa_api_key",
-            )?);
+            config.exa_api_key = Some(load_value_or_file_trimmed(value, "exa_api_key")?);
         }
         ConfigField::LlmReasoningEffort => {
-            config.llm.reasoning_effort = Some(load_value_or_file_trimmed(
-                args.value.as_str(),
-                "llm_reasoning_effort",
-            )?);
+            config.llm.reasoning_effort =
+                Some(load_value_or_file_trimmed(value, "llm_reasoning_effort")?);
         }
         ConfigField::LlmStream => {
-            config.llm.stream = parse_bool(args.value.as_str(), "llm_stream")?;
+            config.llm.stream = parse_bool(value, "llm_stream")?;
         }
         ConfigField::LlmContextWindowTokens => {
-            config.llm.context_window_tokens =
-                parse_u64(args.value.as_str(), "llm_context_window_tokens")?;
+            config.llm.context_window_tokens = parse_u64(value, "llm_context_window_tokens")?;
         }
         ConfigField::LlmMaxOutputTokens => {
-            config.llm.max_output_tokens = parse_u64(args.value.as_str(), "llm_max_output_tokens")?;
+            config.llm.max_output_tokens = parse_u64(value, "llm_max_output_tokens")?;
         }
         ConfigField::LlmPromptSafetyMarginTokens => {
             config.llm.prompt_safety_margin_tokens =
-                parse_u64(args.value.as_str(), "llm_prompt_safety_margin_tokens")?;
+                parse_u64(value, "llm_prompt_safety_margin_tokens")?;
         }
         ConfigField::LlmPromptCharsPerToken => {
-            config.llm.prompt_chars_per_token =
-                parse_u64(args.value.as_str(), "llm_prompt_chars_per_token")?;
+            config.llm.prompt_chars_per_token = parse_u64(value, "llm_prompt_chars_per_token")?;
         }
         ConfigField::LlmCompactionProfileId => {
-            config.llm_compaction_profile_id = Some(parse_hex_id(
-                args.value.as_str(),
-                "llm_compaction_profile_id",
-            )?);
-        }
-        ConfigField::LlmCompactionPrompt => {
-            config.llm_compaction_prompt = Some(load_value_or_file(
-                args.value.as_str(),
-                "llm_compaction_prompt",
-            )?);
+            config.llm_compaction_profile_id =
+                Some(parse_hex_id(value, "llm_compaction_profile_id")?);
         }
         ConfigField::LlmCompactionMergeArity => {
-            let factor = parse_u64(args.value.as_str(), "llm_compaction_merge_arity")?;
+            let factor = parse_u64(value, "llm_compaction_merge_arity")?;
             if factor < 2 {
                 return Err(anyhow!("llm_compaction_merge_arity must be >= 2"));
             }
             config.llm_compaction_merge_arity = factor;
         }
-        ConfigField::MemoryLensFactualPrompt => {
-            let prompt = load_value_or_file(args.value.as_str(), "memory_lens_factual_prompt")?;
-            get_memory_lens_mut(config, "factual")?.prompt = prompt;
-        }
-        ConfigField::MemoryLensTechnicalPrompt => {
-            let prompt = load_value_or_file(args.value.as_str(), "memory_lens_technical_prompt")?;
-            get_memory_lens_mut(config, "technical")?.prompt = prompt;
-        }
-        ConfigField::MemoryLensEmotionalPrompt => {
-            let prompt = load_value_or_file(args.value.as_str(), "memory_lens_emotional_prompt")?;
-            get_memory_lens_mut(config, "emotional")?.prompt = prompt;
-        }
-        ConfigField::MemoryLensFactualMaxOutputTokens => {
-            get_memory_lens_mut(config, "factual")?.max_output_tokens =
-                parse_u64(args.value.as_str(), "memory_lens_factual_max_output_tokens")?;
-        }
-        ConfigField::MemoryLensTechnicalMaxOutputTokens => {
-            get_memory_lens_mut(config, "technical")?.max_output_tokens = parse_u64(
-                args.value.as_str(),
-                "memory_lens_technical_max_output_tokens",
-            )?;
-        }
-        ConfigField::MemoryLensEmotionalMaxOutputTokens => {
-            get_memory_lens_mut(config, "emotional")?.max_output_tokens = parse_u64(
-                args.value.as_str(),
-                "memory_lens_emotional_max_output_tokens",
-            )?;
-        }
         ConfigField::ExecDefaultCwd => {
-            let value = load_value_or_file(args.value.as_str(), "exec_default_cwd")?;
+            let value = load_value_or_file(value, "exec_default_cwd")?;
             config.exec.default_cwd = Some(PathBuf::from(value.trim()));
         }
         ConfigField::ExecSandboxProfile => {
-            config.exec.sandbox_profile =
-                Some(parse_hex_id(args.value.as_str(), "exec_sandbox_profile")?);
+            config.exec.sandbox_profile = Some(parse_hex_id(value, "exec_sandbox_profile")?);
         }
     }
     Ok(())
@@ -1299,31 +1503,6 @@ fn apply_config_unset(config: &mut Config, field: OptionalConfigField) -> Result
         OptionalConfigField::ExaApiKey => config.exa_api_key = None,
         OptionalConfigField::LlmReasoningEffort => config.llm.reasoning_effort = None,
         OptionalConfigField::LlmCompactionProfileId => config.llm_compaction_profile_id = None,
-        OptionalConfigField::LlmCompactionPrompt => config.llm_compaction_prompt = None,
-        OptionalConfigField::MemoryLensFactualPrompt
-        | OptionalConfigField::MemoryLensFactualMaxOutputTokens => {
-            let default = config::default_memory_lens_by_name("factual")
-                .ok_or_else(|| anyhow!("missing default memory lens 'factual'"))?;
-            let lens = get_memory_lens_mut(config, "factual")?;
-            lens.prompt = default.prompt;
-            lens.max_output_tokens = default.max_output_tokens;
-        }
-        OptionalConfigField::MemoryLensTechnicalPrompt
-        | OptionalConfigField::MemoryLensTechnicalMaxOutputTokens => {
-            let default = config::default_memory_lens_by_name("technical")
-                .ok_or_else(|| anyhow!("missing default memory lens 'technical'"))?;
-            let lens = get_memory_lens_mut(config, "technical")?;
-            lens.prompt = default.prompt;
-            lens.max_output_tokens = default.max_output_tokens;
-        }
-        OptionalConfigField::MemoryLensEmotionalPrompt
-        | OptionalConfigField::MemoryLensEmotionalMaxOutputTokens => {
-            let default = config::default_memory_lens_by_name("emotional")
-                .ok_or_else(|| anyhow!("missing default memory lens 'emotional'"))?;
-            let lens = get_memory_lens_mut(config, "emotional")?;
-            lens.prompt = default.prompt;
-            lens.max_output_tokens = default.max_output_tokens;
-        }
         OptionalConfigField::ExecDefaultCwd => config.exec.default_cwd = None,
         OptionalConfigField::ExecSandboxProfile => config.exec.sandbox_profile = None,
     }
@@ -1700,14 +1879,6 @@ fn print_config(config: &Config, show_secrets: bool) {
             .unwrap_or_else(|| "null".to_string())
     );
     println!(
-        "compaction_prompt = {}",
-        config
-            .llm_compaction_prompt
-            .as_ref()
-            .map(|value| format!("\"{}\"", value.replace('\"', "\\\"")))
-            .unwrap_or_else(|| "null".to_string())
-    );
-    println!(
         "compaction_merge_arity = {}",
         config.llm_compaction_merge_arity
     );
@@ -1727,6 +1898,11 @@ fn print_config(config: &Config, show_secrets: bool) {
             "memory_lens.{}.prompt = \"{}\"",
             lens.name.replace(' ', "-"),
             lens.prompt.replace('\"', "\\\"")
+        );
+        println!(
+            "memory_lens.{}.compaction_prompt = \"{}\"",
+            lens.name.replace(' ', "-"),
+            lens.compaction_prompt.replace('\"', "\\\"")
         );
     }
 
@@ -2916,6 +3092,7 @@ fn load_archive_messages_incremental(
 #[derive(Debug, Clone)]
 struct ContextChunk {
     id: Id,
+    lens_id: Id,
     level: u64,
     summary: Value<Handle<Blake3, LongString>>,
     start_at: Value<NsTAIInterval>,
@@ -2933,12 +3110,12 @@ struct ContextChunk {
 #[derive(Default)]
 struct ContextChunkIndex {
     chunks: HashMap<Id, ContextChunk>,
-    // The LSM frontier: roots grouped by level and ordered by time.
-    root_by_level: HashMap<u64, Vec<Id>>,
-    // Leaf chunks tie a single exec result to a compacted chunk.
-    chunk_for_exec_result: HashMap<Id, Id>,
-    // Leaf chunks tie a single imported archive message to a compacted chunk.
-    chunk_for_archive_message: HashMap<Id, Id>,
+    // The LSM frontier for each lens: roots grouped by level and ordered by time.
+    roots_by_lens_level: HashMap<(Id, u64), Vec<Id>>,
+    // Leaf chunks tie a single exec result facet to a compacted chunk.
+    chunk_for_exec_result: HashMap<(Id, Id), Id>,
+    // Leaf chunks tie a single imported archive message facet to a compacted chunk.
+    chunk_for_archive_message: HashMap<(Id, Id), Id>,
 }
 
 #[derive(Debug, Clone)]
@@ -3048,7 +3225,16 @@ fn ingest_archive_context_chunks(
             skipped_newer_than_cutoff = skipped_newer_than_cutoff.saturating_add(1);
             continue;
         }
-        if index.chunk_for_archive_message.contains_key(&message.id) {
+        let missing_lenses: Vec<&MemoryLensConfig> = semantic_compactor
+            .lenses()
+            .iter()
+            .filter(|lens| {
+                !index
+                    .chunk_for_archive_message
+                    .contains_key(&(message.id, lens.id))
+            })
+            .collect();
+        if missing_lenses.is_empty() {
             skipped_existing = skipped_existing.saturating_add(1);
             continue;
         }
@@ -3077,60 +3263,65 @@ fn ingest_archive_context_chunks(
                 .and_then(|person_id| relations.person_label.get(&person_id).map(|s| s.as_str())),
             resolved_person,
         );
-        let leaf_summary_handle = ws.put(leaf_summary);
-        let now = epoch_interval(now_epoch());
-        let chunk_id = ufoid();
+        for lens in missing_lenses {
+            let leaf_summary_handle = ws.put(leaf_summary.clone());
+            let now = epoch_interval(now_epoch());
+            let chunk_id = ufoid();
 
-        *change += entity! { &chunk_id @
-            playground_context::kind: playground_context::kind_chunk,
-            playground_context::level: 0u64,
-            playground_context::summary: leaf_summary_handle,
-            playground_context::created_at: now,
-            playground_context::start_at: message.created_at,
-            playground_context::end_at: message.created_at,
-            playground_context::about_archive_message: message.id,
-            playground_context::archive_author: message.author_id,
-            playground_context::archive_thread_root: message.thread_root_id,
-        };
-        if let Some(person_id) = resolved_person {
-            *change += entity! { &chunk_id @ playground_context::archive_person: person_id };
-        }
-        if let Some(conversation_id) = message.conversation_id {
-            *change +=
-                entity! { &chunk_id @ playground_context::archive_conversation: conversation_id };
-        }
-        if let Some(source_format) = message.source_format.as_deref() {
-            *change +=
-                entity! { &chunk_id @ playground_context::archive_source_format: source_format };
-        }
+            *change += entity! { &chunk_id @
+                playground_context::kind: playground_context::kind_chunk,
+                playground_context::lens_id: lens.id,
+                playground_context::level: 0u64,
+                playground_context::summary: leaf_summary_handle,
+                playground_context::created_at: now,
+                playground_context::start_at: message.created_at,
+                playground_context::end_at: message.created_at,
+                playground_context::about_archive_message: message.id,
+                playground_context::archive_author: message.author_id,
+                playground_context::archive_thread_root: message.thread_root_id,
+            };
+            if let Some(person_id) = resolved_person {
+                *change += entity! { &chunk_id @ playground_context::archive_person: person_id };
+            }
+            if let Some(conversation_id) = message.conversation_id {
+                *change += entity! { &chunk_id @ playground_context::archive_conversation: conversation_id };
+            }
+            if let Some(source_format) = message.source_format.as_deref() {
+                *change += entity! { &chunk_id @ playground_context::archive_source_format: source_format };
+            }
 
-        let chunk = ContextChunk {
-            id: *chunk_id,
-            level: 0,
-            summary: leaf_summary_handle,
-            start_at: message.created_at,
-            end_at: message.created_at,
-            children: Vec::new(),
-            about_exec_result: None,
-            about_archive_message: Some(message.id),
-            archive_author: Some(message.author_id),
-            archive_person: resolved_person,
-            archive_thread_root: Some(message.thread_root_id),
-            archive_conversation: message.conversation_id,
-            archive_source_format: message.source_format.clone(),
-        };
-        index.chunk_for_archive_message.insert(message.id, chunk.id);
-        insert_chunk_with_carry(
-            ws,
-            index,
-            change,
-            chunk,
-            merge_arity,
-            semantic_compactor,
-            stats,
-        )?;
-        stats.archive_leaves_added = stats.archive_leaves_added.saturating_add(1);
-        added = added.saturating_add(1);
+            let chunk = ContextChunk {
+                id: *chunk_id,
+                lens_id: lens.id,
+                level: 0,
+                summary: leaf_summary_handle,
+                start_at: message.created_at,
+                end_at: message.created_at,
+                children: Vec::new(),
+                about_exec_result: None,
+                about_archive_message: Some(message.id),
+                archive_author: Some(message.author_id),
+                archive_person: resolved_person,
+                archive_thread_root: Some(message.thread_root_id),
+                archive_conversation: message.conversation_id,
+                archive_source_format: message.source_format.clone(),
+            };
+            index
+                .chunk_for_archive_message
+                .insert((message.id, lens.id), chunk.id);
+            insert_chunk_with_carry(
+                ws,
+                index,
+                change,
+                chunk,
+                lens,
+                merge_arity,
+                semantic_compactor,
+                stats,
+            )?;
+            stats.archive_leaves_added = stats.archive_leaves_added.saturating_add(1);
+            added = added.saturating_add(1);
+        }
         if progress_every.is_some_and(|step| step > 0 && added % step == 0) {
             memory_status(format!(
                 "archive progress: added {added} chunk(s) (scanned {seen})"
@@ -3167,7 +3358,16 @@ fn ingest_exec_context_chunks(
         if max_new.is_some_and(|limit| added >= limit) {
             break;
         }
-        if index.chunk_for_exec_result.contains_key(&result.id) {
+        let missing_lenses: Vec<&MemoryLensConfig> = semantic_compactor
+            .lenses()
+            .iter()
+            .filter(|lens| {
+                !index
+                    .chunk_for_exec_result
+                    .contains_key(&(result.id, lens.id))
+            })
+            .collect();
+        if missing_lenses.is_empty() {
             skipped_existing = skipped_existing.saturating_add(1);
             continue;
         }
@@ -3177,54 +3377,65 @@ fn ingest_exec_context_chunks(
         let command = load_command_for_result(ws, core_index, result)?;
         let reasoning_text = load_reasoning_for_exec_result(ws, core_index, result)?;
         let exec_output = load_exec_result(ws, result.clone())?;
-        let leaf_summary = format_exec_output(
+        let leaf_outputs = format_exec_outputs_by_lens(
             result.id,
             command.as_str(),
             exec_output,
             reasoning_text.as_deref(),
             semantic_compactor,
         )?;
-        let leaf_summary_handle = ws.put(leaf_summary);
-        let now = epoch_interval(now_epoch());
-        let chunk_id = ufoid();
+        let leaf_output_by_lens: HashMap<Id, String> = leaf_outputs.into_iter().collect();
+        for lens in missing_lenses {
+            let Some(leaf_summary) = leaf_output_by_lens.get(&lens.id) else {
+                continue;
+            };
+            let leaf_summary_handle = ws.put(leaf_summary.clone());
+            let now = epoch_interval(now_epoch());
+            let chunk_id = ufoid();
 
-        *change += entity! { &chunk_id @
-            playground_context::kind: playground_context::kind_chunk,
-            playground_context::level: 0u64,
-            playground_context::summary: leaf_summary_handle,
-            playground_context::created_at: now,
-            playground_context::start_at: finished_at,
-            playground_context::end_at: finished_at,
-            playground_context::about_exec_result: result.id,
-        };
+            *change += entity! { &chunk_id @
+                playground_context::kind: playground_context::kind_chunk,
+                playground_context::lens_id: lens.id,
+                playground_context::level: 0u64,
+                playground_context::summary: leaf_summary_handle,
+                playground_context::created_at: now,
+                playground_context::start_at: finished_at,
+                playground_context::end_at: finished_at,
+                playground_context::about_exec_result: result.id,
+            };
 
-        let chunk = ContextChunk {
-            id: *chunk_id,
-            level: 0,
-            summary: leaf_summary_handle,
-            start_at: finished_at,
-            end_at: finished_at,
-            children: Vec::new(),
-            about_exec_result: Some(result.id),
-            about_archive_message: None,
-            archive_author: None,
-            archive_person: None,
-            archive_thread_root: None,
-            archive_conversation: None,
-            archive_source_format: None,
-        };
-        index.chunk_for_exec_result.insert(result.id, chunk.id);
-        insert_chunk_with_carry(
-            ws,
-            index,
-            change,
-            chunk,
-            merge_arity,
-            semantic_compactor,
-            stats,
-        )?;
-        stats.exec_leaves_added = stats.exec_leaves_added.saturating_add(1);
-        added = added.saturating_add(1);
+            let chunk = ContextChunk {
+                id: *chunk_id,
+                lens_id: lens.id,
+                level: 0,
+                summary: leaf_summary_handle,
+                start_at: finished_at,
+                end_at: finished_at,
+                children: Vec::new(),
+                about_exec_result: Some(result.id),
+                about_archive_message: None,
+                archive_author: None,
+                archive_person: None,
+                archive_thread_root: None,
+                archive_conversation: None,
+                archive_source_format: None,
+            };
+            index
+                .chunk_for_exec_result
+                .insert((result.id, lens.id), chunk.id);
+            insert_chunk_with_carry(
+                ws,
+                index,
+                change,
+                chunk,
+                lens,
+                merge_arity,
+                semantic_compactor,
+                stats,
+            )?;
+            stats.exec_leaves_added = stats.exec_leaves_added.saturating_add(1);
+            added = added.saturating_add(1);
+        }
         if progress_every.is_some_and(|step| step > 0 && added % step == 0) {
             memory_status(format!(
                 "exec progress: added {added} chunk(s) (scanned {seen})"
@@ -3278,6 +3489,11 @@ fn build_prompt_messages_with_compaction(
     let body_budget_chars = prompt_body_budget_chars(config);
     let semantic_compactor = SemanticCompactor::new(config)?;
     let merge_arity = config.llm_compaction_merge_arity as usize;
+    let primary_lens_id = config
+        .memory_lenses
+        .first()
+        .map(|lens| lens.id)
+        .ok_or_else(|| anyhow!("no configured memory lenses"))?;
 
     // Sort all command results in chronological order (oldest -> newest).
     let results = sorted_finished_command_results(core_index);
@@ -3333,6 +3549,7 @@ fn build_prompt_messages_with_compaction(
     let (mut messages, _used_chars) = build_memory_cover_messages(
         ws,
         &index,
+        primary_lens_id,
         body_budget_chars,
         moment_boundary_end_key,
     )?;
@@ -3394,6 +3611,7 @@ struct SplitCandidate {
 fn build_memory_cover_messages(
     ws: &mut Workspace<Pile>,
     index: &ContextChunkIndex,
+    lens_id: Id,
     budget_chars: usize,
     moment_boundary_end_key: Option<i128>,
 ) -> Result<(Vec<ChatMessage>, usize)> {
@@ -3403,10 +3621,16 @@ fn build_memory_cover_messages(
 
     let mut seen_roots = HashSet::new();
     let mut cover: Vec<Id> = index
-        .root_by_level
+        .roots_by_lens_level
         .values()
         .flatten()
         .copied()
+        .filter(|id| {
+            index
+                .chunks
+                .get(id)
+                .is_some_and(|chunk| chunk.lens_id == lens_id)
+        })
         .filter(|id| seen_roots.insert(*id))
         .filter(|id| index.chunks.contains_key(id))
         .collect();
@@ -3549,7 +3773,12 @@ fn is_better_split_candidate(candidate: &SplitCandidate, current: Option<&SplitC
 }
 
 fn format_memory_output(ws: &mut Workspace<Pile>, chunk: &ContextChunk) -> Result<String> {
-    let mut header = format!("mem {} lvl={}", memory_ref(chunk.id), chunk.level);
+    let mut header = format!(
+        "mem {} lens={} lvl={}",
+        memory_ref(chunk.id),
+        id_prefix(chunk.lens_id),
+        chunk.level
+    );
     if let Some(exec_id) = chunk.about_exec_result {
         header.push_str(&format!(" turn_id={exec_id:x}"));
     }
@@ -4286,9 +4515,10 @@ fn format_archive_output(
 fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
     let mut index = ContextChunkIndex::default();
 
-    for (chunk_id, level, summary, start_at, end_at) in find!(
+    for (chunk_id, lens_id, level, summary, start_at, end_at) in find!(
         (
             chunk_id: Id,
+            lens_id: Id,
             level: Value<U256BE>,
             summary: Value<Handle<Blake3, LongString>>,
             start_at: Value<NsTAIInterval>,
@@ -4297,6 +4527,7 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
         pattern!(catalog, [{
             ?chunk_id @
             playground_context::kind: playground_context::kind_chunk,
+            playground_context::lens_id: ?lens_id,
             playground_context::level: ?level,
             playground_context::summary: ?summary,
             playground_context::start_at: ?start_at,
@@ -4308,6 +4539,7 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
             chunk_id,
             ContextChunk {
                 id: chunk_id,
+                lens_id,
                 level,
                 summary,
                 start_at,
@@ -4387,8 +4619,10 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
             playground_context::about_exec_result: ?exec_result_id,
         }])
     ) {
-        index.chunk_for_exec_result.insert(exec_result_id, chunk_id);
         if let Some(chunk) = index.chunks.get_mut(&chunk_id) {
+            index
+                .chunk_for_exec_result
+                .insert((exec_result_id, chunk.lens_id), chunk_id);
             chunk.about_exec_result = Some(exec_result_id);
         }
     }
@@ -4401,10 +4635,10 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
             playground_context::about_archive_message: ?archive_message_id,
         }])
     ) {
-        index
-            .chunk_for_archive_message
-            .insert(archive_message_id, chunk_id);
         if let Some(chunk) = index.chunks.get_mut(&chunk_id) {
+            index
+                .chunk_for_archive_message
+                .insert((archive_message_id, chunk.lens_id), chunk_id);
             chunk.about_archive_message = Some(archive_message_id);
         }
     }
@@ -4487,12 +4721,12 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
             continue;
         }
         index
-            .root_by_level
-            .entry(chunk.level)
+            .roots_by_lens_level
+            .entry((chunk.lens_id, chunk.level))
             .or_default()
             .push(chunk.id);
     }
-    for roots in index.root_by_level.values_mut() {
+    for roots in index.roots_by_lens_level.values_mut() {
         roots.sort_by_key(|chunk_id| {
             index
                 .chunks
@@ -4510,6 +4744,7 @@ fn insert_chunk_with_carry(
     index: &mut ContextChunkIndex,
     change: &mut TribleSet,
     carry: ContextChunk,
+    lens: &MemoryLensConfig,
     merge_arity: usize,
     semantic: &SemanticCompactor,
     stats: &mut CompactionRunStats,
@@ -4519,7 +4754,10 @@ fn insert_chunk_with_carry(
     let mut level = carry.level;
     loop {
         index.chunks.insert(carry.id, carry.clone());
-        let runs = index.root_by_level.entry(level).or_default();
+        let runs = index
+            .roots_by_lens_level
+            .entry((carry.lens_id, level))
+            .or_default();
         runs.push(carry.id);
         runs.sort_by_key(|chunk_id| {
             index
@@ -4535,12 +4773,12 @@ fn insert_chunk_with_carry(
 
         let child_ids = std::mem::take(runs);
         if index
-            .root_by_level
-            .get(&level)
+            .roots_by_lens_level
+            .get(&(carry.lens_id, level))
             .map(Vec::is_empty)
             .unwrap_or(false)
         {
-            index.root_by_level.remove(&level);
+            index.roots_by_lens_level.remove(&(carry.lens_id, level));
         }
 
         let mut children = Vec::with_capacity(child_ids.len());
@@ -4562,7 +4800,7 @@ fn insert_chunk_with_carry(
             .map(|text| text.chars().count())
             .fold(0usize, usize::saturating_add);
         let merged_text = semantic
-            .merge(inputs.as_slice())
+            .merge(lens, inputs.as_slice())
             .context("semantic merge context chunks")?;
         let output_chars = merged_text.chars().count();
         stats.merge_calls = stats.merge_calls.saturating_add(1);
@@ -4586,6 +4824,7 @@ fn insert_chunk_with_carry(
 
         *change += entity! { &parent_id @
             playground_context::kind: playground_context::kind_chunk,
+            playground_context::lens_id: lens.id,
             playground_context::level: parent_level,
             playground_context::summary: merged_handle,
             playground_context::created_at: now,
@@ -4600,6 +4839,7 @@ fn insert_chunk_with_carry(
 
         carry = ContextChunk {
             id: *parent_id,
+            lens_id: lens.id,
             level: parent_level,
             summary: merged_handle,
             start_at,
@@ -4623,11 +4863,9 @@ struct SemanticCompactor {
     api_key: Option<String>,
     model: String,
     chars_per_token: u64,
-    system_prompt: String,
     memory_lenses: Vec<MemoryLensConfig>,
 }
 
-const DEFAULT_COMPACTION_PROMPT: &str = include_str!("../prompts/llm_compaction_prompt.md");
 const FAILED_EXEC_MEMORY_INPUT_LABELS: &str =
     "TURN_ID, COMMAND, REASONING, STDOUT, STDERR, ERROR, EXIT_CODE";
 
@@ -4665,15 +4903,15 @@ impl SemanticCompactor {
             api_key,
             model,
             chars_per_token,
-            system_prompt: config
-                .llm_compaction_prompt
-                .clone()
-                .unwrap_or_else(|| DEFAULT_COMPACTION_PROMPT.to_string()),
             memory_lenses: config.memory_lenses.clone(),
         })
     }
 
-    fn merge(&self, chunks: &[String]) -> Result<String> {
+    fn lenses(&self) -> &[MemoryLensConfig] {
+        self.memory_lenses.as_slice()
+    }
+
+    fn merge(&self, lens: &MemoryLensConfig, chunks: &[String]) -> Result<String> {
         if chunks.len() < 2 {
             return Err(anyhow!("semantic merge needs at least 2 chunks"));
         }
@@ -4700,7 +4938,7 @@ impl SemanticCompactor {
         let payload = serde_json::json!({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": self.system_prompt.as_str()},
+                {"role": "system", "content": lens.compaction_prompt.as_str()},
                 {"role": "user", "content": user},
             ],
             "stream": false,
@@ -4725,7 +4963,7 @@ impl SemanticCompactor {
         Err(last_err.unwrap_or_else(|| anyhow!("semantic compaction failed without error detail")))
     }
 
-    fn summarize_failed_exec(
+    fn summarize_failed_exec_by_lens(
         &self,
         turn_id: Id,
         command: &str,
@@ -4734,7 +4972,7 @@ impl SemanticCompactor {
         stderr: &str,
         error: &str,
         exit_code: Option<u64>,
-    ) -> Result<String> {
+    ) -> Result<HashMap<Id, String>> {
         let exit = exit_code
             .map(|code| code.to_string())
             .unwrap_or_else(|| "none".to_string());
@@ -4745,7 +4983,7 @@ impl SemanticCompactor {
         if self.memory_lenses.is_empty() {
             return Err(anyhow!("no configured memory lenses"));
         }
-        let mut sections = Vec::new();
+        let mut by_lens = HashMap::new();
         for lens in &self.memory_lenses {
             let payload = serde_json::json!({
                 "model": self.model,
@@ -4777,18 +5015,18 @@ impl SemanticCompactor {
                 }
             }
             if let Some(text) = lens_output {
-                sections.push(format!("lens: {}\n{text}", lens.name));
+                by_lens.insert(lens.id, text);
             } else if let Some(err) = last_err {
                 return Err(anyhow!("memory lens '{}' failed: {err:#}", lens.name));
             }
         }
 
-        if sections.is_empty() {
+        if by_lens.is_empty() {
             return Err(anyhow!(
                 "all memory lenses returned empty output for failed exec turn {turn_id:x}"
             ));
         }
-        Ok(sections.join("\n\n"))
+        Ok(by_lens)
     }
 
     fn send_once(&self, payload: &serde_json::Value) -> Result<String> {
@@ -4899,13 +5137,13 @@ fn load_exec_result(ws: &mut Workspace<Pile>, result: CommandResultInfo) -> Resu
     })
 }
 
-fn format_exec_output(
+fn format_exec_outputs_by_lens(
     turn_id: Id,
     command: &str,
     result: ExecResult,
     reasoning_text: Option<&str>,
     semantic_compactor: &SemanticCompactor,
-) -> Result<String> {
+) -> Result<Vec<(Id, String)>> {
     let ExecResult {
         stdout_text,
         stderr_text,
@@ -4921,7 +5159,7 @@ fn format_exec_output(
         .map(|code| code.to_string())
         .unwrap_or_else(|| "none".to_string());
     if exit_code.is_some_and(|code| code != 0) || !error.trim().is_empty() {
-        let summary = semantic_compactor.summarize_failed_exec(
+        let summaries = semantic_compactor.summarize_failed_exec_by_lens(
             turn_id,
             command,
             reasoning_text,
@@ -4930,12 +5168,19 @@ fn format_exec_output(
             error.as_str(),
             exit_code,
         )?;
-        let mut text = String::new();
-        append_section(&mut text, "turn_id", format!("{turn_id:x}").as_str());
-        append_section(&mut text, "event", "failed_exec");
-        append_section(&mut text, "memory", summary.as_str());
-        text.push_str(&format!("exit_code: {exit_code_value}\n"));
-        return Ok(text);
+        let mut outputs = Vec::new();
+        for lens in semantic_compactor.lenses() {
+            let Some(summary) = summaries.get(&lens.id) else {
+                continue;
+            };
+            let mut text = String::new();
+            append_section(&mut text, "turn_id", format!("{turn_id:x}").as_str());
+            append_section(&mut text, "event", "failed_exec");
+            append_section(&mut text, "memory", summary.as_str());
+            text.push_str(&format!("exit_code: {exit_code_value}\n"));
+            outputs.push((lens.id, text));
+        }
+        return Ok(outputs);
     }
 
     let mut text = String::new();
@@ -4951,7 +5196,11 @@ fn format_exec_output(
         append_section(&mut text, "error", error.as_str());
     }
     text.push_str(&format!("exit_code: {exit_code_value}\n"));
-    Ok(text)
+    Ok(semantic_compactor
+        .lenses()
+        .iter()
+        .map(|lens| (lens.id, text.clone()))
+        .collect())
 }
 
 fn append_section(text: &mut String, label: &str, body: &str) {

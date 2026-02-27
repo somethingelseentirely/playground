@@ -536,10 +536,9 @@ struct AgentConfigRow {
     llm_compaction_profile_name: Option<String>,
     llm_compaction_model: Option<String>,
     llm_compaction_base_url: Option<String>,
-    llm_compaction_prompt_chars_per_token: Option<u64>,
+    llm_compaction_chars_per_token: Option<u64>,
     llm_compaction_api_key: Option<String>,
     llm_compaction_merge_arity: Option<u64>,
-    llm_compaction_prompt: Option<String>,
     tavily_api_key: Option<String>,
     exa_api_key: Option<String>,
     exec_default_cwd: Option<String>,
@@ -1862,7 +1861,7 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_compaction_entity_id,
         playground_config::llm_base_url,
     );
-    let llm_compaction_prompt_chars_per_token = load_optional_u64_attr(
+    let llm_compaction_chars_per_token = load_optional_u64_attr(
         data,
         llm_compaction_entity_id,
         playground_config::llm_prompt_chars_per_token,
@@ -1877,12 +1876,6 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         data,
         config_id,
         playground_config::llm_compaction_merge_arity,
-    );
-    let llm_compaction_prompt = load_optional_string_attr(
-        data,
-        ws,
-        config_id,
-        playground_config::llm_compaction_prompt,
     );
     let tavily_api_key =
         load_optional_string_attr(data, ws, config_id, playground_config::tavily_api_key);
@@ -1928,10 +1921,9 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_compaction_profile_name,
         llm_compaction_model,
         llm_compaction_base_url,
-        llm_compaction_prompt_chars_per_token,
+        llm_compaction_chars_per_token,
         llm_compaction_api_key,
         llm_compaction_merge_arity,
-        llm_compaction_prompt,
         tavily_api_key,
         exa_api_key,
         exec_default_cwd,
@@ -4804,7 +4796,7 @@ fn render_agent_config(
             ui.label("llm.compaction.prompt_chars_per_token");
             ui.monospace(
                 config
-                    .llm_compaction_prompt_chars_per_token
+                    .llm_compaction_chars_per_token
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );
@@ -4905,21 +4897,6 @@ fn render_agent_config(
     if let Some(prompt) = config.system_prompt.as_deref() {
         ui.add_space(8.0);
         ui.label(egui::RichText::new("System prompt").monospace());
-        egui::Frame::NONE
-            .fill(egui::Color32::from_gray(55))
-            .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(prompt).monospace())
-                        .wrap_mode(egui::TextWrapMode::Wrap),
-                );
-            });
-    }
-
-    if let Some(prompt) = config.llm_compaction_prompt.as_deref() {
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Compaction prompt").monospace());
         egui::Frame::NONE
             .fill(egui::Color32::from_gray(55))
             .corner_radius(egui::CornerRadius::same(6))
