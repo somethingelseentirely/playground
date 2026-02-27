@@ -148,10 +148,10 @@ cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pil
 Manage LLM profiles (headspaces):
 
 ```bash
-./playground/faculties/headspace.rs --pile /path/to/pile/self.pile list
-./playground/faculties/headspace.rs --pile /path/to/pile/self.pile add "oss-120" --model gpt-oss:120b --base-url http://localhost:11434/v1/responses
-./playground/faculties/headspace.rs --pile /path/to/pile/self.pile use oss-120
-./playground/faculties/headspace.rs --pile /path/to/pile/self.pile set reasoning-effort medium
+./playground/faculties/headspace --pile /path/to/pile/self.pile list
+./playground/faculties/headspace --pile /path/to/pile/self.pile add "oss-120" --model gpt-oss:120b --base-url http://localhost:11434/v1/responses
+./playground/faculties/headspace --pile /path/to/pile/self.pile use oss-120
+./playground/faculties/headspace --pile /path/to/pile/self.pile set reasoning-effort medium
 ```
 
 LLM settings (`llm-model`, `llm-base-url`, `llm-reasoning-effort`, etc.) are stored on the active
