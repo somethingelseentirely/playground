@@ -112,8 +112,8 @@ enum MemoryCommand {
         about = "Backfill context memory chunks from archive/exec without creating LLM requests"
     )]
     Build(MemoryBuildArgs),
-    #[command(about = "Flush current moment into memory by setting the moment boundary turn")]
-    FlushMoment(MemoryFlushMomentArgs),
+    #[command(about = "Consolidate current moment into memory by setting the moment boundary turn")]
+    Consolidate(MemoryConsolidateArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -143,7 +143,7 @@ struct MemoryBuildArgs {
 }
 
 #[derive(Args, Debug, Clone)]
-struct MemoryFlushMomentArgs {
+struct MemoryConsolidateArgs {
     /// Optional explicit turn id. If omitted, uses the latest finished exec turn.
     #[arg(long)]
     turn_id: Option<String>,
@@ -417,7 +417,7 @@ fn run_memory_command(config: Config, command: MemoryCommand) -> Result<()> {
     match command {
         MemoryCommand::Estimate(args) => run_memory_estimate(config, args),
         MemoryCommand::Build(args) => run_memory_build(config, args),
-        MemoryCommand::FlushMoment(args) => run_memory_flush_moment(config, args),
+        MemoryCommand::Consolidate(args) => run_memory_consolidate(config, args),
     }
 }
 
@@ -841,10 +841,10 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
     result
 }
 
-fn run_memory_flush_moment(config: Config, args: MemoryFlushMomentArgs) -> Result<()> {
+fn run_memory_consolidate(config: Config, args: MemoryConsolidateArgs) -> Result<()> {
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
     let result = (|| -> Result<Id> {
-        let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace for flush-moment")?;
+        let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace for memory consolidate")?;
         let catalog = ws.checkout(..).context("checkout workspace")?;
         let mut core_index = CoreIndex::default();
         core_index.apply_delta(&catalog, &catalog);

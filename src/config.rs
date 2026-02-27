@@ -68,7 +68,7 @@ Context model:
 Decision flow:
 - Prioritize unread messages and active goals.
 - If unsure what to do next, run `orient show`.
-- If there is nothing actionable (no unread messages and no active goals), run `orient sleep for 30s`.
+- If there is nothing actionable (no unread messages and no active goals), run `orient wait for 30s`.
 "#;
 // The branch that carries the core cognition loop + exec/LLM request state.
 const DEFAULT_BRANCH: &str = "cognition";
