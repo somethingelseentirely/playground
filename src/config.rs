@@ -124,12 +124,6 @@ pub struct MemoryLensConfig {
     pub max_output_tokens: u64,
 }
 
-#[derive(Clone, Debug)]
-pub struct LlmProfileSummary {
-    pub id: Id,
-    pub name: String,
-}
-
 impl Default for ExecConfig {
     fn default() -> Self {
         Self {
@@ -186,59 +180,6 @@ impl Config {
 
         result
     }
-}
-
-pub fn list_llm_profiles(pile_path: &Path) -> Result<Vec<LlmProfileSummary>> {
-    let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let result = (|| -> Result<Vec<LlmProfileSummary>> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout config workspace")?;
-
-        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-        for (entry_id, profile_id, updated_at) in find!(
-            (entry_id: Id, profile_id: Value<GenId>, updated_at: Value<NsTAIInterval>),
-            pattern!(&catalog, [{
-                ?entry_id @
-                playground_config::kind: playground_config::kind_llm_profile,
-                playground_config::updated_at: ?updated_at,
-                playground_config::llm_profile_id: ?profile_id,
-            }])
-        ) {
-            let profile_id = Id::from_value(&profile_id);
-            let key = interval_key(updated_at);
-            latest
-                .entry(profile_id)
-                .and_modify(|slot| {
-                    if key > slot.1 {
-                        *slot = (entry_id, key);
-                    }
-                })
-                .or_insert((entry_id, key));
-        }
-
-        let mut profiles = Vec::new();
-        for (profile_id, (entry_id, _updated_key)) in latest {
-            let name = load_string_attr(&mut ws, &catalog, entry_id, metadata::name)?
-                .unwrap_or_else(|| format!("profile-{profile_id:x}"));
-            profiles.push(LlmProfileSummary {
-                id: profile_id,
-                name,
-            });
-        }
-        profiles.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-        Ok(profiles)
-    })();
-
-    if let Err(err) = close_repo(repo).context("close config pile") {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-
-    result
 }
 
 pub fn load_llm_profile(pile_path: &Path, profile_id: Id) -> Result<Option<(LlmConfig, String)>> {
@@ -1071,12 +1012,6 @@ fn default_memory_lenses() -> Vec<MemoryLensConfig> {
             max_output_tokens: DEFAULT_MEMORY_LENS_EMOTIONAL_MAX_OUTPUT_TOKENS,
         },
     ]
-}
-
-pub fn default_memory_lens_by_name(name: &str) -> Option<MemoryLensConfig> {
-    default_memory_lenses()
-        .into_iter()
-        .find(|lens| lens.name.eq_ignore_ascii_case(name))
 }
 
 fn default_branch() -> String {
