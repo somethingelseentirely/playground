@@ -31,10 +31,12 @@ pub mod playground_config {
         "6691CF3F872C6107DCFAD0BCF7CDC1A0" as pub llm_profile_id: GenId;
         "85BE7BDA465B3CB0F800F76EEF8FAC9B" as pub llm_model: Handle<Blake3, LongString>;
         "B216CFBBF85AA1350B142D510E26268B" as pub llm_base_url: Handle<Blake3, LongString>;
+        "605C55F6ADB1F3FBFE0787AC2715924E" as pub llm_transport: Handle<Blake3, LongString>;
         "55F3FFD721AF7C1258E45BC91CDBF30F" as pub llm_api_key: Handle<Blake3, LongString>;
         "328B29CE81665EE719C5A6E91695D4D4" as pub tavily_api_key: Handle<Blake3, LongString>;
         "AB0DF9F03F28A27A6DB95B693CC0EC53" as pub exa_api_key: Handle<Blake3, LongString>;
         "BA4E05799CA2ACDCF3F9350FC8742F2F" as pub llm_reasoning_effort: Handle<Blake3, LongString>;
+        "73876213CFB8CF73CF0139E20B9770A1" as pub llm_reasoning_summary: Handle<Blake3, LongString>;
         "5F04F7A0EB4EBBE6161022B336F83513" as pub llm_stream: U256BE;
         "F9CEA1A2E81D738BB125B4D144B7A746" as pub llm_context_window_tokens: U256BE;
         "4200F6746B36F2784DEBA1555595D6AC" as pub llm_max_output_tokens: U256BE;
@@ -187,10 +189,12 @@ where
     metadata += describe_attribute(blobs, &playground_config::llm_profile_id)?;
     metadata += describe_attribute(blobs, &playground_config::llm_model)?;
     metadata += describe_attribute(blobs, &playground_config::llm_base_url)?;
+    metadata += describe_attribute(blobs, &playground_config::llm_transport)?;
     metadata += describe_attribute(blobs, &playground_config::llm_api_key)?;
     metadata += describe_attribute(blobs, &playground_config::tavily_api_key)?;
     metadata += describe_attribute(blobs, &playground_config::exa_api_key)?;
     metadata += describe_attribute(blobs, &playground_config::llm_reasoning_effort)?;
+    metadata += describe_attribute(blobs, &playground_config::llm_reasoning_summary)?;
     metadata += describe_attribute(blobs, &playground_config::llm_stream)?;
     metadata += describe_attribute(blobs, &playground_config::llm_context_window_tokens)?;
     metadata += describe_attribute(blobs, &playground_config::llm_max_output_tokens)?;

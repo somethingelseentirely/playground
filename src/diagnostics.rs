@@ -525,7 +525,9 @@ struct AgentConfigRow {
     llm_profile_name: Option<String>,
     llm_model: Option<String>,
     llm_base_url: Option<String>,
+    llm_transport: Option<String>,
     llm_reasoning_effort: Option<String>,
+    llm_reasoning_summary: Option<String>,
     llm_stream: Option<bool>,
     llm_context_window_tokens: Option<u64>,
     llm_max_output_tokens: Option<u64>,
@@ -1801,11 +1803,19 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         load_optional_string_attr(data, ws, llm_entity_id, playground_config::llm_model);
     let llm_base_url =
         load_optional_string_attr(data, ws, llm_entity_id, playground_config::llm_base_url);
+    let llm_transport =
+        load_optional_string_attr(data, ws, llm_entity_id, playground_config::llm_transport);
     let llm_reasoning_effort = load_optional_string_attr(
         data,
         ws,
         llm_entity_id,
         playground_config::llm_reasoning_effort,
+    );
+    let llm_reasoning_summary = load_optional_string_attr(
+        data,
+        ws,
+        llm_entity_id,
+        playground_config::llm_reasoning_summary,
     );
     let llm_stream = load_optional_u64_attr(data, llm_entity_id, playground_config::llm_stream)
         .map(|value| value != 0);
@@ -1872,11 +1882,8 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_compaction_entity_id,
         playground_config::llm_api_key,
     );
-    let memory_compaction_arity = load_optional_u64_attr(
-        data,
-        config_id,
-        playground_config::memory_compaction_arity,
-    );
+    let memory_compaction_arity =
+        load_optional_u64_attr(data, config_id, playground_config::memory_compaction_arity);
     let tavily_api_key =
         load_optional_string_attr(data, ws, config_id, playground_config::tavily_api_key);
     let exa_api_key =
@@ -1910,7 +1917,9 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_profile_name,
         llm_model,
         llm_base_url,
+        llm_transport,
         llm_reasoning_effort,
+        llm_reasoning_summary,
         llm_stream,
         llm_context_window_tokens,
         llm_max_output_tokens,
@@ -4695,8 +4704,16 @@ fn render_agent_config(
             ui.label(config.llm_base_url.as_deref().unwrap_or("-"));
             ui.end_row();
 
+            ui.label("llm.transport");
+            ui.label(config.llm_transport.as_deref().unwrap_or("-"));
+            ui.end_row();
+
             ui.label("llm.reasoning_effort");
             ui.label(config.llm_reasoning_effort.as_deref().unwrap_or("-"));
+            ui.end_row();
+
+            ui.label("llm.reasoning_summary");
+            ui.label(config.llm_reasoning_summary.as_deref().unwrap_or("-"));
             ui.end_row();
 
             ui.label("llm.stream");

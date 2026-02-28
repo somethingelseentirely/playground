@@ -20,7 +20,7 @@ use triblespace::prelude::*;
 
 use crate::blob_refs::{PromptChunk, split_blob_refs, unknown_blob_handle_from_hex};
 use crate::chat_prompt::{ChatMessage, ChatRole};
-use crate::config::Config;
+use crate::config::{Config, LlmTransport};
 use crate::repo_util::{
     close_repo, current_branch_head, ensure_worker_name, init_repo, load_text, pull_workspace,
     push_workspace, refresh_cached_checkout, seed_metadata,
@@ -51,10 +51,11 @@ struct OpenAIResult {
     response_id: Option<String>,
 }
 
-struct ChatCompletionsClient {
+struct LlmHttpClient {
     client: Client,
     endpoint_url: String,
     api_key: Option<String>,
+    transport: LlmTransport,
     stream: bool,
 }
 
@@ -77,18 +78,40 @@ fn chat_completions_url(api_base_url: &str) -> String {
     format!("{base}/chat/completions")
 }
 
-impl ChatCompletionsClient {
-    fn new(api_base_url: &str, api_key: Option<String>, stream: bool) -> Result<Self> {
+fn responses_url(api_base_url: &str) -> String {
+    let base = api_base_url.trim().trim_end_matches('/');
+    if base.ends_with("/responses") {
+        return base.to_string();
+    }
+    if let Some(base) = base.strip_suffix("/chat/completions") {
+        return format!("{base}/responses");
+    }
+    if let Some(base) = base.strip_suffix("/completions") {
+        return format!("{base}/responses");
+    }
+    format!("{base}/responses")
+}
+
+impl LlmHttpClient {
+    fn new(config: &Config) -> Result<Self> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(LLM_CONNECT_TIMEOUT_SECS))
             .timeout(Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS))
             .build()
             .context("build http client")?;
-        let endpoint_url = chat_completions_url(api_base_url);
+        let endpoint_url = match config.llm.transport {
+            LlmTransport::ChatCompletions => chat_completions_url(config.llm.base_url.as_str()),
+            LlmTransport::Responses => responses_url(config.llm.base_url.as_str()),
+        };
+        let stream = match config.llm.transport {
+            LlmTransport::Responses => false,
+            LlmTransport::ChatCompletions => config.llm.stream,
+        };
         Ok(Self {
             client,
             endpoint_url,
-            api_key,
+            api_key: config.llm.api_key.clone(),
+            transport: config.llm.transport,
             stream,
         })
     }
@@ -168,7 +191,7 @@ impl ChatCompletionsClient {
     }
 
     fn parse_response(&self, response: reqwest::blocking::Response) -> Result<OpenAIResult> {
-        if self.stream {
+        if self.stream && self.transport == LlmTransport::ChatCompletions {
             parse_stream(response)
         } else {
             let json: JsonValue = response.json().context("read response json")?;
@@ -219,11 +242,7 @@ pub(crate) fn run_llm_loop(
         let mut cached_catalog = TribleSet::new();
         let mut request_index = LlmRequestIndex::default();
 
-        let client = ChatCompletionsClient::new(
-            config.llm.base_url.as_str(),
-            config.llm.api_key.clone(),
-            config.llm.stream,
-        )?;
+        let client = LlmHttpClient::new(&config)?;
 
         loop {
             if stop_requested(&stop) {
@@ -275,13 +294,7 @@ pub(crate) fn run_llm_loop(
                     continue;
                 }
             };
-            let payload_messages = build_payload_messages(&mut ws, model.as_str(), &messages);
-            let payload = build_payload(
-                &model,
-                config.llm.stream,
-                config.llm.max_output_tokens,
-                payload_messages,
-            );
+            let payload = build_payload(&config, &mut ws, model.as_str(), &messages);
             let request_raw =
                 serde_json::to_string(&payload).context("serialize request payload")?;
 
@@ -495,7 +508,7 @@ impl LlmRequestIndex {
     }
 }
 
-fn build_payload_messages(
+fn build_chat_payload_messages(
     ws: &mut Workspace<Pile>,
     model: &str,
     messages: &[ChatMessage],
@@ -532,19 +545,135 @@ fn build_payload_messages(
     out
 }
 
-fn build_payload(
+fn build_responses_input_messages(
+    ws: &mut Workspace<Pile>,
     model: &str,
-    stream: bool,
-    max_tokens: u64,
-    messages: Vec<JsonValue>,
+    messages: &[ChatMessage],
+) -> Vec<JsonValue> {
+    let supports_images = model_supports_images(model);
+    let mut out = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        let role = match message.role {
+            ChatRole::System => "system",
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        };
+        let text_type = if message.role == ChatRole::Assistant {
+            "output_text"
+        } else {
+            "input_text"
+        };
+
+        if message.role == ChatRole::User && supports_images {
+            let chunks = split_blob_refs(message.content.as_str());
+            let has_blob = chunks.iter().any(|chunk| match chunk {
+                PromptChunk::Blob(_) => true,
+                PromptChunk::Text(_) => false,
+            });
+            if has_blob {
+                let mut content = Vec::new();
+                for part in build_prompt_input_content(ws, model, message.content.as_str()) {
+                    match part.get("type").and_then(JsonValue::as_str) {
+                        Some("text") => {
+                            if let Some(text) = part.get("text").and_then(JsonValue::as_str) {
+                                content.push(serde_json::json!({
+                                    "type": "input_text",
+                                    "text": text,
+                                }));
+                            }
+                        }
+                        Some("image_url") => {
+                            if let Some(url) = part
+                                .get("image_url")
+                                .and_then(|image| image.get("url"))
+                                .and_then(JsonValue::as_str)
+                            {
+                                content.push(serde_json::json!({
+                                    "type": "input_image",
+                                    "image_url": url,
+                                }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if content.is_empty() {
+                    content.push(serde_json::json!({
+                        "type": "input_text",
+                        "text": message.content.as_str(),
+                    }));
+                }
+                out.push(serde_json::json!({
+                    "type": "message",
+                    "role": role,
+                    "content": content,
+                }));
+                continue;
+            }
+        }
+
+        out.push(serde_json::json!({
+            "type": "message",
+            "role": role,
+            "content": [
+                {
+                    "type": text_type,
+                    "text": message.content.as_str(),
+                }
+            ],
+        }));
+    }
+
+    out
+}
+
+fn build_payload(
+    config: &Config,
+    ws: &mut Workspace<Pile>,
+    model: &str,
+    messages: &[ChatMessage],
 ) -> JsonValue {
-    let max_tokens = max_tokens.max(1);
-    serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "stream": stream,
-        "max_tokens": max_tokens,
-    })
+    match config.llm.transport {
+        LlmTransport::ChatCompletions => {
+            let messages = build_chat_payload_messages(ws, model, messages);
+            let max_tokens = config.llm.max_output_tokens.max(1);
+            serde_json::json!({
+                "model": model,
+                "messages": messages,
+                "stream": config.llm.stream,
+                "max_tokens": max_tokens,
+            })
+        }
+        LlmTransport::Responses => {
+            let input = build_responses_input_messages(ws, model, messages);
+            let mut payload = serde_json::json!({
+                "model": model,
+                "input": input,
+                "store": true,
+                "stream": false,
+                "include": ["reasoning.encrypted_content"],
+                "max_output_tokens": config.llm.max_output_tokens.max(1),
+            });
+            let mut reasoning = serde_json::Map::new();
+            if let Some(effort) = config.llm.reasoning_effort.as_ref() {
+                reasoning.insert("effort".to_string(), JsonValue::String(effort.clone()));
+            }
+            if let Some(summary) = config.llm.reasoning_summary {
+                reasoning.insert(
+                    "summary".to_string(),
+                    JsonValue::String(summary.as_str().to_string()),
+                );
+            }
+            if !reasoning.is_empty() {
+                payload
+                    .as_object_mut()
+                    .expect("responses payload object")
+                    .insert("reasoning".to_string(), JsonValue::Object(reasoning));
+            }
+            payload
+        }
+    }
 }
 
 fn build_prompt_input_content(
@@ -728,6 +857,36 @@ fn extract_response_id(response: &JsonValue) -> Option<String> {
 }
 
 fn extract_output_text(response: &JsonValue) -> String {
+    // Responses-style output: output[] with assistant message content items.
+    if let Some(output) = response.get("output").and_then(JsonValue::as_array) {
+        let mut out = String::new();
+        for item in output {
+            if item.get("type").and_then(JsonValue::as_str) != Some("message") {
+                continue;
+            }
+            if item.get("role").and_then(JsonValue::as_str) != Some("assistant") {
+                continue;
+            }
+            let Some(parts) = item.get("content").and_then(JsonValue::as_array) else {
+                continue;
+            };
+            for part in parts {
+                let kind = part
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default();
+                if (kind == "output_text" || kind == "text")
+                    && let Some(text) = part.get("text").and_then(JsonValue::as_str)
+                {
+                    out.push_str(text);
+                }
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+
     let Some(choices) = response.get("choices").and_then(JsonValue::as_array) else {
         return String::new();
     };
