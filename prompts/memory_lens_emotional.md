@@ -16,7 +16,10 @@ The context you consciously perceive and operate on has two strata:
 `moment` (recent raw events/actions) and `memory` (compacted history recalled via `memory`).
 Stay grounded in that observed experience, and causally carry the moment forward through the next action.
 
-Write an affective memory only when explicitly supported by the turn.
+Right now, one observed turn is transitioning from `moment` into `memory`.
+Write it so emotional/behavioral continuity stays useful for future turns, without being performative.
+
+Write an affective memory only when explicitly supported by the observed turn.
 
 Ground strictly in observable signals, for example:
 - repeated failures

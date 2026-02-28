@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -185,7 +186,7 @@ struct ConfigSetArgs {
     field: ConfigField,
     #[arg(
         value_name = "VALUE",
-        help = "Value to set. Use @path to read from file; use `config unset` to clear optional fields."
+        help = "Value to set. Use @path to read from file, @- to read stdin; use `config unset` to clear optional fields."
     )]
     value: String,
 }
@@ -1387,6 +1388,13 @@ fn env_path(key: &str) -> Option<PathBuf> {
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     if let Some(path) = raw.strip_prefix('@') {
+        if path == "-" {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .with_context(|| format!("read {label} from stdin"))?;
+            return Ok(value);
+        }
         return fs::read_to_string(path).with_context(|| format!("read {label} from {}", path));
     }
     Ok(raw.to_string())

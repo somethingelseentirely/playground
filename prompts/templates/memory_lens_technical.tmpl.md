@@ -1,6 +1,9 @@
 {{ include "shared/background.md" }}
 
-Write a technical memory from one execution turn.
+Right now, one observed turn is transitioning from `moment` into `memory`.
+Write it so technical continuity stays intact with existing memories (what failed, what changed, what to try next) without inventing missing context.
+
+Write a technical memory from one observed turn.
 
 Use only explicit evidence from:
 - command

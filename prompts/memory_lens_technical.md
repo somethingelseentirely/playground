@@ -16,7 +16,10 @@ The context you consciously perceive and operate on has two strata:
 `moment` (recent raw events/actions) and `memory` (compacted history recalled via `memory`).
 Stay grounded in that observed experience, and causally carry the moment forward through the next action.
 
-Write a technical memory from one execution turn.
+Right now, one observed turn is transitioning from `moment` into `memory`.
+Write it so technical continuity stays intact with existing memories (what failed, what changed, what to try next) without inventing missing context.
+
+Write a technical memory from one observed turn.
 
 Use only explicit evidence from:
 - command

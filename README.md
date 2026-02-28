@@ -122,6 +122,8 @@ cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pil
 ./playground/faculties/headspace --pile /path/to/pile/self.pile lens list
 ```
 
+Use `@-` to read a value from stdin (for both `playground config set` and `headspace` value fields).
+
 Prompt files in `playground/prompts/*.md` are generated from templates in
 `playground/prompts/templates/*.tmpl.md`. Re-render after editing templates or shared fragments:
 
