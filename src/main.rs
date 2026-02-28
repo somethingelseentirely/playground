@@ -220,18 +220,8 @@ enum ConfigField {
     AuthorRole,
     PersonaId,
     PollMs,
-    LlmModel,
-    LlmBaseUrl,
-    LlmApiKey,
     TavilyApiKey,
     ExaApiKey,
-    LlmReasoningEffort,
-    LlmStream,
-    LlmContextWindowTokens,
-    LlmMaxOutputTokens,
-    LlmPromptSafetyMarginTokens,
-    LlmPromptCharsPerToken,
-    LlmCompactionProfileId,
     LlmCompactionMergeArity,
     ExecDefaultCwd,
     ExecSandboxProfile,
@@ -242,11 +232,8 @@ enum ConfigField {
 enum OptionalConfigField {
     TeamsBranchId,
     PersonaId,
-    LlmApiKey,
     TavilyApiKey,
     ExaApiKey,
-    LlmReasoningEffort,
-    LlmCompactionProfileId,
     ExecDefaultCwd,
     ExecSandboxProfile,
 }
@@ -1153,44 +1140,11 @@ fn apply_config_set(config: &mut Config, field: ConfigField, value: &str) -> Res
         ConfigField::PollMs => {
             config.poll_ms = parse_u64(value, "poll_ms")?;
         }
-        ConfigField::LlmModel => {
-            config.llm.model = load_value_or_file(value, "llm_model")?;
-        }
-        ConfigField::LlmBaseUrl => {
-            config.llm.base_url = load_value_or_file(value, "llm_base_url")?;
-        }
-        ConfigField::LlmApiKey => {
-            config.llm.api_key = Some(load_value_or_file_trimmed(value, "llm_api_key")?);
-        }
         ConfigField::TavilyApiKey => {
             config.tavily_api_key = Some(load_value_or_file_trimmed(value, "tavily_api_key")?);
         }
         ConfigField::ExaApiKey => {
             config.exa_api_key = Some(load_value_or_file_trimmed(value, "exa_api_key")?);
-        }
-        ConfigField::LlmReasoningEffort => {
-            config.llm.reasoning_effort =
-                Some(load_value_or_file_trimmed(value, "llm_reasoning_effort")?);
-        }
-        ConfigField::LlmStream => {
-            config.llm.stream = parse_bool(value, "llm_stream")?;
-        }
-        ConfigField::LlmContextWindowTokens => {
-            config.llm.context_window_tokens = parse_u64(value, "llm_context_window_tokens")?;
-        }
-        ConfigField::LlmMaxOutputTokens => {
-            config.llm.max_output_tokens = parse_u64(value, "llm_max_output_tokens")?;
-        }
-        ConfigField::LlmPromptSafetyMarginTokens => {
-            config.llm.prompt_safety_margin_tokens =
-                parse_u64(value, "llm_prompt_safety_margin_tokens")?;
-        }
-        ConfigField::LlmPromptCharsPerToken => {
-            config.llm.prompt_chars_per_token = parse_u64(value, "llm_prompt_chars_per_token")?;
-        }
-        ConfigField::LlmCompactionProfileId => {
-            config.llm_compaction_profile_id =
-                Some(parse_hex_id(value, "llm_compaction_profile_id")?);
         }
         ConfigField::LlmCompactionMergeArity => {
             let factor = parse_u64(value, "llm_compaction_merge_arity")?;
@@ -1214,11 +1168,8 @@ fn apply_config_unset(config: &mut Config, field: OptionalConfigField) -> Result
     match field {
         OptionalConfigField::TeamsBranchId => config.teams_branch_id = None,
         OptionalConfigField::PersonaId => config.persona_id = None,
-        OptionalConfigField::LlmApiKey => config.llm.api_key = None,
         OptionalConfigField::TavilyApiKey => config.tavily_api_key = None,
         OptionalConfigField::ExaApiKey => config.exa_api_key = None,
-        OptionalConfigField::LlmReasoningEffort => config.llm.reasoning_effort = None,
-        OptionalConfigField::LlmCompactionProfileId => config.llm_compaction_profile_id = None,
         OptionalConfigField::ExecDefaultCwd => config.exec.default_cwd = None,
         OptionalConfigField::ExecSandboxProfile => config.exec.sandbox_profile = None,
     }
@@ -1448,14 +1399,6 @@ fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
 fn parse_u64(raw: &str, label: &str) -> Result<u64> {
     raw.parse::<u64>()
         .map_err(|_| anyhow!("invalid {label} {raw}"))
-}
-
-fn parse_bool(raw: &str, label: &str) -> Result<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        _ => Err(anyhow!("invalid {label} {raw} (expected true/false)")),
-    }
 }
 
 fn print_config(config: &Config, show_secrets: bool) {

@@ -108,7 +108,7 @@ Playground stores its configuration inside the pile. Use the `config` subcommand
 
 ```bash
 cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config show
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set llm-base-url http://localhost:11434/v1/responses
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set poll-ms 100
 ```
 
 Prompts can also be loaded from files:
@@ -152,10 +152,11 @@ Manage LLM profiles (headspaces):
 ./playground/faculties/headspace --pile /path/to/pile/self.pile add "oss-120" --model gpt-oss:120b --base-url http://localhost:11434/v1/responses
 ./playground/faculties/headspace --pile /path/to/pile/self.pile use oss-120
 ./playground/faculties/headspace --pile /path/to/pile/self.pile set reasoning-effort medium
+./playground/faculties/headspace --pile /path/to/pile/self.pile set api-key sk-...
 ```
 
-LLM settings (`llm-model`, `llm-base-url`, `llm-reasoning-effort`, etc.) are stored on the active
-profile.
+LLM settings (model/base-url/reasoning/api-key and memory lenses) are managed by the headspace
+faculty and stored on the active profile.
 
 ## Workspace snapshots (in the pile)
 
