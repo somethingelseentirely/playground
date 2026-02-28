@@ -25,7 +25,7 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
 const DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS: u64 = 512;
 const DEFAULT_PROMPT_CHARS_PER_TOKEN: u64 = 4;
-const DEFAULT_COMPACTION_MERGE_ARITY: u64 = 8;
+const DEFAULT_MEMORY_COMPACTION_ARITY: u64 = 8;
 const DEFAULT_MEMORY_LENS_FACTUAL_PROMPT: &str = include_str!("../prompts/memory_lens_factual.md");
 const DEFAULT_MEMORY_LENS_TECHNICAL_PROMPT: &str =
     include_str!("../prompts/memory_lens_technical.md");
@@ -73,7 +73,7 @@ pub struct Config {
     pub llm_profile_id: Option<Id>,
     pub llm_profile_name: String,
     pub llm_compaction_profile_id: Option<Id>,
-    pub llm_compaction_merge_arity: u64,
+    pub memory_compaction_arity: u64,
     pub memory_lenses: Vec<MemoryLensConfig>,
     pub tavily_api_key: Option<String>,
     pub exa_api_key: Option<String>,
@@ -209,7 +209,7 @@ fn default_config(pile_path: PathBuf) -> Config {
         llm_profile_id: None,
         llm_profile_name: "default".to_string(),
         llm_compaction_profile_id: None,
-        llm_compaction_merge_arity: default_compaction_merge_arity(),
+        memory_compaction_arity: default_memory_compaction_arity(),
         memory_lenses: default_memory_lenses(),
         tavily_api_key: None,
         exa_api_key: None,
@@ -590,11 +590,11 @@ fn load_latest_config(
     if let Some(factor) = load_u256_attr(
         catalog,
         config_id,
-        playground_config::llm_compaction_merge_arity,
+        playground_config::memory_compaction_arity,
     )
     .and_then(u256be_to_u64)
     {
-        config.llm_compaction_merge_arity = factor.max(2);
+        config.memory_compaction_arity = factor.max(2);
     }
 
     if let Some(profile_id) = config.llm_profile_id {
@@ -789,10 +789,10 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         playground_config::poll_ms: poll_ms,
         playground_config::active_llm_profile_id: profile_id,
     };
-    let llm_compaction_merge_arity: Value<U256BE> =
-        config.llm_compaction_merge_arity.max(2).to_value();
+    let memory_compaction_arity: Value<U256BE> =
+        config.memory_compaction_arity.max(2).to_value();
     change += entity! { &config_id @
-        playground_config::llm_compaction_merge_arity: llm_compaction_merge_arity,
+        playground_config::memory_compaction_arity: memory_compaction_arity,
     };
 
     if let Some(id) = config.branch_id {
@@ -990,8 +990,8 @@ fn default_prompt_chars_per_token() -> u64 {
     DEFAULT_PROMPT_CHARS_PER_TOKEN
 }
 
-fn default_compaction_merge_arity() -> u64 {
-    DEFAULT_COMPACTION_MERGE_ARITY
+fn default_memory_compaction_arity() -> u64 {
+    DEFAULT_MEMORY_COMPACTION_ARITY
 }
 
 fn default_memory_lenses() -> Vec<MemoryLensConfig> {

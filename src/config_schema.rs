@@ -40,7 +40,7 @@ pub mod playground_config {
         "4200F6746B36F2784DEBA1555595D6AC" as pub llm_max_output_tokens: U256BE;
         "1FF004BB48F7A4F8F72541F4D4FA75FF" as pub llm_prompt_safety_margin_tokens: U256BE;
         "095FAECDB8FF205DF591DF594E593B01" as pub llm_prompt_chars_per_token: U256BE;
-        "167BABF8DFCD69AB4DB69773AAB18C4B" as pub llm_compaction_merge_arity: U256BE;
+        "167BABF8DFCD69AB4DB69773AAB18C4B" as pub memory_compaction_arity: U256BE;
         "24CF9D532E03C44CF719546DDE7E0493" as pub memory_lens_id: GenId;
         "1F0A596CD677F732CD5C506F74C61F6B" as pub memory_lens_prompt: Handle<Blake3, LongString>;
         "1067F34FE4517B058A74BC2118868DA4" as pub memory_lens_compaction_prompt: Handle<Blake3, LongString>;
@@ -196,7 +196,7 @@ where
     metadata += describe_attribute(blobs, &playground_config::llm_max_output_tokens)?;
     metadata += describe_attribute(blobs, &playground_config::llm_prompt_safety_margin_tokens)?;
     metadata += describe_attribute(blobs, &playground_config::llm_prompt_chars_per_token)?;
-    metadata += describe_attribute(blobs, &playground_config::llm_compaction_merge_arity)?;
+    metadata += describe_attribute(blobs, &playground_config::memory_compaction_arity)?;
     metadata += describe_attribute(blobs, &playground_config::memory_lens_id)?;
     metadata += describe_attribute(blobs, &playground_config::memory_lens_prompt)?;
     metadata += describe_attribute(blobs, &playground_config::memory_lens_compaction_prompt)?;

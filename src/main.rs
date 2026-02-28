@@ -222,7 +222,7 @@ enum ConfigField {
     PollMs,
     TavilyApiKey,
     ExaApiKey,
-    LlmCompactionMergeArity,
+    MemoryCompactionArity,
     ExecDefaultCwd,
     ExecSandboxProfile,
 }
@@ -398,7 +398,7 @@ fn format_elapsed(duration: Duration) -> String {
 }
 
 fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
-    let merge_arity = config.llm_compaction_merge_arity.max(2) as usize;
+    let merge_arity = config.memory_compaction_arity.max(2) as usize;
     let profile = resolve_compaction_profile_info(&config);
 
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
@@ -651,7 +651,7 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
 }
 
 fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
-    let merge_arity = config.llm_compaction_merge_arity.max(2) as usize;
+    let merge_arity = config.memory_compaction_arity.max(2) as usize;
     let profile = resolve_compaction_profile_info(&config);
 
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
@@ -1146,12 +1146,12 @@ fn apply_config_set(config: &mut Config, field: ConfigField, value: &str) -> Res
         ConfigField::ExaApiKey => {
             config.exa_api_key = Some(load_value_or_file_trimmed(value, "exa_api_key")?);
         }
-        ConfigField::LlmCompactionMergeArity => {
-            let factor = parse_u64(value, "llm_compaction_merge_arity")?;
+        ConfigField::MemoryCompactionArity => {
+            let factor = parse_u64(value, "memory_compaction_arity")?;
             if factor < 2 {
-                return Err(anyhow!("llm_compaction_merge_arity must be >= 2"));
+                return Err(anyhow!("memory_compaction_arity must be >= 2"));
             }
-            config.llm_compaction_merge_arity = factor;
+            config.memory_compaction_arity = factor;
         }
         ConfigField::ExecDefaultCwd => {
             let value = load_value_or_file(value, "exec_default_cwd")?;
@@ -1537,10 +1537,7 @@ fn print_config(config: &Config, show_secrets: bool) {
             .map(|id| format!("\"{id:x}\""))
             .unwrap_or_else(|| "null".to_string())
     );
-    println!(
-        "compaction_merge_arity = {}",
-        config.llm_compaction_merge_arity
-    );
+    println!("memory_compaction_arity = {}", config.memory_compaction_arity);
     println!("memory_lens_count = {}", config.memory_lenses.len());
     for lens in &config.memory_lenses {
         println!(
@@ -3147,7 +3144,7 @@ fn build_prompt_messages_with_compaction(
     let mut index = load_context_chunks(catalog);
     let body_budget_chars = prompt_body_budget_chars(config);
     let semantic_compactor = SemanticCompactor::new(config)?;
-    let merge_arity = config.llm_compaction_merge_arity as usize;
+    let merge_arity = config.memory_compaction_arity as usize;
     let primary_lens_id = config
         .memory_lenses
         .first()

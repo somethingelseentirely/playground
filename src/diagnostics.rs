@@ -538,7 +538,7 @@ struct AgentConfigRow {
     llm_compaction_base_url: Option<String>,
     llm_compaction_chars_per_token: Option<u64>,
     llm_compaction_api_key: Option<String>,
-    llm_compaction_merge_arity: Option<u64>,
+    memory_compaction_arity: Option<u64>,
     tavily_api_key: Option<String>,
     exa_api_key: Option<String>,
     exec_default_cwd: Option<String>,
@@ -1872,10 +1872,10 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_compaction_entity_id,
         playground_config::llm_api_key,
     );
-    let llm_compaction_merge_arity = load_optional_u64_attr(
+    let memory_compaction_arity = load_optional_u64_attr(
         data,
         config_id,
-        playground_config::llm_compaction_merge_arity,
+        playground_config::memory_compaction_arity,
     );
     let tavily_api_key =
         load_optional_string_attr(data, ws, config_id, playground_config::tavily_api_key);
@@ -1923,7 +1923,7 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_compaction_base_url,
         llm_compaction_chars_per_token,
         llm_compaction_api_key,
-        llm_compaction_merge_arity,
+        memory_compaction_arity,
         tavily_api_key,
         exa_api_key,
         exec_default_cwd,
@@ -4802,10 +4802,10 @@ fn render_agent_config(
             );
             ui.end_row();
 
-            ui.label("llm.compaction.merge_arity");
+            ui.label("memory.compaction.arity");
             ui.monospace(
                 config
-                    .llm_compaction_merge_arity
+                    .memory_compaction_arity
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );

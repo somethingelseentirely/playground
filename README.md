@@ -109,6 +109,7 @@ Playground stores its configuration inside the pile. Use the `config` subcommand
 ```bash
 cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config show
 cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set poll-ms 100
+cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set memory-compaction-arity 8
 ```
 
 Prompts can also be loaded from files:
@@ -140,7 +141,6 @@ cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pil
 Clear an optional config field:
 
 ```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config unset llm-api-key
 ./playground/faculties/headspace --pile /path/to/pile/self.pile lens reset factual prompt
 ./playground/faculties/headspace --pile /path/to/pile/self.pile lens remove reflective
 ```
@@ -155,8 +155,8 @@ Manage LLM profiles (headspaces):
 ./playground/faculties/headspace --pile /path/to/pile/self.pile set api-key sk-...
 ```
 
-LLM settings (model/base-url/reasoning/api-key and memory lenses) are managed by the headspace
-faculty and stored on the active profile.
+LLM/headspace settings (model/base-url/reasoning/api-key, compaction profile, and memory lenses)
+are managed by the `headspace` faculty. Compaction merge arity is runtime config.
 
 ## Workspace snapshots (in the pile)
 
