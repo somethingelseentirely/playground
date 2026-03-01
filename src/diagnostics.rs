@@ -33,7 +33,7 @@ use GORBIE::widgets::{Button, TextField};
 
 use crate::blob_refs::{PromptChunk, split_blob_refs};
 use crate::chat_prompt::{ChatMessage, ChatRole};
-use crate::schema::llm_chat;
+use crate::schema::model_chat;
 use crate::schema::playground_cog;
 use crate::schema::playground_config;
 use crate::schema::playground_context;
@@ -3013,25 +3013,25 @@ fn collect_changed_result_ids(data: &TribleSet, delta: &TribleSet) -> HashSet<Id
     let mut ids = HashSet::new();
     for (result_id,) in find!(
         (result_id: Id),
-        pattern_changes!(data, delta, [{ ?result_id @ llm_chat::kind: llm_chat::kind_result }])
+        pattern_changes!(data, delta, [{ ?result_id @ model_chat::kind: model_chat::kind_result }])
     ) {
         ids.insert(result_id);
     }
     for (result_id,) in find!(
         (result_id: Id),
-        pattern_changes!(data, delta, [{ ?result_id @ llm_chat::reasoning_text: _?reasoning_handle }])
+        pattern_changes!(data, delta, [{ ?result_id @ model_chat::reasoning_text: _?reasoning_handle }])
     ) {
         ids.insert(result_id);
     }
     for (result_id,) in find!(
         (result_id: Id),
-        pattern_changes!(data, delta, [{ ?result_id @ llm_chat::response_raw: _?raw_handle }])
+        pattern_changes!(data, delta, [{ ?result_id @ model_chat::response_raw: _?raw_handle }])
     ) {
         ids.insert(result_id);
     }
     for (result_id,) in find!(
         (result_id: Id),
-        pattern_changes!(data, delta, [{ ?result_id @ llm_chat::finished_at: _?finished_at }])
+        pattern_changes!(data, delta, [{ ?result_id @ model_chat::finished_at: _?finished_at }])
     ) {
         ids.insert(result_id);
     }
@@ -3047,8 +3047,8 @@ fn collect_reasoning_summary_row(
         (finished_at: Value<NsTAIInterval>),
         pattern!(data, [{
             result_id @
-            llm_chat::kind: llm_chat::kind_result,
-            llm_chat::finished_at: ?finished_at,
+            model_chat::kind: model_chat::kind_result,
+            model_chat::finished_at: ?finished_at,
         }])
     )
     .into_iter()
@@ -3059,8 +3059,8 @@ fn collect_reasoning_summary_row(
         (reasoning_handle: Value<Handle<Blake3, LongString>>),
         pattern!(data, [{
             result_id @
-            llm_chat::kind: llm_chat::kind_result,
-            llm_chat::reasoning_text: ?reasoning_handle,
+            model_chat::kind: model_chat::kind_result,
+            model_chat::reasoning_text: ?reasoning_handle,
         }])
     )
     .into_iter()
@@ -3071,8 +3071,8 @@ fn collect_reasoning_summary_row(
         (raw_handle: Value<Handle<Blake3, LongString>>),
         pattern!(data, [{
             result_id @
-            llm_chat::kind: llm_chat::kind_result,
-            llm_chat::response_raw: ?raw_handle,
+            model_chat::kind: model_chat::kind_result,
+            model_chat::response_raw: ?raw_handle,
         }])
     )
     .into_iter()
@@ -3113,8 +3113,8 @@ fn collect_reasoning_summaries(
         ),
         pattern!(data, [{
             ?result_id @
-            llm_chat::kind: llm_chat::kind_result,
-            llm_chat::reasoning_text: ?reasoning_handle,
+            model_chat::kind: model_chat::kind_result,
+            model_chat::reasoning_text: ?reasoning_handle,
         }])
     ) {
         reasoning_by_result.insert(result_id, reasoning_handle);
@@ -3128,8 +3128,8 @@ fn collect_reasoning_summaries(
         ),
         pattern!(data, [{
             ?result_id @
-            llm_chat::kind: llm_chat::kind_result,
-            llm_chat::response_raw: ?raw_handle,
+            model_chat::kind: model_chat::kind_result,
+            model_chat::response_raw: ?raw_handle,
         }])
     ) {
         raw_by_result.insert(result_id, raw_handle);
@@ -3139,8 +3139,8 @@ fn collect_reasoning_summaries(
         (result_id: Id, finished_at: Value<NsTAIInterval>),
         pattern!(data, [{
             ?result_id @
-            llm_chat::kind: llm_chat::kind_result,
-            llm_chat::finished_at: ?finished_at,
+            model_chat::kind: model_chat::kind_result,
+            model_chat::finished_at: ?finished_at,
         }])
     ) {
         let summary = if let Some(handle) = reasoning_by_result.get(&result_id).copied() {

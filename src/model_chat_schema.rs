@@ -6,7 +6,7 @@ use triblespace::prelude::valueschemas::{
 };
 use triblespace::prelude::*;
 
-pub mod llm_chat {
+pub mod model_chat {
     use super::*;
 
     attributes! {
@@ -29,9 +29,9 @@ pub mod llm_chat {
         "9E9B829C473E416E9150D4B94A6A2DC4" as pub error: Handle<Blake3, LongString>;
     }
 
-    /// Root id for describing the llm_chat protocol.
+    /// Root id for describing the model_chat protocol.
     #[allow(non_upper_case_globals)]
-    pub const llm_chat_metadata: Id = id_hex!("E714890E7F711B393B6249A3E7198B89");
+    pub const model_chat_metadata: Id = id_hex!("E714890E7F711B393B6249A3E7198B89");
 
     /// Tag for response request entities.
     #[allow(non_upper_case_globals)]
@@ -43,16 +43,16 @@ pub mod llm_chat {
     #[allow(non_upper_case_globals)]
     pub const kind_result: Id = id_hex!("DE498E4697F9F01219C75E7BC183DB91");
 
-    /// Tag for llm_chat protocol metadata.
+    /// Tag for model_chat protocol metadata.
     #[allow(non_upper_case_globals)]
     pub const tag_protocol: Id = id_hex!("4E2AFB139125A2294B4D464C150D48FC");
-    /// Tag for kind constants in the llm_chat protocol.
+    /// Tag for kind constants in the model_chat protocol.
     #[allow(non_upper_case_globals)]
     pub const tag_kind: Id = id_hex!("3E8E162D4BD697DE01083D0E529F49C1");
-    /// Tag for attribute constants in the llm_chat protocol.
+    /// Tag for attribute constants in the model_chat protocol.
     #[allow(non_upper_case_globals)]
     pub const tag_attribute: Id = id_hex!("6A2166D684C571DC18769CAC44260A4D");
-    /// Tag for tag constants in the llm_chat protocol.
+    /// Tag for tag constants in the model_chat protocol.
     #[allow(non_upper_case_globals)]
     pub const tag_tag: Id = id_hex!("737CB4E3D88A2942C2725F978D620135");
 }
@@ -63,74 +63,74 @@ where
 {
     let mut tribles = TribleSet::new();
 
-    tribles += entity! { ExclusiveId::force_ref(&llm_chat::llm_chat_metadata) @
-        metadata::name: blobs.put("llm_chat_metadata".to_string())?,
+    tribles += entity! { ExclusiveId::force_ref(&model_chat::model_chat_metadata) @
+        metadata::name: blobs.put("model_chat_metadata".to_string())?,
         metadata::description: blobs.put(
-            "Root id for describing the llm_chat protocol.".to_string(),
+            "Root id for describing the model_chat protocol.".to_string(),
         )?,
-        metadata::tag: llm_chat::tag_protocol,
+        metadata::tag: model_chat::tag_protocol,
     };
 
-    tribles += entity! { ExclusiveId::force_ref(&llm_chat::tag_protocol) @
+    tribles += entity! { ExclusiveId::force_ref(&model_chat::tag_protocol) @
         metadata::name: blobs.put("tag_protocol".to_string())?,
         metadata::description: blobs.put(
-            "Tag for llm_chat protocol metadata.".to_string(),
+            "Tag for model_chat protocol metadata.".to_string(),
         )?,
-        metadata::tag: llm_chat::tag_tag,
+        metadata::tag: model_chat::tag_tag,
     };
 
-    tribles += entity! { ExclusiveId::force_ref(&llm_chat::tag_kind) @
+    tribles += entity! { ExclusiveId::force_ref(&model_chat::tag_kind) @
         metadata::name: blobs.put("tag_kind".to_string())?,
         metadata::description: blobs.put(
-            "Tag for llm_chat protocol kind constants.".to_string(),
+            "Tag for model_chat protocol kind constants.".to_string(),
         )?,
-        metadata::tag: llm_chat::tag_tag,
+        metadata::tag: model_chat::tag_tag,
     };
 
-    tribles += entity! { ExclusiveId::force_ref(&llm_chat::tag_attribute) @
+    tribles += entity! { ExclusiveId::force_ref(&model_chat::tag_attribute) @
         metadata::name: blobs.put("tag_attribute".to_string())?,
         metadata::description: blobs.put(
-            "Tag for llm_chat protocol attributes.".to_string(),
+            "Tag for model_chat protocol attributes.".to_string(),
         )?,
-        metadata::tag: llm_chat::tag_tag,
+        metadata::tag: model_chat::tag_tag,
     };
 
-    tribles += entity! { ExclusiveId::force_ref(&llm_chat::tag_tag) @
+    tribles += entity! { ExclusiveId::force_ref(&model_chat::tag_tag) @
         metadata::name: blobs.put("tag_tag".to_string())?,
         metadata::description: blobs.put(
-            "Tag for llm_chat protocol tag constants.".to_string(),
+            "Tag for model_chat protocol tag constants.".to_string(),
         )?,
-        metadata::tag: llm_chat::tag_tag,
+        metadata::tag: model_chat::tag_tag,
     };
 
-    tribles += entity! { ExclusiveId::force_ref(&llm_chat::kind_request) @
+    tribles += entity! { ExclusiveId::force_ref(&model_chat::kind_request) @
         metadata::name: blobs.put("kind_request".to_string())?,
         metadata::description: blobs.put(
-            "LLM request entity kind.".to_string(),
+            "Model request entity kind.".to_string(),
         )?,
-        metadata::tag: llm_chat::tag_kind,
+        metadata::tag: model_chat::tag_kind,
     };
 
-    tribles += entity! { ExclusiveId::force_ref(&llm_chat::kind_in_progress) @
+    tribles += entity! { ExclusiveId::force_ref(&model_chat::kind_in_progress) @
         metadata::name: blobs.put("kind_in_progress".to_string())?,
         metadata::description: blobs.put(
-            "LLM in-progress entity kind.".to_string(),
+            "Model in-progress entity kind.".to_string(),
         )?,
-        metadata::tag: llm_chat::tag_kind,
+        metadata::tag: model_chat::tag_kind,
     };
 
-    tribles += entity! { ExclusiveId::force_ref(&llm_chat::kind_result) @
+    tribles += entity! { ExclusiveId::force_ref(&model_chat::kind_result) @
         metadata::name: blobs.put("kind_result".to_string())?,
         metadata::description: blobs.put(
-            "LLM result entity kind.".to_string(),
+            "Model result entity kind.".to_string(),
         )?,
-        metadata::tag: llm_chat::tag_kind,
+        metadata::tag: model_chat::tag_kind,
     };
 
     Ok(tribles)
 }
 
-pub fn build_llm_chat_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
+pub fn build_model_chat_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
 where
     B: BlobStore<Blake3>,
 {
@@ -142,23 +142,23 @@ where
     metadata += <ShortString as metadata::ConstDescribe>::describe(blobs)?;
     metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
 
-    metadata += describe_attribute(blobs, &llm_chat::kind)?;
-    metadata += describe_attribute(blobs, &llm_chat::about_request)?;
-    metadata += describe_attribute(blobs, &llm_chat::about_thought)?;
-    metadata += describe_attribute(blobs, &llm_chat::model)?;
-    metadata += describe_attribute(blobs, &llm_chat::context)?;
-    metadata += describe_attribute(blobs, &llm_chat::requested_at)?;
-    metadata += describe_attribute(blobs, &llm_chat::request_raw)?;
-    metadata += describe_attribute(blobs, &llm_chat::worker)?;
-    metadata += describe_attribute(blobs, &llm_chat::started_at)?;
-    metadata += describe_attribute(blobs, &llm_chat::attempt)?;
-    metadata += describe_attribute(blobs, &llm_chat::finished_at)?;
-    metadata += describe_attribute(blobs, &llm_chat::output_text)?;
-    metadata += describe_attribute(blobs, &llm_chat::response_id)?;
-    metadata += describe_attribute(blobs, &llm_chat::response_raw)?;
-    metadata += describe_attribute(blobs, &llm_chat::reasoning_text)?;
-    metadata += describe_attribute(blobs, &llm_chat::response_json_root)?;
-    metadata += describe_attribute(blobs, &llm_chat::error)?;
+    metadata += describe_attribute(blobs, &model_chat::kind)?;
+    metadata += describe_attribute(blobs, &model_chat::about_request)?;
+    metadata += describe_attribute(blobs, &model_chat::about_thought)?;
+    metadata += describe_attribute(blobs, &model_chat::model)?;
+    metadata += describe_attribute(blobs, &model_chat::context)?;
+    metadata += describe_attribute(blobs, &model_chat::requested_at)?;
+    metadata += describe_attribute(blobs, &model_chat::request_raw)?;
+    metadata += describe_attribute(blobs, &model_chat::worker)?;
+    metadata += describe_attribute(blobs, &model_chat::started_at)?;
+    metadata += describe_attribute(blobs, &model_chat::attempt)?;
+    metadata += describe_attribute(blobs, &model_chat::finished_at)?;
+    metadata += describe_attribute(blobs, &model_chat::output_text)?;
+    metadata += describe_attribute(blobs, &model_chat::response_id)?;
+    metadata += describe_attribute(blobs, &model_chat::response_raw)?;
+    metadata += describe_attribute(blobs, &model_chat::reasoning_text)?;
+    metadata += describe_attribute(blobs, &model_chat::response_json_root)?;
+    metadata += describe_attribute(blobs, &model_chat::error)?;
 
     Ok(metadata)
 }
@@ -175,7 +175,7 @@ where
     tribles += metadata::Describe::describe(attribute, blobs)?;
     let attribute_id = attribute.id();
     tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::tag: llm_chat::tag_attribute,
+        metadata::tag: model_chat::tag_attribute,
     };
     Ok(tribles)
 }

@@ -25,11 +25,11 @@ use crate::repo_util::{
     close_repo, current_branch_head, ensure_worker_name, init_repo, load_text, pull_workspace,
     push_workspace, refresh_cached_checkout, seed_metadata,
 };
-use crate::schema::llm_chat;
+use crate::schema::model_chat;
 use crate::time_util::{epoch_interval, interval_key, now_epoch};
 
 #[derive(Debug, Clone)]
-struct LlmRequest {
+struct ModelRequest {
     id: Id,
     context: Value<Handle<Blake3, LongString>>,
     model: Option<Value<ShortString>>,
@@ -37,8 +37,8 @@ struct LlmRequest {
 }
 
 #[derive(Default)]
-struct LlmRequestIndex {
-    requests: HashMap<Id, LlmRequest>,
+struct ModelRequestIndex {
+    requests: HashMap<Id, ModelRequest>,
     in_progress_by_worker: HashSet<Id>,
     done: HashSet<Id>,
 }
@@ -51,7 +51,7 @@ struct OpenAIResult {
     response_id: Option<String>,
 }
 
-struct LlmHttpClient {
+struct ModelHttpClient {
     client: Client,
     endpoint_url: String,
     api_key: Option<String>,
@@ -61,8 +61,8 @@ struct LlmHttpClient {
 const SEND_MAX_ATTEMPTS: usize = 8;
 const SEND_RETRY_BASE_MS: u64 = 1_000;
 const SEND_RETRY_MAX_MS: u64 = 30_000;
-const LLM_CONNECT_TIMEOUT_SECS: u64 = 20;
-const LLM_REQUEST_TIMEOUT_SECS: u64 = 240;
+const MODEL_CONNECT_TIMEOUT_SECS: u64 = 20;
+const MODEL_REQUEST_TIMEOUT_SECS: u64 = 240;
 const MAX_INLINE_IMAGES_PER_PROMPT: usize = 4;
 const MAX_INLINE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
@@ -77,11 +77,11 @@ fn chat_completions_url(api_base_url: &str) -> String {
     format!("{base}/chat/completions")
 }
 
-impl LlmHttpClient {
+impl ModelHttpClient {
     fn new(config: &Config) -> Result<Self> {
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(LLM_CONNECT_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(MODEL_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(MODEL_REQUEST_TIMEOUT_SECS))
             .build()
             .context("build http client")?;
         let endpoint_url = chat_completions_url(config.llm.base_url.as_str());
@@ -100,7 +100,7 @@ impl LlmHttpClient {
                 Ok(result) => return Ok(result),
                 Err(failure) => {
                     eprintln!(
-                        "warning: llm send attempt {attempt}/{SEND_MAX_ATTEMPTS} to {} failed: {err:#}",
+                        "warning: model send attempt {attempt}/{SEND_MAX_ATTEMPTS} to {} failed: {err:#}",
                         self.endpoint_url,
                         err = failure.error
                     );
@@ -204,7 +204,7 @@ fn is_retryable_request_error(err: &anyhow::Error) -> bool {
         .any(|req_err| req_err.is_timeout() || req_err.is_connect() || req_err.is_request())
 }
 
-pub(crate) fn run_llm_loop(
+pub(crate) fn run_model_loop(
     config: Config,
     worker_id: Id,
     poll_ms: u64,
@@ -213,13 +213,13 @@ pub(crate) fn run_llm_loop(
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
     let result = (|| -> Result<()> {
         seed_metadata(&mut repo)?;
-        let label = format!("llm-{}", id_prefix(worker_id));
+        let label = format!("model-{}", id_prefix(worker_id));
         ensure_worker_name(&mut repo, branch_id, worker_id, &label)?;
         let mut cached_head = None;
         let mut cached_catalog = TribleSet::new();
-        let mut request_index = LlmRequestIndex::default();
+        let mut request_index = ModelRequestIndex::default();
 
-        let client = LlmHttpClient::new(&config)?;
+        let client = ModelHttpClient::new(&config)?;
 
         loop {
             if stop_requested(&stop) {
@@ -259,13 +259,13 @@ pub(crate) fn run_llm_loop(
                     let handle = ws.put(format!("parse chat context: {err}"));
                     let mut change = TribleSet::new();
                     change += entity! { &result_id @
-                        llm_chat::kind: llm_chat::kind_result,
-                        llm_chat::about_request: request.id,
-                        llm_chat::finished_at: finished_at,
-                        llm_chat::attempt: attempt,
-                        llm_chat::error: handle,
+                        model_chat::kind: model_chat::kind_result,
+                        model_chat::about_request: request.id,
+                        model_chat::finished_at: finished_at,
+                        model_chat::attempt: attempt,
+                        model_chat::error: handle,
                     };
-                    ws.commit(change, None, Some("llm_chat result (context parse error)"));
+                    ws.commit(change, None, Some("model_chat result (context parse error)"));
                     push_workspace(&mut repo, &mut ws).context("push context parse error")?;
                     sleep(Duration::from_millis(poll_ms));
                     continue;
@@ -281,16 +281,16 @@ pub(crate) fn run_llm_loop(
 
             let mut change = TribleSet::new();
             change += entity! { ExclusiveId::force_ref(&request.id) @
-                llm_chat::request_raw: request_raw_handle,
+                model_chat::request_raw: request_raw_handle,
             };
             change += entity! { &in_progress_id @
-                llm_chat::kind: llm_chat::kind_in_progress,
-                llm_chat::about_request: request.id,
-                llm_chat::started_at: started_at,
-                llm_chat::worker: worker_id,
-                llm_chat::attempt: attempt,
+                model_chat::kind: model_chat::kind_in_progress,
+                model_chat::about_request: request.id,
+                model_chat::started_at: started_at,
+                model_chat::worker: worker_id,
+                model_chat::attempt: attempt,
             };
-            ws.commit(change, None, Some("llm_chat in_progress"));
+            ws.commit(change, None, Some("model_chat in_progress"));
             push_workspace(&mut repo, &mut ws).context("push in_progress")?;
 
             let result = client.send_payload(&payload);
@@ -299,10 +299,10 @@ pub(crate) fn run_llm_loop(
             let result_id = ufoid();
             let mut change = TribleSet::new();
             change += entity! { &result_id @
-                llm_chat::kind: llm_chat::kind_result,
-                llm_chat::about_request: request.id,
-                llm_chat::finished_at: finished_at,
-                llm_chat::attempt: attempt,
+                model_chat::kind: model_chat::kind_result,
+                model_chat::about_request: request.id,
+                model_chat::finished_at: finished_at,
+                model_chat::attempt: attempt,
             };
 
             let mut import_data = None;
@@ -315,19 +315,19 @@ pub(crate) fn run_llm_loop(
                     let output_handle = ws.put(result.output_text);
                     let raw_handle = ws.put(result.raw);
                     change += entity! { &result_id @
-                        llm_chat::output_text: output_handle,
-                        llm_chat::response_raw: raw_handle,
+                        model_chat::output_text: output_handle,
+                        model_chat::response_raw: raw_handle,
                     };
                     if let Some(reasoning_text) = result.reasoning_text {
                         let handle = ws.put(reasoning_text);
                         change += entity! { &result_id @
-                            llm_chat::reasoning_text: handle,
+                            model_chat::reasoning_text: handle,
                         };
                     }
                     if let Some(response_id) = response_id {
                         let response_id_handle = ws.put(response_id);
                         change += entity! { &result_id @
-                            llm_chat::response_id: response_id_handle,
+                            model_chat::response_id: response_id_handle,
                         };
                     }
 
@@ -349,7 +349,7 @@ pub(crate) fn run_llm_loop(
 
                             for root in fragment.exports() {
                                 change += entity! { &result_id @
-                                    llm_chat::response_json_root: root,
+                                    model_chat::response_json_root: root,
                                 };
                             }
 
@@ -364,7 +364,7 @@ pub(crate) fn run_llm_loop(
                 Err(err) => {
                     let handle = ws.put(format!("{err:#}"));
                     change += entity! { &result_id @
-                        llm_chat::error: handle,
+                        model_chat::error: handle,
                     };
                 }
             }
@@ -372,7 +372,7 @@ pub(crate) fn run_llm_loop(
             if let (Some(data), Some(metadata)) = (import_data, import_metadata) {
                 ws.commit(data, Some(metadata), Some("import response json"));
             }
-            ws.commit(change, None, Some("llm_chat result"));
+            ws.commit(change, None, Some("model_chat result"));
             push_workspace(&mut repo, &mut ws).context("push result")?;
         }
 
@@ -395,7 +395,7 @@ fn stop_requested(stop: &Option<Arc<AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
-impl LlmRequestIndex {
+impl ModelRequestIndex {
     fn apply_delta(&mut self, updated: &TribleSet, delta: &TribleSet, worker_id: Id) {
         if delta.is_empty() {
             return;
@@ -405,13 +405,13 @@ impl LlmRequestIndex {
             (request_id: Id, context: Value<Handle<Blake3, LongString>>),
             pattern_changes!(updated, delta, [{
                 ?request_id @
-                llm_chat::kind: llm_chat::kind_request,
-                llm_chat::context: ?context,
+                model_chat::kind: model_chat::kind_request,
+                model_chat::context: ?context,
             }])
         ) {
             self.requests.insert(
                 request_id,
-                LlmRequest {
+                ModelRequest {
                     id: request_id,
                     context,
                     model: None,
@@ -423,7 +423,7 @@ impl LlmRequestIndex {
         for (request_id, model) in find!(
             (request_id: Id, model: Value<ShortString>),
             pattern_changes!(updated, delta, [{
-                ?request_id @ llm_chat::model: ?model
+                ?request_id @ model_chat::model: ?model
             }])
         ) {
             if let Some(entry) = self.requests.get_mut(&request_id) {
@@ -434,7 +434,7 @@ impl LlmRequestIndex {
         for (request_id, requested_at) in find!(
             (request_id: Id, requested_at: Value<NsTAIInterval>),
             pattern_changes!(updated, delta, [{
-                ?request_id @ llm_chat::requested_at: ?requested_at
+                ?request_id @ model_chat::requested_at: ?requested_at
             }])
         ) {
             if let Some(entry) = self.requests.get_mut(&request_id) {
@@ -449,9 +449,9 @@ impl LlmRequestIndex {
             ),
             pattern_changes!(updated, delta, [{
                 _?event @
-                llm_chat::kind: llm_chat::kind_in_progress,
-                llm_chat::about_request: ?request_id,
-                llm_chat::worker: ?in_progress_worker_id,
+                model_chat::kind: model_chat::kind_in_progress,
+                model_chat::about_request: ?request_id,
+                model_chat::worker: ?in_progress_worker_id,
             }])
         ) {
             if in_progress_worker_id == worker_id {
@@ -463,16 +463,16 @@ impl LlmRequestIndex {
             (request_id: Id),
             pattern_changes!(updated, delta, [{
                 _?event @
-                llm_chat::kind: llm_chat::kind_result,
-                llm_chat::about_request: ?request_id,
+                model_chat::kind: model_chat::kind_result,
+                model_chat::about_request: ?request_id,
             }])
         ) {
             self.done.insert(request_id);
         }
     }
 
-    fn next_pending(&self) -> Option<LlmRequest> {
-        let mut candidates: Vec<LlmRequest> = self
+    fn next_pending(&self) -> Option<ModelRequest> {
+        let mut candidates: Vec<ModelRequest> = self
             .requests
             .values()
             .filter(|req| {
@@ -897,7 +897,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "playground-llm-worker-test-{}-{ts}.pile",
+            "playground-model-worker-test-{}-{ts}.pile",
             std::process::id()
         ))
     }

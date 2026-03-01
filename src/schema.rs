@@ -4,8 +4,8 @@ mod cog_schema;
 mod context_schema;
 #[path = "exec_schema.rs"]
 mod exec_schema;
-#[path = "llm_chat_schema.rs"]
-mod llm_chat_schema;
+#[path = "model_chat_schema.rs"]
+mod model_chat_schema;
 #[path = "workspace_schema.rs"]
 mod workspace_schema;
 
@@ -16,7 +16,7 @@ pub use context_schema::playground_context;
 #[allow(unused_imports)]
 pub use exec_schema::playground_exec;
 #[allow(unused_imports)]
-pub use llm_chat_schema::llm_chat;
+pub use model_chat_schema::model_chat;
 #[allow(unused_imports)]
 pub use workspace_schema::playground_workspace;
 
@@ -30,7 +30,7 @@ where
     metadata += config_schema::build_playground_config_metadata(blobs)?;
     metadata += cog_schema::build_playground_cog_metadata(blobs)?;
     metadata += context_schema::build_playground_context_metadata(blobs)?;
-    metadata += llm_chat_schema::build_llm_chat_metadata(blobs)?;
+    metadata += model_chat_schema::build_model_chat_metadata(blobs)?;
     metadata += workspace_schema::build_playground_workspace_metadata(blobs)?;
     Ok(metadata)
 }

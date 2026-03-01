@@ -30,7 +30,7 @@ mod config;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
 mod exec_worker;
-mod llm_worker;
+mod model_worker;
 mod relations_schema;
 mod repo_ops;
 mod repo_util;
@@ -46,7 +46,7 @@ use repo_util::{
     close_repo, current_branch_head, init_repo, load_text, pull_workspace, push_workspace,
     refresh_cached_checkout,
 };
-use schema::{llm_chat, playground_cog, playground_context, playground_exec};
+use schema::{model_chat, playground_cog, playground_context, playground_exec};
 use time_util::{epoch_interval, interval_key, now_epoch};
 
 mod reason_events {
@@ -65,18 +65,18 @@ mod reason_events {
 
 #[derive(Subcommand, Debug)]
 enum CommandMode {
-    #[command(about = "Run core + LLM and start the exec worker in a Lima VM")]
+    #[command(about = "Run core + Model and start the exec worker in a Lima VM")]
     Run(RunArgs),
-    #[command(about = "Run only the core loop (no LLM/exec workers)")]
+    #[command(about = "Run only the core loop (no model/exec workers)")]
     Core,
     #[command(about = "Run only the exec worker (remote host)")]
     Exec(WorkerArgs),
-    #[command(about = "Run only the LLM worker (host)")]
-    Llm(WorkerArgs),
+    #[command(about = "Run only the Model worker (host)")]
+    Model(WorkerArgs),
     #[cfg(feature = "diagnostics")]
     #[command(about = "Open the diagnostics dashboard")]
     Diagnostics(DiagnosticsArgs),
-    #[command(about = "Estimate/backfill context memory independent of LLM requests")]
+    #[command(about = "Estimate/backfill context memory independent of Model requests")]
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
@@ -103,7 +103,7 @@ enum MemoryCommand {
     #[command(about = "Estimate pending compaction work and approximate token/cost usage")]
     Estimate(MemoryEstimateArgs),
     #[command(
-        about = "Backfill context memory chunks from archive/exec without creating LLM requests"
+        about = "Backfill context memory chunks from archive/exec without creating Model requests"
     )]
     Build(MemoryBuildArgs),
     #[command(about = "Consolidate current moment into memory by setting the moment boundary turn")]
@@ -144,7 +144,7 @@ struct MemoryConsolidateArgs {
 }
 
 #[derive(Args, Debug, Clone)]
-#[command(about = "Run core + LLM and start the exec worker in a Lima VM")]
+#[command(about = "Run core + Model and start the exec worker in a Lima VM")]
 struct RunArgs {
     #[arg(long)]
     poll_ms: Option<u64>,
@@ -256,7 +256,7 @@ enum OptionalConfigField {
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Playground runner that turns LLM output into exec requests"
+    about = "Playground runner that turns Model output into exec requests"
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -292,11 +292,11 @@ fn main() -> Result<()> {
             let config = Config::load(Some(pile_path.as_path())).context("load config")?;
             run_exec_worker(config, args)
         }
-        CommandMode::Llm(args) => {
+        CommandMode::Model(args) => {
             let instance = default_instance_name();
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
             let config = Config::load(Some(pile_path.as_path())).context("load config")?;
-            run_llm_worker(config, args)
+            run_model_worker(config, args)
         }
         #[cfg(feature = "diagnostics")]
         CommandMode::Diagnostics(args) => {
@@ -336,7 +336,7 @@ fn run_with_exec(mut config: Config, args: RunArgs) -> Result<()> {
     let llm_config = config.clone();
     let llm_worker_id = *ufoid();
     let llm_handle = thread::spawn(move || {
-        llm_worker::run_llm_loop(llm_config, llm_worker_id, poll_ms, Some(llm_stop))
+        model_worker::run_model_loop(llm_config, llm_worker_id, poll_ms, Some(llm_stop))
     });
 
     prepare_lima_service(&config, &args.lima)?;
@@ -346,10 +346,10 @@ fn run_with_exec(mut config: Config, args: RunArgs) -> Result<()> {
 
     let llm_result = llm_handle
         .join()
-        .map_err(|_| anyhow!("llm worker panicked"))?;
+        .map_err(|_| anyhow!("model worker panicked"))?;
 
     core_result?;
-    llm_result.context("llm worker")?;
+    llm_result.context("model worker")?;
     Ok(())
 }
 
@@ -359,10 +359,10 @@ fn run_exec_worker(config: Config, args: WorkerArgs) -> Result<()> {
     exec_worker::run_exec_loop(config, worker_id, poll_ms, None)
 }
 
-fn run_llm_worker(config: Config, args: WorkerArgs) -> Result<()> {
+fn run_model_worker(config: Config, args: WorkerArgs) -> Result<()> {
     let poll_ms = args.poll_ms.unwrap_or(config.poll_ms);
     let worker_id = parse_worker_id(args.worker_id)?;
-    llm_worker::run_llm_loop(config, worker_id, poll_ms, None)
+    model_worker::run_model_loop(config, worker_id, poll_ms, None)
 }
 
 #[derive(Debug, Clone)]
@@ -1513,7 +1513,7 @@ fn print_config(config: &Config, show_secrets: bool) {
             .unwrap_or_else(|| "null".to_string())
     );
 
-    println!("\n[llm]");
+    println!("\n[model]");
     println!(
         "profile_id = {}",
         config
@@ -1638,17 +1638,17 @@ fn run_loop(config: Config) -> Result<()> {
     let exec_profile = config.exec.sandbox_profile;
 
     let result = (|| -> Result<()> {
-        let mut request_info = ensure_llm_request(&mut repo, branch_id, &config)?;
+        let mut request_info = ensure_model_request(&mut repo, branch_id, &config)?;
 
         loop {
             let llm_result =
-                wait_for_llm_result(&mut repo, branch_id, request_info.id, config.poll_ms)?;
+                wait_for_model_result(&mut repo, branch_id, request_info.id, config.poll_ms)?;
             if let Some(error) = llm_result.error {
                 eprintln!(
-                    "warning: llm request {request_id:x} failed: {error}",
+                    "warning: model request {request_id:x} failed: {error}",
                     request_id = request_info.id
                 );
-                request_info = ensure_llm_request(&mut repo, branch_id, &config)?;
+                request_info = ensure_model_request(&mut repo, branch_id, &config)?;
                 sleep(Duration::from_millis(config.poll_ms));
                 continue;
             }
@@ -1685,13 +1685,13 @@ fn run_loop(config: Config) -> Result<()> {
 }
 
 #[derive(Debug, Clone)]
-struct LlmRequestInfo {
+struct ModelRequestInfo {
     id: Id,
     thought_id: Option<Id>,
 }
 
 #[derive(Debug, Clone)]
-struct CoreLlmRequest {
+struct CoreModelRequest {
     id: Id,
     requested_at: Option<Value<NsTAIInterval>>,
     thought_id: Option<Id>,
@@ -1720,7 +1720,7 @@ struct CoreCommandRequest {
 }
 
 #[derive(Debug, Clone)]
-struct LlmResultEntry {
+struct ModelResultEntry {
     id: Id,
     about_request: Option<Id>,
     finished_at: Option<Value<NsTAIInterval>>,
@@ -1742,14 +1742,14 @@ struct CoreReasonEvent {
 
 #[derive(Default)]
 struct CoreIndex {
-    llm_requests: HashMap<Id, CoreLlmRequest>,
-    llm_done_requests: HashSet<Id>,
+    model_requests: HashMap<Id, CoreModelRequest>,
+    model_done_requests: HashSet<Id>,
     request_for_thought: HashMap<Id, Id>,
     thoughts: HashMap<Id, CoreThought>,
     moment_boundaries: HashMap<Id, CoreMomentBoundary>,
     thought_for_exec_result: HashMap<Id, Id>,
     requested_thoughts: HashSet<Id>,
-    llm_results: HashMap<Id, LlmResultEntry>,
+    model_results: HashMap<Id, ModelResultEntry>,
     command_requests: HashMap<Id, CoreCommandRequest>,
     command_request_for_thought: HashMap<Id, Id>,
     command_done_requests: HashSet<Id>,
@@ -1759,11 +1759,11 @@ struct CoreIndex {
     reason_event_ids_by_turn: HashMap<Id, HashSet<Id>>,
 }
 
-fn ensure_llm_request(
+fn ensure_model_request(
     repo: &mut Repository<Pile>,
     branch_id: Id,
     config: &Config,
-) -> Result<LlmRequestInfo> {
+) -> Result<ModelRequestInfo> {
     let mut cached_head = None;
     let mut cached_catalog = TribleSet::new();
     let mut core_index = CoreIndex::default();
@@ -1774,19 +1774,19 @@ fn ensure_llm_request(
             continue;
         }
 
-        let mut ws = pull_workspace(repo, branch_id, "pull workspace for llm request")?;
+        let mut ws = pull_workspace(repo, branch_id, "pull workspace for model request")?;
         let delta = refresh_cached_checkout(&mut ws, &mut cached_head, &mut cached_catalog)?;
         core_index.apply_delta(&cached_catalog, &delta);
 
-        if let Some(request) = core_index.latest_pending_llm_request() {
+        if let Some(request) = core_index.latest_pending_model_request() {
             return Ok(request);
         }
 
         if let Some(thought_id) = core_index.latest_unrequested_thought() {
             let request_id =
                 create_request_for_thought_from_index(&mut ws, &core_index, thought_id, config)?;
-            push_workspace(repo, &mut ws).context("push llm request")?;
-            return Ok(LlmRequestInfo {
+            push_workspace(repo, &mut ws).context("push model request")?;
+            return Ok(ModelRequestInfo {
                 id: request_id,
                 thought_id: Some(thought_id),
             });
@@ -1826,7 +1826,7 @@ fn create_thought_and_request(
     branch_id: Id,
     about_exec_result: Option<Id>,
     config: &Config,
-) -> Result<LlmRequestInfo> {
+) -> Result<ModelRequestInfo> {
     let mut ws = pull_workspace(repo, branch_id, "pull workspace for thought")?;
     let catalog = ws.checkout(..).context("checkout workspace")?;
     let mut core_index = CoreIndex::default();
@@ -1836,8 +1836,8 @@ fn create_thought_and_request(
         if let Some(thought_id) = core_index.thought_for_exec_result(exec_result_id) {
             let request_id =
                 create_request_for_thought_from_index(&mut ws, &core_index, thought_id, config)?;
-            push_workspace(repo, &mut ws).context("push llm request")?;
-            return Ok(LlmRequestInfo {
+            push_workspace(repo, &mut ws).context("push model request")?;
+            return Ok(ModelRequestInfo {
                 id: request_id,
                 thought_id: Some(thought_id),
             });
@@ -1896,17 +1896,17 @@ fn create_thought_and_request(
 
     let request_id = ufoid();
     change += entity! { &request_id @
-        llm_chat::kind: llm_chat::kind_request,
-        llm_chat::about_thought: *thought_id,
-        llm_chat::context: context_handle,
-        llm_chat::requested_at: now,
-        llm_chat::model: config.llm.model.as_str(),
+        model_chat::kind: model_chat::kind_request,
+        model_chat::about_thought: *thought_id,
+        model_chat::context: context_handle,
+        model_chat::requested_at: now,
+        model_chat::model: config.llm.model.as_str(),
     };
 
-    ws.commit(change, None, Some("create thought + llm request"));
+    ws.commit(change, None, Some("create thought + model request"));
     push_workspace(repo, &mut ws).context("push thought + request")?;
 
-    Ok(LlmRequestInfo {
+    Ok(ModelRequestInfo {
         id: *request_id,
         thought_id: Some(*thought_id),
     })
@@ -1940,36 +1940,36 @@ fn create_request_for_thought_from_index(
     let request_id = ufoid();
     let mut change = TribleSet::new();
     change += entity! { &request_id @
-        llm_chat::kind: llm_chat::kind_request,
-        llm_chat::about_thought: thought_id,
-        llm_chat::context: context_handle,
-        llm_chat::requested_at: now,
-        llm_chat::model: config.llm.model.as_str(),
+        model_chat::kind: model_chat::kind_request,
+        model_chat::about_thought: thought_id,
+        model_chat::context: context_handle,
+        model_chat::requested_at: now,
+        model_chat::model: config.llm.model.as_str(),
     };
-    ws.commit(change, None, Some("create llm request"));
+    ws.commit(change, None, Some("create model request"));
     Ok(*request_id)
 }
 
 #[derive(Debug)]
-struct LlmResult {
+struct ModelResult {
     output_text: String,
     error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct LlmResultInfo {
+struct ModelResultInfo {
     id: Id,
     output_text: Option<Value<Handle<Blake3, LongString>>>,
     reasoning_text: Option<Value<Handle<Blake3, LongString>>>,
     error: Option<Value<Handle<Blake3, LongString>>>,
 }
 
-fn wait_for_llm_result(
+fn wait_for_model_result(
     repo: &mut Repository<Pile>,
     branch_id: Id,
     request_id: Id,
     poll_ms: u64,
-) -> Result<LlmResult> {
+) -> Result<ModelResult> {
     let mut cached_head = None;
     let mut cached_catalog = TribleSet::new();
     let mut core_index = CoreIndex::default();
@@ -1980,21 +1980,21 @@ fn wait_for_llm_result(
             continue;
         }
 
-        let mut ws = pull_workspace(repo, branch_id, "pull workspace for llm result")?;
+        let mut ws = pull_workspace(repo, branch_id, "pull workspace for model result")?;
         let delta = refresh_cached_checkout(&mut ws, &mut cached_head, &mut cached_catalog)?;
         core_index.apply_delta(&cached_catalog, &delta);
-        if !delta_has_llm_result(&cached_catalog, &delta, request_id) {
+        if !delta_has_model_result(&cached_catalog, &delta, request_id) {
             sleep(Duration::from_millis(poll_ms));
             continue;
         }
-        if let Some(result) = core_index.latest_llm_result(request_id) {
-            return load_llm_result(&mut ws, result);
+        if let Some(result) = core_index.latest_model_result(request_id) {
+            return load_model_result(&mut ws, result);
         }
         sleep(Duration::from_millis(poll_ms));
     }
 }
 
-fn load_llm_result(ws: &mut Workspace<Pile>, result: LlmResultInfo) -> Result<LlmResult> {
+fn load_model_result(ws: &mut Workspace<Pile>, result: ModelResultInfo) -> Result<ModelResult> {
     let output_text = result
         .output_text
         .map(|handle| load_text(ws, handle))
@@ -2005,7 +2005,7 @@ fn load_llm_result(ws: &mut Workspace<Pile>, result: LlmResultInfo) -> Result<Ll
         .map(|handle| load_text(ws, handle))
         .transpose()?;
 
-    Ok(LlmResult { output_text, error })
+    Ok(ModelResult { output_text, error })
 }
 
 #[derive(Debug)]
@@ -2041,12 +2041,12 @@ impl CoreIndex {
         for (request_id,) in find!(
             (request_id: Id),
             pattern_changes!(updated, delta, [{
-                ?request_id @ llm_chat::kind: llm_chat::kind_request
+                ?request_id @ model_chat::kind: model_chat::kind_request
             }])
         ) {
-            self.llm_requests
+            self.model_requests
                 .entry(request_id)
-                .or_insert(CoreLlmRequest {
+                .or_insert(CoreModelRequest {
                     id: request_id,
                     requested_at: None,
                     thought_id: None,
@@ -2056,10 +2056,10 @@ impl CoreIndex {
         for (request_id, requested_at) in find!(
             (request_id: Id, requested_at: Value<NsTAIInterval>),
             pattern_changes!(updated, delta, [{
-                ?request_id @ llm_chat::requested_at: ?requested_at
+                ?request_id @ model_chat::requested_at: ?requested_at
             }])
         ) {
-            if let Some(entry) = self.llm_requests.get_mut(&request_id) {
+            if let Some(entry) = self.model_requests.get_mut(&request_id) {
                 entry.requested_at = Some(requested_at);
             }
         }
@@ -2067,10 +2067,10 @@ impl CoreIndex {
         for (request_id, thought_id) in find!(
             (request_id: Id, thought_id: Id),
             pattern_changes!(updated, delta, [{
-                ?request_id @ llm_chat::about_thought: ?thought_id
+                ?request_id @ model_chat::about_thought: ?thought_id
             }])
         ) {
-            if let Some(entry) = self.llm_requests.get_mut(&request_id) {
+            if let Some(entry) = self.model_requests.get_mut(&request_id) {
                 entry.thought_id = Some(thought_id);
             }
             self.request_for_thought.insert(thought_id, request_id);
@@ -2156,12 +2156,12 @@ impl CoreIndex {
             (result_id: Id, about_request: Id),
             pattern_changes!(updated, delta, [{
                 ?result_id @
-                llm_chat::kind: llm_chat::kind_result,
-                llm_chat::about_request: ?about_request,
+                model_chat::kind: model_chat::kind_result,
+                model_chat::about_request: ?about_request,
             }])
         ) {
-            self.llm_done_requests.insert(about_request);
-            let entry = self.llm_results.entry(result_id).or_insert(LlmResultEntry {
+            self.model_done_requests.insert(about_request);
+            let entry = self.model_results.entry(result_id).or_insert(ModelResultEntry {
                 id: result_id,
                 about_request: None,
                 finished_at: None,
@@ -2176,10 +2176,10 @@ impl CoreIndex {
         for (result_id, finished_at) in find!(
             (result_id: Id, finished_at: Value<NsTAIInterval>),
             pattern_changes!(updated, delta, [{
-                ?result_id @ llm_chat::finished_at: ?finished_at
+                ?result_id @ model_chat::finished_at: ?finished_at
             }])
         ) {
-            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+            if let Some(entry) = self.model_results.get_mut(&result_id) {
                 entry.finished_at = Some(finished_at);
             }
         }
@@ -2187,10 +2187,10 @@ impl CoreIndex {
         for (result_id, attempt) in find!(
             (result_id: Id, attempt: Value<U256BE>),
             pattern_changes!(updated, delta, [{
-                ?result_id @ llm_chat::attempt: ?attempt
+                ?result_id @ model_chat::attempt: ?attempt
             }])
         ) {
-            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+            if let Some(entry) = self.model_results.get_mut(&result_id) {
                 entry.attempt = Some(attempt);
             }
         }
@@ -2198,10 +2198,10 @@ impl CoreIndex {
         for (result_id, output_text) in find!(
             (result_id: Id, output_text: Value<Handle<Blake3, LongString>>),
             pattern_changes!(updated, delta, [{
-                ?result_id @ llm_chat::output_text: ?output_text
+                ?result_id @ model_chat::output_text: ?output_text
             }])
         ) {
-            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+            if let Some(entry) = self.model_results.get_mut(&result_id) {
                 entry.output_text = Some(output_text);
             }
         }
@@ -2209,10 +2209,10 @@ impl CoreIndex {
         for (result_id, reasoning_text) in find!(
             (result_id: Id, reasoning_text: Value<Handle<Blake3, LongString>>),
             pattern_changes!(updated, delta, [{
-                ?result_id @ llm_chat::reasoning_text: ?reasoning_text
+                ?result_id @ model_chat::reasoning_text: ?reasoning_text
             }])
         ) {
-            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+            if let Some(entry) = self.model_results.get_mut(&result_id) {
                 entry.reasoning_text = Some(reasoning_text);
             }
         }
@@ -2220,10 +2220,10 @@ impl CoreIndex {
         for (result_id, error) in find!(
             (result_id: Id, error: Value<Handle<Blake3, LongString>>),
             pattern_changes!(updated, delta, [{
-                ?result_id @ llm_chat::error: ?error
+                ?result_id @ model_chat::error: ?error
             }])
         ) {
-            if let Some(entry) = self.llm_results.get_mut(&result_id) {
+            if let Some(entry) = self.model_results.get_mut(&result_id) {
                 entry.error = Some(error);
             }
         }
@@ -2492,11 +2492,11 @@ impl CoreIndex {
         }
     }
 
-    fn latest_pending_llm_request(&self) -> Option<LlmRequestInfo> {
-        let mut candidates: Vec<CoreLlmRequest> = self
-            .llm_requests
+    fn latest_pending_model_request(&self) -> Option<ModelRequestInfo> {
+        let mut candidates: Vec<CoreModelRequest> = self
+            .model_requests
             .values()
-            .filter(|request| !self.llm_done_requests.contains(&request.id))
+            .filter(|request| !self.model_done_requests.contains(&request.id))
             .cloned()
             .collect();
         candidates.sort_by_key(|request| {
@@ -2505,7 +2505,7 @@ impl CoreIndex {
                 request.id,
             )
         });
-        candidates.pop().map(|request| LlmRequestInfo {
+        candidates.pop().map(|request| ModelRequestInfo {
             id: request.id,
             thought_id: request.thought_id,
         })
@@ -2536,12 +2536,12 @@ impl CoreIndex {
             .and_then(|thought| thought.context)
     }
 
-    fn latest_llm_result(&self, request_id: Id) -> Option<LlmResultInfo> {
-        self.llm_results
+    fn latest_model_result(&self, request_id: Id) -> Option<ModelResultInfo> {
+        self.model_results
             .values()
             .filter(|result| result.about_request == Some(request_id))
-            .max_by_key(|result| llm_result_rank(result.attempt, result.finished_at))
-            .map(|result| LlmResultInfo {
+            .max_by_key(|result| model_result_rank(result.attempt, result.finished_at))
+            .map(|result| ModelResultInfo {
                 id: result.id,
                 output_text: result.output_text,
                 reasoning_text: result.reasoning_text,
@@ -2621,7 +2621,7 @@ impl CoreIndex {
     }
 }
 
-fn llm_result_rank(
+fn model_result_rank(
     attempt: Option<Value<U256BE>>,
     finished_at: Option<Value<NsTAIInterval>>,
 ) -> (u64, i128) {
@@ -2713,13 +2713,13 @@ fn wait_for_command_result(
     }
 }
 
-fn delta_has_llm_result(updated: &TribleSet, delta: &TribleSet, request_id: Id) -> bool {
+fn delta_has_model_result(updated: &TribleSet, delta: &TribleSet, request_id: Id) -> bool {
     find!(
         (about_request: Id),
         pattern_changes!(updated, delta, [{
             _?event @
-            llm_chat::kind: llm_chat::kind_result,
-            llm_chat::about_request: ?about_request,
+            model_chat::kind: model_chat::kind_result,
+            model_chat::about_request: ?about_request,
         }])
     )
     .into_iter()
@@ -3740,7 +3740,7 @@ fn load_reasoning_for_exec_result(
     let Some(request_id) = core_index.request_for_thought(thought_id) else {
         return Ok(None);
     };
-    let Some(llm_result) = core_index.latest_llm_result(request_id) else {
+    let Some(llm_result) = core_index.latest_model_result(request_id) else {
         return Ok(None);
     };
     let Some(reasoning_handle) = llm_result.reasoning_text else {
@@ -4866,7 +4866,7 @@ struct ReasonProjectionEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReasonProjectionSource {
     Logged,
-    Llm,
+    Model,
 }
 
 #[derive(Debug, Clone)]
@@ -4941,7 +4941,7 @@ fn load_exec_turn_projection(
             id: result_id,
             text: reasoning_text,
             command_text: None,
-            source: ReasonProjectionSource::Llm,
+            source: ReasonProjectionSource::Model,
         });
     }
 
@@ -4990,7 +4990,7 @@ fn synthetic_reason_command(reason_text: &str) -> String {
 fn synthetic_reason_output(event: &ReasonProjectionEvent) -> String {
     let source = match event.source {
         ReasonProjectionSource::Logged => "logged",
-        ReasonProjectionSource::Llm => "llm",
+        ReasonProjectionSource::Model => "model",
     };
     format!("reason_id: {:x}\nsource: {source}", event.id)
 }
