@@ -32,7 +32,9 @@ use GORBIE::themes::colorhash;
 use GORBIE::widgets::{Button, TextField};
 
 use crate::blob_refs::{PromptChunk, split_blob_refs};
+use crate::chat_prompt::{ChatMessage, ChatRole};
 use crate::schema::llm_chat;
+use crate::schema::playground_cog;
 use crate::schema::playground_config;
 use crate::schema::playground_context;
 use crate::schema::playground_exec;
@@ -101,6 +103,8 @@ mod reason_events {
 
 type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 const ACTIVITY_TIMELINE_HEIGHT: f32 = 980.0;
+const TURN_MEMORY_HEIGHT: f32 = 980.0;
+const TURN_MEMORY_MAX_ROWS: usize = 160;
 const TIMELINE_DEFAULT_LIMIT: usize = 300;
 const TIMELINE_LIMIT_PRESETS: [usize; 4] = [100, 300, 1000, 3000];
 const TIMELINE_LIMIT_MIN: usize = 10;
@@ -230,6 +234,7 @@ struct DashboardState {
     teams_selected_chat: Option<Id>,
     workspace_selected_snapshot: Option<Id>,
     context_selected_chunk: Option<Id>,
+    turn_memory_selected_request: Option<Id>,
     context_selection_stack: Vec<Id>,
     context_show_children: bool,
     context_show_origins: bool,
@@ -266,6 +271,7 @@ impl Default for DashboardState {
             teams_selected_chat: None,
             workspace_selected_snapshot: None,
             context_selected_chunk: None,
+            turn_memory_selected_request: None,
             context_selection_stack: Vec::new(),
             context_show_children: false,
             context_show_origins: false,
@@ -355,6 +361,16 @@ struct ReasonRow {
     turn_id: Option<Id>,
     worker_id: Option<Id>,
     command_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TurnMemoryRow {
+    request_id: Id,
+    command: String,
+    requested_at: Option<i128>,
+    thought_id: Option<Id>,
+    prompt_messages: Vec<ChatMessage>,
+    prompt_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -560,6 +576,7 @@ struct DashboardSnapshot {
     exec_rows: Vec<ExecRow>,
     reasoning_summaries: Vec<ReasoningSummaryRow>,
     reason_rows: Vec<ReasonRow>,
+    turn_memory_rows: Vec<TurnMemoryRow>,
     local_message_rows: Vec<LocalMessageRow>,
     compass_status_rows: Vec<CompassStatusRow>,
     timeline_rows: Vec<TimelineRow>,
@@ -902,6 +919,20 @@ _Live view of the agent pile, exec queue, and message activity._"
                 return;
             }
             render_activity_timeline(ui, snapshot.now_key, &snapshot.timeline_rows);
+        });
+    });
+
+    nb.view(move |ui| {
+        let mut state = dashboard.read_mut(ui);
+        with_padding(ui, padding, |ui| {
+            ui.heading("Turn memory view");
+            let snapshot = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                snapshot.clone()
+            };
+            render_turn_memory_view(ui, &mut state, snapshot.now_key, &snapshot.turn_memory_rows);
         });
     });
 
@@ -1260,6 +1291,7 @@ fn load_snapshot(
             exec_rows: Vec::new(),
             reasoning_summaries: Vec::new(),
             reason_rows: Vec::new(),
+            turn_memory_rows: Vec::new(),
             local_message_rows: Vec::new(),
             compass_status_rows: Vec::new(),
             timeline_rows: Vec::new(),
@@ -1396,6 +1428,13 @@ fn build_snapshot(
         previous.map(|snapshot| snapshot.reason_rows.as_slice()),
         ws,
     );
+    let turn_memory_rows = if exec_delta.is_empty() {
+        previous
+            .map(|snapshot| snapshot.turn_memory_rows.clone())
+            .unwrap_or_else(|| collect_turn_memory_rows(&exec_data, &exec_rows, ws))
+    } else {
+        collect_turn_memory_rows(&exec_data, &exec_rows, ws)
+    };
     let context_chunks = if exec_delta.is_empty() {
         previous
             .map(|snapshot| snapshot.context_chunks.clone())
@@ -1494,6 +1533,7 @@ fn build_snapshot(
         exec_rows,
         reasoning_summaries,
         reason_rows,
+        turn_memory_rows,
         local_message_rows,
         compass_status_rows,
         timeline_rows,
@@ -2242,6 +2282,72 @@ fn collect_exec_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ExecRow>
     }
 
     sort_exec_rows(rows)
+}
+
+fn collect_turn_memory_rows(
+    data: &TribleSet,
+    exec_rows: &[ExecRow],
+    ws: &mut Workspace<Pile>,
+) -> Vec<TurnMemoryRow> {
+    let mut thought_by_request: HashMap<Id, Id> = HashMap::new();
+    for (request_id, thought_id) in find!(
+        (request_id: Id, thought_id: Id),
+        pattern!(data, [{
+            ?request_id @
+            playground_exec::kind: playground_exec::kind_command_request,
+            playground_exec::about_thought: ?thought_id,
+        }])
+    ) {
+        thought_by_request.insert(request_id, thought_id);
+    }
+
+    let mut prompt_by_thought: HashMap<Id, Value<Handle<Blake3, LongString>>> = HashMap::new();
+    for (thought_id, prompt_handle) in find!(
+        (thought_id: Id, prompt_handle: Value<Handle<Blake3, LongString>>),
+        pattern!(data, [{
+            ?thought_id @
+            playground_cog::kind: playground_cog::kind_thought,
+            playground_cog::prompt: ?prompt_handle,
+        }])
+    ) {
+        prompt_by_thought.insert(thought_id, prompt_handle);
+    }
+
+    let mut rows = Vec::new();
+    for exec in exec_rows.iter().take(TURN_MEMORY_MAX_ROWS) {
+        let thought_id = thought_by_request.get(&exec.request_id).copied();
+        let mut prompt_messages = Vec::new();
+        let mut prompt_error = None;
+        if let Some(thought_id) = thought_id {
+            if let Some(prompt_handle) = prompt_by_thought.get(&thought_id).copied() {
+                match load_text(ws, prompt_handle) {
+                    Some(prompt_json) => match serde_json::from_str::<Vec<ChatMessage>>(&prompt_json) {
+                        Ok(messages) => prompt_messages = messages,
+                        Err(err) => {
+                            prompt_error = Some(format!("prompt parse error: {err}"));
+                        }
+                    },
+                    None => {
+                        prompt_error = Some("prompt blob missing".to_string());
+                    }
+                }
+            } else {
+                prompt_error = Some("thought has no prompt handle".to_string());
+            }
+        } else {
+            prompt_error = Some("request has no thought link".to_string());
+        }
+
+        rows.push(TurnMemoryRow {
+            request_id: exec.request_id,
+            command: exec.command.clone(),
+            requested_at: exec.requested_at,
+            thought_id,
+            prompt_messages,
+            prompt_error,
+        });
+    }
+    rows
 }
 
 fn collect_local_messages_incremental(
@@ -4961,6 +5067,115 @@ fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRo
                 ui.add_space(8.0);
             }
         });
+}
+
+fn render_turn_memory_view(
+    ui: &mut egui::Ui,
+    state: &mut DashboardState,
+    now_key: i128,
+    rows: &[TurnMemoryRow],
+) {
+    if rows.is_empty() {
+        ui.small("No turn memory prompts yet.");
+        return;
+    }
+
+    if state
+        .turn_memory_selected_request
+        .is_none_or(|selected| !rows.iter().any(|row| row.request_id == selected))
+    {
+        state.turn_memory_selected_request = Some(rows[0].request_id);
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.small(format!("Showing {} recent turn prompts.", rows.len()));
+        egui::ComboBox::from_id_salt("turn_memory_request_picker")
+            .selected_text(
+                state
+                    .turn_memory_selected_request
+                    .and_then(|selected| {
+                        rows.iter()
+                            .find(|row| row.request_id == selected)
+                            .map(|row| turn_memory_row_label(now_key, row))
+                    })
+                    .unwrap_or_else(|| "<none>".to_string()),
+            )
+            .show_ui(ui, |ui| {
+                for row in rows {
+                    let selected = state.turn_memory_selected_request == Some(row.request_id);
+                    if ui
+                        .selectable_label(selected, turn_memory_row_label(now_key, row))
+                        .clicked()
+                    {
+                        state.turn_memory_selected_request = Some(row.request_id);
+                    }
+                }
+            });
+    });
+
+    let Some(selected_request) = state.turn_memory_selected_request else {
+        return;
+    };
+    let Some(row) = rows.iter().find(|row| row.request_id == selected_request) else {
+        ui.small("Selected turn prompt no longer available.");
+        return;
+    };
+
+    ui.small(format!(
+        "turn {} · thought {} · {} message(s)",
+        id_prefix(row.request_id),
+        row.thought_id
+            .map(id_prefix)
+            .unwrap_or_else(|| "-".to_string()),
+        row.prompt_messages.len()
+    ));
+    if let Some(err) = row.prompt_error.as_deref() {
+        ui.colored_label(egui::Color32::LIGHT_RED, err);
+    }
+    if row.prompt_messages.is_empty() {
+        ui.small("No prompt messages captured for this turn.");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .id_salt("turn_memory_view_scroll")
+        .auto_shrink([false, false])
+        .min_scrolled_height(TURN_MEMORY_HEIGHT)
+        .max_height(TURN_MEMORY_HEIGHT)
+        .show(ui, |ui| {
+            for (idx, message) in row.prompt_messages.iter().enumerate() {
+                let (label, fill) = turn_memory_role_style(message.role);
+                let chars = message.content.chars().count();
+                ui.horizontal_wrapped(|ui| {
+                    render_timeline_source_chip(ui, label, fill);
+                    ui.small(format!("msg {idx} · {chars}c"));
+                });
+                egui::Frame::NONE
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(190)))
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        render_blob_aware_text(ui, message.content.as_str(), None, None);
+                    });
+                ui.add_space(6.0);
+            }
+        });
+}
+
+fn turn_memory_row_label(now_key: i128, row: &TurnMemoryRow) -> String {
+    let age = format_age(now_key, row.requested_at);
+    let mut command = row.command.replace('\n', " ");
+    if command.chars().count() > 72 {
+        command = command.chars().take(72).collect::<String>() + "…";
+    }
+    format!("{age} {} {command}", id_prefix(row.request_id))
+}
+
+fn turn_memory_role_style(role: ChatRole) -> (&'static str, egui::Color32) {
+    match role {
+        ChatRole::System => ("system", egui::Color32::from_rgb(104, 122, 151)),
+        ChatRole::User => ("user", egui::Color32::from_rgb(82, 138, 118)),
+        ChatRole::Assistant => ("assistant", egui::Color32::from_rgb(120, 108, 166)),
+    }
 }
 
 fn render_context_compaction(
