@@ -15,13 +15,12 @@ use triblespace::core::blob::schemas::UnknownBlob;
 use triblespace::core::import::json::JsonObjectImporter;
 use triblespace::core::repo::Workspace;
 use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::U256BE;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
 use crate::blob_refs::{PromptChunk, split_blob_refs, unknown_blob_handle_from_hex};
 use crate::chat_prompt::{ChatMessage, ChatRole};
-use crate::config::{Config, LlmTransport};
+use crate::config::Config;
 use crate::repo_util::{
     close_repo, current_branch_head, ensure_worker_name, init_repo, load_text, pull_workspace,
     push_workspace, refresh_cached_checkout, seed_metadata,
@@ -42,7 +41,6 @@ struct LlmRequestIndex {
     requests: HashMap<Id, LlmRequest>,
     in_progress_by_worker: HashSet<Id>,
     done: HashSet<Id>,
-    response_raw_by_request: HashMap<Id, Value<Handle<Blake3, LongString>>>,
 }
 
 #[derive(Debug)]
@@ -57,7 +55,6 @@ struct LlmHttpClient {
     client: Client,
     endpoint_url: String,
     api_key: Option<String>,
-    transport: LlmTransport,
     stream: bool,
 }
 
@@ -80,20 +77,6 @@ fn chat_completions_url(api_base_url: &str) -> String {
     format!("{base}/chat/completions")
 }
 
-fn responses_url(api_base_url: &str) -> String {
-    let base = api_base_url.trim().trim_end_matches('/');
-    if base.ends_with("/responses") {
-        return base.to_string();
-    }
-    if let Some(base) = base.strip_suffix("/chat/completions") {
-        return format!("{base}/responses");
-    }
-    if let Some(base) = base.strip_suffix("/completions") {
-        return format!("{base}/responses");
-    }
-    format!("{base}/responses")
-}
-
 impl LlmHttpClient {
     fn new(config: &Config) -> Result<Self> {
         let client = Client::builder()
@@ -101,20 +84,12 @@ impl LlmHttpClient {
             .timeout(Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS))
             .build()
             .context("build http client")?;
-        let endpoint_url = match config.llm.transport {
-            LlmTransport::ChatCompletions => chat_completions_url(config.llm.base_url.as_str()),
-            LlmTransport::Responses => responses_url(config.llm.base_url.as_str()),
-        };
-        let stream = match config.llm.transport {
-            LlmTransport::Responses => false,
-            LlmTransport::ChatCompletions => config.llm.stream,
-        };
+        let endpoint_url = chat_completions_url(config.llm.base_url.as_str());
         Ok(Self {
             client,
             endpoint_url,
             api_key: config.llm.api_key.clone(),
-            transport: config.llm.transport,
-            stream,
+            stream: config.llm.stream,
         })
     }
 
@@ -152,7 +127,7 @@ impl LlmHttpClient {
         payload: &JsonValue,
     ) -> std::result::Result<OpenAIResult, SendFailure> {
         let response = self.send_request(payload).map_err(|err| SendFailure {
-            retryable: is_retryable_transport_error(&err),
+            retryable: is_retryable_request_error(&err),
             error: err,
         })?;
         if response.status().is_success() {
@@ -193,7 +168,7 @@ impl LlmHttpClient {
     }
 
     fn parse_response(&self, response: reqwest::blocking::Response) -> Result<OpenAIResult> {
-        if self.stream && self.transport == LlmTransport::ChatCompletions {
+        if self.stream {
             parse_stream(response)
         } else {
             let json: JsonValue = response.json().context("read response json")?;
@@ -223,7 +198,7 @@ fn is_retryable_http_status(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
-fn is_retryable_transport_error(err: &anyhow::Error) -> bool {
+fn is_retryable_request_error(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
         .any(|req_err| req_err.is_timeout() || req_err.is_connect() || req_err.is_request())
@@ -296,18 +271,7 @@ pub(crate) fn run_llm_loop(
                     continue;
                 }
             };
-            let replay_reasoning_items = if config.llm.transport == LlmTransport::Responses {
-                request_index.replay_reasoning_items_for_request(&mut ws, &request)
-            } else {
-                Vec::new()
-            };
-            let payload = build_payload(
-                &config,
-                &mut ws,
-                model.as_str(),
-                &messages,
-                replay_reasoning_items.as_slice(),
-            );
+            let payload = build_payload(&config, &mut ws, model.as_str(), &messages);
             let request_raw =
                 serde_json::to_string(&payload).context("serialize request payload")?;
 
@@ -495,7 +459,6 @@ impl LlmRequestIndex {
             }
         }
 
-        let mut requests_with_new_results = HashSet::new();
         for (request_id,) in find!(
             (request_id: Id),
             pattern_changes!(updated, delta, [{
@@ -505,11 +468,6 @@ impl LlmRequestIndex {
             }])
         ) {
             self.done.insert(request_id);
-            requests_with_new_results.insert(request_id);
-        }
-
-        for request_id in requests_with_new_results {
-            self.refresh_request_response_raw(updated, request_id);
         }
     }
 
@@ -525,112 +483,6 @@ impl LlmRequestIndex {
         candidates.sort_by_key(|req| req.requested_at.map(interval_key).unwrap_or(i128::MIN));
         candidates.into_iter().next()
     }
-
-    fn replay_reasoning_items_for_request(
-        &self,
-        ws: &mut Workspace<Pile>,
-        request: &LlmRequest,
-    ) -> Vec<JsonValue> {
-        let Some(previous) = self.latest_completed_request_before(request) else {
-            return Vec::new();
-        };
-        let Some(raw_handle) = self.response_raw_by_request.get(&previous.id).copied() else {
-            return Vec::new();
-        };
-        let raw = match load_text(ws, raw_handle) {
-            Ok(text) => text,
-            Err(err) => {
-                eprintln!(
-                    "warning: failed to load response_raw for reasoning replay on request {:x}: {err:#}",
-                    previous.id
-                );
-                return Vec::new();
-            }
-        };
-        let response_json: JsonValue = match serde_json::from_str(raw.as_str()) {
-            Ok(json) => json,
-            Err(err) => {
-                eprintln!(
-                    "warning: failed to parse response_raw for reasoning replay on request {:x}: {err:#}",
-                    previous.id
-                );
-                return Vec::new();
-            }
-        };
-        extract_replayable_reasoning_items(&response_json)
-    }
-
-    fn latest_completed_request_before(&self, request: &LlmRequest) -> Option<&LlmRequest> {
-        let current_key = request_order_key(request);
-        let mut best_before: Option<&LlmRequest> = None;
-        let mut best_before_key: Option<(i128, [u8; 16])> = None;
-        let mut best_any: Option<&LlmRequest> = None;
-        let mut best_any_key: Option<(i128, [u8; 16])> = None;
-
-        for candidate in self.requests.values() {
-            if candidate.id == request.id {
-                continue;
-            }
-            if !self.done.contains(&candidate.id) {
-                continue;
-            }
-            if !self.response_raw_by_request.contains_key(&candidate.id) {
-                continue;
-            }
-
-            let candidate_key = request_order_key(candidate);
-            if best_any_key.is_none_or(|key| candidate_key > key) {
-                best_any = Some(candidate);
-                best_any_key = Some(candidate_key);
-            }
-            if candidate_key < current_key && best_before_key.is_none_or(|key| candidate_key > key)
-            {
-                best_before = Some(candidate);
-                best_before_key = Some(candidate_key);
-            }
-        }
-
-        best_before.or(best_any)
-    }
-
-    fn refresh_request_response_raw(&mut self, updated: &TribleSet, request_id: Id) {
-        let mut latest: Option<(i128, [u8; 32], Value<Handle<Blake3, LongString>>)> = None;
-        for (finished_at, attempt, raw_handle) in find!(
-            (
-                finished_at: Value<NsTAIInterval>,
-                attempt: Value<U256BE>,
-                raw_handle: Value<Handle<Blake3, LongString>>
-            ),
-            pattern!(updated, [{
-                _?result_id @
-                llm_chat::kind: llm_chat::kind_result,
-                llm_chat::about_request: request_id,
-                llm_chat::finished_at: ?finished_at,
-                llm_chat::attempt: ?attempt,
-                llm_chat::response_raw: ?raw_handle,
-            }])
-        ) {
-            let key = (interval_key(finished_at), attempt.raw);
-            if latest.as_ref().is_none_or(|(best_time, best_attempt, _)| {
-                key.0 > *best_time || (key.0 == *best_time && key.1 > *best_attempt)
-            }) {
-                latest = Some((key.0, key.1, raw_handle));
-            }
-        }
-
-        if let Some((_, _, raw_handle)) = latest {
-            self.response_raw_by_request.insert(request_id, raw_handle);
-        } else {
-            self.response_raw_by_request.remove(&request_id);
-        }
-    }
-}
-
-fn request_order_key(request: &LlmRequest) -> (i128, [u8; 16]) {
-    (
-        request.requested_at.map(interval_key).unwrap_or(i128::MIN),
-        request.id.into(),
-    )
 }
 
 fn build_chat_payload_messages(
@@ -670,184 +522,20 @@ fn build_chat_payload_messages(
     out
 }
 
-fn build_responses_input_messages(
-    ws: &mut Workspace<Pile>,
-    model: &str,
-    messages: &[ChatMessage],
-) -> Vec<JsonValue> {
-    let supports_images = model_supports_images(model);
-    let mut out = Vec::with_capacity(messages.len());
-
-    for message in messages {
-        let role = match message.role {
-            ChatRole::System => "system",
-            ChatRole::User => "user",
-            ChatRole::Assistant => "assistant",
-        };
-        let text_type = if message.role == ChatRole::Assistant {
-            "output_text"
-        } else {
-            "input_text"
-        };
-
-        if message.role == ChatRole::User && supports_images {
-            let chunks = split_blob_refs(message.content.as_str());
-            let has_blob = chunks.iter().any(|chunk| match chunk {
-                PromptChunk::Blob(_) => true,
-                PromptChunk::Text(_) => false,
-            });
-            if has_blob {
-                let mut content = Vec::new();
-                for part in build_prompt_input_content(ws, model, message.content.as_str()) {
-                    match part.get("type").and_then(JsonValue::as_str) {
-                        Some("text") => {
-                            if let Some(text) = part.get("text").and_then(JsonValue::as_str) {
-                                content.push(serde_json::json!({
-                                    "type": "input_text",
-                                    "text": text,
-                                }));
-                            }
-                        }
-                        Some("image_url") => {
-                            if let Some(url) = part
-                                .get("image_url")
-                                .and_then(|image| image.get("url"))
-                                .and_then(JsonValue::as_str)
-                            {
-                                content.push(serde_json::json!({
-                                    "type": "input_image",
-                                    "image_url": url,
-                                }));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if content.is_empty() {
-                    content.push(serde_json::json!({
-                        "type": "input_text",
-                        "text": message.content.as_str(),
-                    }));
-                }
-                out.push(serde_json::json!({
-                    "type": "message",
-                    "role": role,
-                    "content": content,
-                }));
-                continue;
-            }
-        }
-
-        out.push(serde_json::json!({
-            "type": "message",
-            "role": role,
-            "content": [
-                {
-                    "type": text_type,
-                    "text": message.content.as_str(),
-                }
-            ],
-        }));
-    }
-
-    out
-}
-
 fn build_payload(
     config: &Config,
     ws: &mut Workspace<Pile>,
     model: &str,
     messages: &[ChatMessage],
-    replay_reasoning_items: &[JsonValue],
 ) -> JsonValue {
-    match config.llm.transport {
-        LlmTransport::ChatCompletions => {
-            let messages = build_chat_payload_messages(ws, model, messages);
-            let max_tokens = config.llm.max_output_tokens.max(1);
-            serde_json::json!({
-                "model": model,
-                "messages": messages,
-                "stream": config.llm.stream,
-                "max_tokens": max_tokens,
-            })
-        }
-        LlmTransport::Responses => {
-            let mut input =
-                Vec::with_capacity(replay_reasoning_items.len().saturating_add(messages.len()));
-            input.extend(replay_reasoning_items.iter().cloned());
-            input.extend(build_responses_input_messages(ws, model, messages));
-            let mut payload = serde_json::json!({
-                "model": model,
-                "input": input,
-                "store": true,
-                "stream": false,
-                "include": ["reasoning.encrypted_content"],
-                "max_output_tokens": config.llm.max_output_tokens.max(1),
-            });
-            let mut reasoning = serde_json::Map::new();
-            if let Some(effort) = config.llm.reasoning_effort.as_ref() {
-                reasoning.insert("effort".to_string(), JsonValue::String(effort.clone()));
-            }
-            if let Some(summary) = config.llm.reasoning_summary {
-                reasoning.insert(
-                    "summary".to_string(),
-                    JsonValue::String(summary.as_str().to_string()),
-                );
-            }
-            if !reasoning.is_empty() {
-                payload
-                    .as_object_mut()
-                    .expect("responses payload object")
-                    .insert("reasoning".to_string(), JsonValue::Object(reasoning));
-            }
-            payload
-        }
-    }
-}
-
-fn extract_replayable_reasoning_items(response: &JsonValue) -> Vec<JsonValue> {
-    let Some(output) = response.get("output").and_then(JsonValue::as_array) else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    for item in output {
-        if item.get("type").and_then(JsonValue::as_str) != Some("reasoning") {
-            continue;
-        }
-
-        let Some(id) = item.get("id").and_then(JsonValue::as_str) else {
-            continue;
-        };
-
-        let mut replay = serde_json::Map::new();
-        replay.insert(
-            "type".to_string(),
-            JsonValue::String("reasoning".to_string()),
-        );
-        replay.insert("id".to_string(), JsonValue::String(id.to_string()));
-
-        if let Some(summary) = item.get("summary").filter(|value| value.is_array()) {
-            replay.insert("summary".to_string(), summary.clone());
-        }
-        if let Some(encrypted_content) = item.get("encrypted_content").and_then(JsonValue::as_str) {
-            replay.insert(
-                "encrypted_content".to_string(),
-                JsonValue::String(encrypted_content.to_string()),
-            );
-        } else if let Some(content) = item.get("content") {
-            replay.insert("content".to_string(), content.clone());
-        }
-
-        if replay.get("summary").is_none()
-            && replay.get("encrypted_content").is_none()
-            && replay.get("content").is_none()
-        {
-            continue;
-        }
-        out.push(JsonValue::Object(replay));
-    }
-    out
+    let messages = build_chat_payload_messages(ws, model, messages);
+    let max_tokens = config.llm.max_output_tokens.max(1);
+    serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": config.llm.stream,
+        "max_tokens": max_tokens,
+    })
 }
 
 fn build_prompt_input_content(
@@ -1031,36 +719,6 @@ fn extract_response_id(response: &JsonValue) -> Option<String> {
 }
 
 fn extract_output_text(response: &JsonValue) -> String {
-    // Responses-style output: output[] with assistant message content items.
-    if let Some(output) = response.get("output").and_then(JsonValue::as_array) {
-        let mut out = String::new();
-        for item in output {
-            if item.get("type").and_then(JsonValue::as_str) != Some("message") {
-                continue;
-            }
-            if item.get("role").and_then(JsonValue::as_str) != Some("assistant") {
-                continue;
-            }
-            let Some(parts) = item.get("content").and_then(JsonValue::as_array) else {
-                continue;
-            };
-            for part in parts {
-                let kind = part
-                    .get("type")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or_default();
-                if (kind == "output_text" || kind == "text")
-                    && let Some(text) = part.get("text").and_then(JsonValue::as_str)
-                {
-                    out.push_str(text);
-                }
-            }
-        }
-        if !out.is_empty() {
-            return out;
-        }
-    }
-
     let Some(choices) = response.get("choices").and_then(JsonValue::as_array) else {
         return String::new();
     };
@@ -1100,25 +758,7 @@ fn extract_output_text(response: &JsonValue) -> String {
 fn extract_reasoning_text(response: &JsonValue) -> Option<String> {
     let mut out = Vec::new();
 
-    // OpenAI responses-style reasoning summaries.
-    if let Some(output) = response.get("output").and_then(JsonValue::as_array) {
-        for item in output {
-            if item.get("type").and_then(JsonValue::as_str) != Some("reasoning") {
-                continue;
-            }
-            if let Some(summary_items) = item.get("summary").and_then(JsonValue::as_array) {
-                for entry in summary_items {
-                    if entry.get("type").and_then(JsonValue::as_str) == Some("summary_text")
-                        && let Some(text) = entry.get("text").and_then(JsonValue::as_str)
-                    {
-                        push_clean(&mut out, text);
-                    }
-                }
-            }
-        }
-    }
-
-    // Chat-completions style (including Mistral reasoning/thinking chunks where present).
+    // Chat-completions style (including Mistral thinking chunks where present).
     if let Some(choices) = response.get("choices").and_then(JsonValue::as_array) {
         for choice in choices {
             if let Some(message) = choice.get("message") {
@@ -1244,11 +884,11 @@ mod tests {
     use triblespace::prelude::*;
 
     use crate::chat_prompt::ChatMessage;
-    use crate::config::{Config, LlmTransport};
+    use crate::config::Config;
 
     use super::{
         Bytes, JsonValue, UnknownBlob, build_payload, build_prompt_input_content,
-        extract_reasoning_text, extract_replayable_reasoning_items,
+        extract_reasoning_text,
     };
 
     fn test_repo_path() -> PathBuf {
@@ -1296,29 +936,12 @@ mod tests {
         output
     }
 
-    fn test_config(transport: LlmTransport) -> Config {
+    fn test_config() -> Config {
         let path = test_repo_path();
         let mut config = Config::load(Some(path.as_path())).expect("load default config");
-        config.llm.transport = transport;
         config.llm.model = "gpt-5".to_string();
         let _ = std::fs::remove_file(path);
         config
-    }
-
-    #[test]
-    fn extracts_openai_reasoning_summary() {
-        let response = json!({
-            "output": [
-                {
-                    "type": "reasoning",
-                    "summary": [
-                        {"type": "summary_text", "text": "Investigating branch mismatch"}
-                    ]
-                }
-            ]
-        });
-        let reasoning = extract_reasoning_text(&response).expect("reasoning");
-        assert!(reasoning.contains("Investigating branch mismatch"));
     }
 
     #[test]
@@ -1378,71 +1001,21 @@ mod tests {
     }
 
     #[test]
-    fn extracts_replayable_reasoning_items_for_responses() {
-        let response = json!({
-            "output": [
-                {
-                    "type": "reasoning",
-                    "id": "rs_123",
-                    "summary": [{"type": "summary_text", "text": "checking context"}],
-                    "encrypted_content": "enc_abc"
-                },
-                {
-                    "type": "reasoning",
-                    "id": "rs_124",
-                    "summary": [{"type": "summary_text", "text": "fallback summary"}]
-                },
-                {
-                    "type": "reasoning",
-                    "id": "rs_125"
-                },
-                {
-                    "type": "message",
-                    "id": "msg_1",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "echo hi"}]
-                }
-            ]
-        });
-        let replay = extract_replayable_reasoning_items(&response);
-        assert_eq!(replay.len(), 2);
-        assert_eq!(replay[0]["type"].as_str(), Some("reasoning"));
-        assert_eq!(replay[0]["id"].as_str(), Some("rs_123"));
-        assert_eq!(replay[0]["encrypted_content"].as_str(), Some("enc_abc"));
-        assert_eq!(replay[1]["id"].as_str(), Some("rs_124"));
-        assert!(replay[1].get("encrypted_content").is_none());
-    }
-
-    #[test]
-    fn responses_payload_prepends_replay_reasoning_items() {
+    fn chat_payload_uses_message_array() {
         with_test_workspace(|ws| {
-            let mut config = test_config(LlmTransport::Responses);
-            config.llm.reasoning_effort = Some("medium".to_string());
+            let config = test_config();
             let messages = vec![
                 ChatMessage::system("sys"),
                 ChatMessage::assistant("orient show"),
                 ChatMessage::user("stdout:\nok\n"),
             ];
-            let replay = vec![json!({
-                "type": "reasoning",
-                "id": "rs_prev",
-                "encrypted_content": "enc_prev"
-            })];
-
-            let payload = build_payload(&config, ws, "gpt-5", &messages, replay.as_slice());
-            let input = payload
-                .get("input")
+            let payload = build_payload(&config, ws, "gpt-5", &messages);
+            let payload_messages = payload
+                .get("messages")
                 .and_then(JsonValue::as_array)
-                .expect("responses input array");
-            assert!(!input.is_empty());
-            assert_eq!(
-                input[0].get("type").and_then(JsonValue::as_str),
-                Some("reasoning")
-            );
-            assert_eq!(
-                input[0].get("id").and_then(JsonValue::as_str),
-                Some("rs_prev")
-            );
+                .expect("chat payload messages array");
+            assert_eq!(payload_messages.len(), 3);
+            assert!(payload.get("input").is_none());
         });
     }
 

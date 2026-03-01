@@ -21,7 +21,6 @@ use crate::time_util::{epoch_interval, interval_key, now_epoch};
 const DEFAULT_MODEL: &str = "gpt-oss:120b";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_STREAM: bool = false;
-const DEFAULT_TRANSPORT: LlmTransport = LlmTransport::ChatCompletions;
 const DEFAULT_REASONING_SUMMARY: LlmReasoningSummary = LlmReasoningSummary::Detailed;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
@@ -103,7 +102,6 @@ pub struct LlmConfig {
     pub model: String,
     pub base_url: String,
     pub api_key: Option<String>,
-    pub transport: LlmTransport,
     pub reasoning_effort: Option<String>,
     pub reasoning_summary: Option<LlmReasoningSummary>,
     pub stream: bool,
@@ -111,29 +109,6 @@ pub struct LlmConfig {
     pub max_output_tokens: u64,
     pub prompt_safety_margin_tokens: u64,
     pub prompt_chars_per_token: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LlmTransport {
-    ChatCompletions,
-    Responses,
-}
-
-impl LlmTransport {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ChatCompletions => "chat-completions",
-            Self::Responses => "responses",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "chat-completions" => Some(Self::ChatCompletions),
-            "responses" => Some(Self::Responses),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,7 +170,6 @@ impl Default for LlmConfig {
             model: default_model(),
             base_url: default_base_url(),
             api_key: None,
-            transport: default_transport(),
             reasoning_effort: None,
             reasoning_summary: Some(default_reasoning_summary()),
             stream: default_stream(),
@@ -541,18 +515,6 @@ fn load_latest_config(
     if let Some(url) = load_string_attr(ws, catalog, config_id, playground_config::llm_base_url)? {
         config.llm.base_url = url;
     }
-    if let Some(transport) =
-        load_string_attr(ws, catalog, config_id, playground_config::llm_transport)?
-    {
-        if let Some(parsed) = LlmTransport::parse(transport.as_str()) {
-            config.llm.transport = parsed;
-        } else {
-            eprintln!(
-                "warning: unsupported llm transport '{transport}', using {}",
-                config.llm.transport.as_str()
-            );
-        }
-    }
     if let Some(effort) = load_string_attr(
         ws,
         catalog,
@@ -735,12 +697,6 @@ fn load_latest_llm_profile(
     }
     if let Some(url) = load_string_attr(ws, catalog, entry_id, playground_config::llm_base_url)? {
         llm.base_url = url;
-    }
-    if let Some(transport) =
-        load_string_attr(ws, catalog, entry_id, playground_config::llm_transport)?
-    {
-        llm.transport = LlmTransport::parse(transport.as_str())
-            .ok_or_else(|| anyhow!("unsupported llm transport '{transport}'"))?;
     }
     if let Some(effort) = load_string_attr(
         ws,
@@ -956,7 +912,6 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let profile_name = ws.put(config.llm_profile_name.clone());
     let llm_model = ws.put(config.llm.model.clone());
     let llm_base_url = ws.put(config.llm.base_url.clone());
-    let llm_transport = ws.put(config.llm.transport.as_str().to_string());
     let llm_stream: Value<U256BE> = if config.llm.stream { 1u64 } else { 0u64 }.to_value();
     let llm_context_window_tokens: Value<U256BE> = config.llm.context_window_tokens.to_value();
     let llm_max_output_tokens: Value<U256BE> = config.llm.max_output_tokens.to_value();
@@ -971,7 +926,6 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         metadata::name: profile_name,
         playground_config::llm_model: llm_model,
         playground_config::llm_base_url: llm_base_url,
-        playground_config::llm_transport: llm_transport,
         playground_config::llm_stream: llm_stream,
         playground_config::llm_context_window_tokens: llm_context_window_tokens,
         playground_config::llm_max_output_tokens: llm_max_output_tokens,
@@ -1083,10 +1037,6 @@ fn default_base_url() -> String {
 
 fn default_stream() -> bool {
     DEFAULT_STREAM
-}
-
-fn default_transport() -> LlmTransport {
-    DEFAULT_TRANSPORT
 }
 
 fn default_reasoning_summary() -> LlmReasoningSummary {

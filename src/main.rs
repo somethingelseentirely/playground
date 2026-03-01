@@ -40,7 +40,7 @@ mod workspace_snapshot;
 
 use archive_schema::{playground_archive, playground_archive_import};
 use chat_prompt::ChatMessage;
-use config::{Config, LlmReasoningSummary, LlmTransport, MemoryLensConfig};
+use config::{Config, MemoryLensConfig};
 use relations_schema::playground_relations;
 use repo_util::{
     close_repo, current_branch_head, init_repo, load_text, pull_workspace, push_workspace,
@@ -242,7 +242,7 @@ enum OptionalConfigField {
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Playground runner that turns LLM responses into exec requests"
+    about = "Playground runner that turns LLM output into exec requests"
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -1510,7 +1510,6 @@ fn print_config(config: &Config, show_secrets: bool) {
     println!("profile_name = \"{}\"", config.llm_profile_name);
     println!("model = \"{}\"", config.llm.model);
     println!("base_url = \"{}\"", config.llm.base_url);
-    println!("transport = \"{}\"", config.llm.transport.as_str());
     match (&config.llm.api_key, show_secrets) {
         (Some(key), true) => println!("api_key = \"{}\"", key),
         (Some(_), false) => println!("api_key = \"<redacted>\""),
@@ -4538,9 +4537,6 @@ struct SemanticCompactor {
     endpoint_url: String,
     api_key: Option<String>,
     model: String,
-    transport: LlmTransport,
-    reasoning_effort: Option<String>,
-    reasoning_summary: Option<LlmReasoningSummary>,
     chars_per_token: u64,
     memory_lenses: Vec<MemoryLensConfig>,
 }
@@ -4558,9 +4554,6 @@ impl SemanticCompactor {
         let mut model = config.llm.model.clone();
         let mut base_url = config.llm.base_url.clone();
         let mut api_key = config.llm.api_key.clone();
-        let mut transport = config.llm.transport;
-        let mut reasoning_effort = config.llm.reasoning_effort.clone();
-        let mut reasoning_summary = config.llm.reasoning_summary;
         let mut chars_per_token = config.llm.prompt_chars_per_token.max(1);
         if let Some(profile_id) = config.llm_compaction_profile_id {
             match config::load_llm_profile(config.pile_path.as_path(), profile_id) {
@@ -4568,9 +4561,6 @@ impl SemanticCompactor {
                     model = profile.model;
                     base_url = profile.base_url;
                     api_key = profile.api_key;
-                    transport = profile.transport;
-                    reasoning_effort = profile.reasoning_effort;
-                    reasoning_summary = profile.reasoning_summary;
                     chars_per_token = profile.prompt_chars_per_token.max(1);
                 }
                 Ok(None) => eprintln!(
@@ -4584,12 +4574,9 @@ impl SemanticCompactor {
 
         Ok(Self {
             client,
-            endpoint_url: llm_endpoint_url(transport, base_url.as_str()),
+            endpoint_url: chat_completions_url(base_url.as_str()),
             api_key,
             model,
-            transport,
-            reasoning_effort,
-            reasoning_summary,
             chars_per_token,
             memory_lenses: config.memory_lenses.clone(),
         })
@@ -4731,79 +4718,16 @@ impl SemanticCompactor {
     }
 
     fn build_payload(&self, system: &str, user: &str, max_output_tokens: u64) -> serde_json::Value {
-        match self.transport {
-            LlmTransport::ChatCompletions => serde_json::json!({
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "stream": false,
-                "temperature": 0,
-                "max_tokens": max_output_tokens.max(1),
-            }),
-            LlmTransport::Responses => {
-                let mut payload = serde_json::json!({
-                    "model": self.model,
-                    "input": [
-                        {
-                            "type": "message",
-                            "role": "system",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": system,
-                                }
-                            ],
-                        },
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": user,
-                                }
-                            ],
-                        }
-                    ],
-                    "store": true,
-                    "stream": false,
-                    "include": ["reasoning.encrypted_content"],
-                    "max_output_tokens": max_output_tokens.max(1),
-                });
-                let mut reasoning = serde_json::Map::new();
-                if let Some(effort) = self.reasoning_effort.as_ref() {
-                    reasoning.insert(
-                        "effort".to_string(),
-                        serde_json::Value::String(effort.clone()),
-                    );
-                }
-                if let Some(summary) = self.reasoning_summary {
-                    reasoning.insert(
-                        "summary".to_string(),
-                        serde_json::Value::String(summary.as_str().to_string()),
-                    );
-                }
-                if !reasoning.is_empty() {
-                    payload
-                        .as_object_mut()
-                        .expect("responses payload object")
-                        .insert(
-                            "reasoning".to_string(),
-                            serde_json::Value::Object(reasoning),
-                        );
-                }
-                payload
-            }
-        }
-    }
-}
-
-fn llm_endpoint_url(transport: LlmTransport, api_base_url: &str) -> String {
-    match transport {
-        LlmTransport::ChatCompletions => chat_completions_url(api_base_url),
-        LlmTransport::Responses => responses_url(api_base_url),
+        serde_json::json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": false,
+            "temperature": 0,
+            "max_tokens": max_output_tokens.max(1),
+        })
     }
 }
 
@@ -4818,50 +4742,7 @@ fn chat_completions_url(api_base_url: &str) -> String {
     format!("{base}/chat/completions")
 }
 
-fn responses_url(api_base_url: &str) -> String {
-    let base = api_base_url.trim().trim_end_matches('/');
-    if base.ends_with("/responses") {
-        return base.to_string();
-    }
-    if let Some(base) = base.strip_suffix("/chat/completions") {
-        return format!("{base}/responses");
-    }
-    if let Some(base) = base.strip_suffix("/completions") {
-        return format!("{base}/responses");
-    }
-    format!("{base}/responses")
-}
-
 fn extract_output_text(json: &serde_json::Value) -> String {
-    if let Some(output) = json.get("output").and_then(|v| v.as_array()) {
-        let mut out = String::new();
-        for item in output {
-            if item.get("type").and_then(|v| v.as_str()) != Some("message") {
-                continue;
-            }
-            if item.get("role").and_then(|v| v.as_str()) != Some("assistant") {
-                continue;
-            }
-            let Some(parts) = item.get("content").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for part in parts {
-                let kind = part
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if (kind == "output_text" || kind == "text")
-                    && let Some(text) = part.get("text").and_then(|v| v.as_str())
-                {
-                    out.push_str(text);
-                }
-            }
-        }
-        if !out.is_empty() {
-            return out;
-        }
-    }
-
     // Chat-completions style: choices[0].message.content
     if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
         if let Some(first) = choices.first() {

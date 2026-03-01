@@ -525,7 +525,6 @@ struct AgentConfigRow {
     llm_profile_name: Option<String>,
     llm_model: Option<String>,
     llm_base_url: Option<String>,
-    llm_transport: Option<String>,
     llm_reasoning_effort: Option<String>,
     llm_reasoning_summary: Option<String>,
     llm_stream: Option<bool>,
@@ -1803,8 +1802,6 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         load_optional_string_attr(data, ws, llm_entity_id, playground_config::llm_model);
     let llm_base_url =
         load_optional_string_attr(data, ws, llm_entity_id, playground_config::llm_base_url);
-    let llm_transport =
-        load_optional_string_attr(data, ws, llm_entity_id, playground_config::llm_transport);
     let llm_reasoning_effort = load_optional_string_attr(
         data,
         ws,
@@ -1917,7 +1914,6 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         llm_profile_name,
         llm_model,
         llm_base_url,
-        llm_transport,
         llm_reasoning_effort,
         llm_reasoning_summary,
         llm_stream,
@@ -4702,10 +4698,6 @@ fn render_agent_config(
 
             ui.label("llm.base_url");
             ui.label(config.llm_base_url.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("llm.transport");
-            ui.label(config.llm_transport.as_deref().unwrap_or("-"));
             ui.end_row();
 
             ui.label("llm.reasoning_effort");
