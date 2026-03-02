@@ -33,4 +33,8 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new(ChatRole::Assistant, content)
     }
+
+    pub fn content_chars(&self) -> usize {
+        self.content.chars().count()
+    }
 }

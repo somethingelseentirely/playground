@@ -370,6 +370,9 @@ struct CompactionProfileInfo {
     model: String,
     base_url: String,
     chars_per_token: u64,
+    context_window_tokens: u64,
+    max_output_tokens: u64,
+    context_safety_margin_tokens: u64,
     source: String,
 }
 
@@ -575,10 +578,28 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
             (sample_chars_sum as f64) / (sample_count as f64)
         };
 
-        let estimated_input_chars = (sim.merged_children_total as f64) * avg_leaf_chars;
-        let estimated_output_chars = (sim.merge_calls as f64) * avg_leaf_chars;
-        let input_tokens = (estimated_input_chars / profile.chars_per_token as f64).ceil();
-        let output_tokens = (estimated_output_chars / profile.chars_per_token as f64).ceil();
+        // Leaf creation now involves a fork model call per leaf. The fork context
+        // input is dominated by the memory cover (roughly body_budget_chars), plus
+        // the event content. We estimate the event/moment content as avg_leaf_chars.
+        let body_budget_chars = {
+            let reserved = profile
+                .max_output_tokens
+                .saturating_add(profile.context_safety_margin_tokens);
+            let input_tokens = profile.context_window_tokens.saturating_sub(reserved);
+            (input_tokens as f64) * (profile.chars_per_token.max(1) as f64)
+        };
+        // Leaf calls: each leaf sends ~body_budget worth of context and produces ~avg_leaf_chars output.
+        let leaf_input_chars = (new_leaves as f64) * body_budget_chars;
+        let leaf_output_chars = (new_leaves as f64) * avg_leaf_chars;
+        // Merge calls: each merge sends ~body_budget + children content.
+        let merge_input_chars = (sim.merge_calls as f64) * body_budget_chars
+            + (sim.merged_children_total as f64) * avg_leaf_chars;
+        let merge_output_chars = (sim.merge_calls as f64) * avg_leaf_chars;
+
+        let estimated_input_chars = leaf_input_chars + merge_input_chars;
+        let estimated_output_chars = leaf_output_chars + merge_output_chars;
+        let input_tokens = (estimated_input_chars / profile.chars_per_token.max(1) as f64).ceil();
+        let output_tokens = (estimated_output_chars / profile.chars_per_token.max(1) as f64).ceil();
 
         println!("memory estimate");
         println!("  model: {} ({})", profile.model, profile.source);
@@ -609,7 +630,9 @@ fn run_memory_estimate(config: Config, args: MemoryEstimateArgs) -> Result<()> {
             archive_coverage.strict_imported_pct()
         );
         println!("  leaves_to_add: {}", new_leaves);
+        println!("  estimated_leaf_calls: {}", new_leaves);
         println!("  estimated_merge_calls: {}", sim.merge_calls);
+        println!("  estimated_total_calls: {}", new_leaves + sim.merge_calls);
         println!("  estimated_input_tokens: {}", input_tokens as u64);
         println!("  estimated_output_tokens: {}", output_tokens as u64);
         println!("  sampled_leaf_summaries: {}", sample_count);
@@ -739,7 +762,13 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
             return Ok(());
         }
 
-        let semantic_compactor = SemanticCompactor::new(&config)?;
+        let fork_context = ForkContext::new(&config)?;
+        let fork_env = build_fork_env(&config);
+        let exec_cwd = config
+            .exec
+            .default_cwd
+            .as_deref()
+            .map(|p| p.to_str().unwrap_or("/workspace"));
         let mut change = TribleSet::new();
         let mut stats = CompactionRunStats::default();
         memory_status("backfilling archive memory chunks...");
@@ -753,7 +782,9 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
             None,
             args.max_archive_leaves,
             merge_arity,
-            &semantic_compactor,
+            &fork_context,
+            &fork_env,
+            exec_cwd,
             &mut stats,
             Some(500),
         )?;
@@ -773,7 +804,9 @@ fn run_memory_build(config: Config, args: MemoryBuildArgs) -> Result<()> {
                 results.as_slice(),
                 None,
                 merge_arity,
-                &semantic_compactor,
+                &fork_context,
+                &fork_env,
+                exec_cwd,
                 &mut stats,
                 Some(200),
             )?;
@@ -878,6 +911,9 @@ fn resolve_compaction_profile_info(config: &Config) -> CompactionProfileInfo {
     let mut model = config.model.model.clone();
     let mut base_url = config.model.base_url.clone();
     let mut chars_per_token = config.model.chars_per_token.max(1);
+    let mut context_window_tokens = config.model.context_window_tokens;
+    let mut max_output_tokens = config.model.max_output_tokens;
+    let mut context_safety_margin_tokens = config.model.context_safety_margin_tokens;
     let mut source = "active profile".to_string();
 
     if let Some(profile_id) = config.compaction_profile_id {
@@ -886,6 +922,9 @@ fn resolve_compaction_profile_info(config: &Config) -> CompactionProfileInfo {
                 model = profile.model;
                 base_url = profile.base_url;
                 chars_per_token = profile.chars_per_token.max(1);
+                context_window_tokens = profile.context_window_tokens;
+                max_output_tokens = profile.max_output_tokens;
+                context_safety_margin_tokens = profile.context_safety_margin_tokens;
                 source = format!("compaction profile {name}");
             }
             Ok(None) => {
@@ -905,6 +944,9 @@ fn resolve_compaction_profile_info(config: &Config) -> CompactionProfileInfo {
         model,
         base_url,
         chars_per_token,
+        context_window_tokens,
+        max_output_tokens,
+        context_safety_margin_tokens,
         source,
     }
 }
@@ -1551,14 +1593,14 @@ fn print_config(config: &Config, show_secrets: bool) {
             lens.max_output_tokens
         );
         println!(
-            "memory_lens.{}.prompt = \"{}\"",
+            "memory_lens.{}.instructions = \"{}\"",
             lens.name.replace(' ', "-"),
-            lens.prompt.replace('\"', "\\\"")
+            lens.instructions.replace('\"', "\\\"")
         );
         println!(
-            "memory_lens.{}.compaction_prompt = \"{}\"",
+            "memory_lens.{}.compaction_instructions = \"{}\"",
             lens.name.replace(' ', "-"),
-            lens.compaction_prompt.replace('\"', "\\\"")
+            lens.compaction_instructions.replace('\"', "\\\"")
         );
     }
 
@@ -2973,7 +3015,9 @@ fn ingest_archive_context_chunks(
     max_created_at_key: Option<i128>,
     max_new: Option<usize>,
     merge_arity: usize,
-    semantic_compactor: &SemanticCompactor,
+    fork: &ForkContext,
+    fork_env: &exec_worker::ExecCommandEnv,
+    exec_cwd: Option<&str>,
     stats: &mut CompactionRunStats,
     progress_every: Option<usize>,
 ) -> Result<usize> {
@@ -2991,7 +3035,7 @@ fn ingest_archive_context_chunks(
             skipped_newer_than_cutoff = skipped_newer_than_cutoff.saturating_add(1);
             continue;
         }
-        let missing_lenses: Vec<&MemoryLensConfig> = semantic_compactor
+        let missing_lenses: Vec<&MemoryLensConfig> = fork
             .lenses()
             .iter()
             .filter(|lens| {
@@ -3016,7 +3060,11 @@ fn ingest_archive_context_chunks(
             author_name.as_deref(),
             Some(source_author.as_str()),
         );
-        let leaf_summary = format_archive_output(
+        let event_command = format!(
+            "archive read {}",
+            &format!("{:x}", message.id)[..8]
+        );
+        let event_output = format_archive_output(
             message,
             author_name.as_deref(),
             source_author.as_str(),
@@ -3028,8 +3076,28 @@ fn ingest_archive_context_chunks(
                 .and_then(|person_id| relations.person_label.get(&person_id).map(|s| s.as_str())),
             resolved_person,
         );
+        let event_time_key = interval_key(message.created_at);
+        let primary_lens_id = fork
+            .primary_lens_id()
+            .context("no configured memory lenses")?;
         for lens in missing_lenses {
-            let leaf_summary_handle = ws.put(leaf_summary.clone());
+            let leaf_summary = match fork_summarize_leaf(
+                ws,
+                fork,
+                index,
+                lens,
+                primary_lens_id,
+                event_command.as_str(),
+                event_output.as_str(),
+                &[], // archive messages have no reason events
+                event_time_key,
+                fork_env,
+                exec_cwd,
+            )? {
+                Some(summary) => summary,
+                None => continue, // model decided nothing worth storing
+            };
+            let leaf_summary_handle = ws.put(leaf_summary);
             let now = epoch_interval(now_epoch());
             let chunk_id = ufoid();
 
@@ -3079,7 +3147,9 @@ fn ingest_archive_context_chunks(
                 chunk,
                 lens,
                 merge_arity,
-                semantic_compactor,
+                fork,
+                fork_env,
+                exec_cwd,
                 stats,
             )?;
             stats.archive_leaves_added = stats.archive_leaves_added.saturating_add(1);
@@ -3108,7 +3178,9 @@ fn ingest_exec_context_chunks(
     exec_results: &[CommandResultInfo],
     max_new: Option<usize>,
     merge_arity: usize,
-    semantic_compactor: &SemanticCompactor,
+    fork: &ForkContext,
+    fork_env: &exec_worker::ExecCommandEnv,
+    exec_cwd: Option<&str>,
     stats: &mut CompactionRunStats,
     progress_every: Option<usize>,
 ) -> Result<usize> {
@@ -3121,7 +3193,7 @@ fn ingest_exec_context_chunks(
         if max_new.is_some_and(|limit| added >= limit) {
             break;
         }
-        let missing_lenses: Vec<&MemoryLensConfig> = semantic_compactor
+        let missing_lenses: Vec<&MemoryLensConfig> = fork
             .lenses()
             .iter()
             .filter(|lens| {
@@ -3139,19 +3211,29 @@ fn ingest_exec_context_chunks(
             .context("command result missing finished_at")?;
         let turn_projection = load_exec_turn_projection(ws, core_index, result)?;
         let exec_output = load_exec_result(ws, result.clone())?;
-        let leaf_outputs = format_exec_outputs_by_lens(
-            result.id,
-            turn_projection.command.as_str(),
-            exec_output,
-            turn_projection.reason_events.as_slice(),
-            semantic_compactor,
-        )?;
-        let leaf_output_by_lens: HashMap<Id, String> = leaf_outputs.into_iter().collect();
+        let event_output = format_moment_output(&exec_output);
+        let event_time_key = interval_key(finished_at);
+        let primary_lens_id = fork
+            .primary_lens_id()
+            .context("no configured memory lenses")?;
         for lens in missing_lenses {
-            let Some(leaf_summary) = leaf_output_by_lens.get(&lens.id) else {
-                continue;
+            let leaf_summary = match fork_summarize_leaf(
+                ws,
+                fork,
+                index,
+                lens,
+                primary_lens_id,
+                turn_projection.command.as_str(),
+                event_output.as_str(),
+                turn_projection.reason_events.as_slice(),
+                event_time_key,
+                fork_env,
+                exec_cwd,
+            )? {
+                Some(summary) => summary,
+                None => continue, // model decided nothing worth storing
             };
-            let leaf_summary_handle = ws.put(leaf_summary.clone());
+            let leaf_summary_handle = ws.put(leaf_summary);
             let now = epoch_interval(now_epoch());
             let chunk_id = ufoid();
 
@@ -3192,7 +3274,9 @@ fn ingest_exec_context_chunks(
                 chunk,
                 lens,
                 merge_arity,
-                semantic_compactor,
+                fork,
+                fork_env,
+                exec_cwd,
                 stats,
             )?;
             stats.exec_leaves_added = stats.exec_leaves_added.saturating_add(1);
@@ -3247,7 +3331,13 @@ fn build_context_messages_with_compaction(
 ) -> Result<(Vec<ChatMessage>, TribleSet)> {
     let mut index = load_context_chunks(catalog);
     let body_budget_chars = context_body_budget_chars(config);
-    let semantic_compactor = SemanticCompactor::new(config)?;
+    let fork_context = ForkContext::new(config)?;
+    let fork_env = build_fork_env(config);
+    let exec_cwd = config
+        .exec
+        .default_cwd
+        .as_deref()
+        .map(|p| p.to_str().unwrap_or("/workspace"));
     let merge_arity = config.memory_compaction_arity as usize;
     let primary_lens_id = config
         .memory_lenses
@@ -3284,7 +3374,9 @@ fn build_context_messages_with_compaction(
             Some(current_finished_key),
             None,
             merge_arity,
-            &semantic_compactor,
+            &fork_context,
+            &fork_env,
+            exec_cwd,
             &mut compaction_stats,
             None,
         )?;
@@ -3297,7 +3389,9 @@ fn build_context_messages_with_compaction(
         results.as_slice(),
         None,
         merge_arity,
-        &semantic_compactor,
+        &fork_context,
+        &fork_env,
+        exec_cwd,
         &mut compaction_stats,
         None,
     )?;
@@ -3312,9 +3406,11 @@ fn build_context_messages_with_compaction(
         primary_lens_id,
         body_budget_chars,
         moment_boundary_end_key,
+        None,
     )?;
 
     // Insert breath boundary between memory and moment segments.
+    // Mirrors what happens when the model calls the `breath` faculty.
     if !messages.is_empty() {
         let fill_pct = if body_budget_chars > 0 {
             (used_chars * 100) / body_budget_chars
@@ -3325,7 +3421,7 @@ fn build_context_messages_with_compaction(
             "context filled to {fill_pct}%. present moment begins."
         );
         messages.insert(breath_idx, ChatMessage::user(breath_output));
-        messages.insert(breath_idx, ChatMessage::assistant("breath".to_string()));
+        messages.insert(breath_idx, ChatMessage::assistant(format!("breath {fill_pct}")));
     }
 
     // Project post-boundary exec results as raw shell interaction turns.
@@ -3414,6 +3510,7 @@ fn build_memory_cover_messages(
     lens_id: Id,
     budget_chars: usize,
     moment_boundary_end_key: Option<i128>,
+    exclude_ids: Option<&HashSet<Id>>,
 ) -> Result<(Vec<ChatMessage>, usize, usize)> {
     if budget_chars == 0 {
         return Ok((Vec::new(), 0, 0));
@@ -3433,6 +3530,8 @@ fn build_memory_cover_messages(
         })
         .filter(|id| seen_roots.insert(*id))
         .filter(|id| index.chunks.contains_key(id))
+        // Exclude specific chunks (e.g. children being merged in a fork context).
+        .filter(|id| exclude_ids.is_none_or(|set| !set.contains(id)))
         // Exclude post-boundary chunks: moment turns are projected as raw shell
         // interaction, not as memory cover entries.
         .filter(|id| {
@@ -4482,7 +4581,9 @@ fn insert_chunk_with_carry(
     carry: ContextChunk,
     lens: &MemoryLensConfig,
     merge_arity: usize,
-    semantic: &SemanticCompactor,
+    fork: &ForkContext,
+    fork_env: &exec_worker::ExecCommandEnv,
+    exec_cwd: Option<&str>,
     stats: &mut CompactionRunStats,
 ) -> Result<()> {
     let merge_arity = merge_arity.max(2);
@@ -4527,17 +4628,35 @@ fn insert_chunk_with_carry(
             children.push(child);
         }
         children.sort_by_key(|child| (interval_key(child.start_at), child.id));
-        let mut inputs = Vec::with_capacity(children.len());
-        for child in &children {
-            inputs.push(load_text(ws, child.summary).context("load child chunk summary")?);
-        }
-        let input_chars = inputs
+        let input_chars = children
             .iter()
-            .map(|text| text.chars().count())
+            .map(|child| {
+                load_text(ws, child.summary)
+                    .map(|text| text.chars().count())
+                    .unwrap_or(0)
+            })
             .fold(0usize, usize::saturating_add);
-        let merged_text = semantic
-            .merge(lens, inputs.as_slice())
-            .context("semantic merge context chunks")?;
+        let primary_lens_id = fork
+            .primary_lens_id()
+            .unwrap_or(lens.id);
+        let merged_text = match fork_summarize_merge(
+            ws,
+            fork,
+            index,
+            lens,
+            children.as_slice(),
+            primary_lens_id,
+            fork_env,
+            exec_cwd,
+        )
+        .context("fork merge context chunks")?
+        {
+            Some(text) => text,
+            None => {
+                // Model decided nothing worth merging; keep children as separate roots.
+                return Ok(());
+            }
+        };
         let output_chars = merged_text.chars().count();
         stats.merge_calls = stats.merge_calls.saturating_add(1);
         stats.merged_children_total = stats.merged_children_total.saturating_add(children.len());
@@ -4593,26 +4712,46 @@ fn insert_chunk_with_carry(
     }
 }
 
-struct SemanticCompactor {
+/// Build the ExecCommandEnv for fork loops. Faculties read config from the
+/// pile (via PILE and CONFIG_BRANCH_ID). Per-invocation env vars like
+/// FORK_EVENT_TIME_NS are NOT set, so `memory_create` runs in validate mode.
+fn build_fork_env(config: &config::Config) -> exec_worker::ExecCommandEnv {
+    exec_worker::ExecCommandEnv {
+        pile: config.pile_path.to_string_lossy().to_string(),
+        config_branch_id: "4790808CF044F979FC7C2E47FCCB4A64".to_string(),
+        worker_id: "fork".to_string(),
+        turn_id: format!("{:x}", *ufoid()),
+        extra: Vec::new(),
+    }
+}
+
+struct ForkContext {
     client: Client,
     endpoint_url: String,
     api_key: Option<String>,
     model: String,
     chars_per_token: u64,
+    context_window_tokens: u64,
+    max_output_tokens: u64,
+    context_safety_margin_tokens: u64,
+    system_prompt: String,
     memory_lenses: Vec<MemoryLensConfig>,
 }
 
-impl SemanticCompactor {
+impl ForkContext {
     fn new(config: &Config) -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(120))
             .build()
-            .context("build semantic compaction http client")?;
+            .context("build fork context http client")?;
 
         let mut model = config.model.model.clone();
         let mut base_url = config.model.base_url.clone();
         let mut api_key = config.model.api_key.clone();
         let mut chars_per_token = config.model.chars_per_token.max(1);
+        let mut context_window_tokens = config.model.context_window_tokens;
+        let mut max_output_tokens = config.model.max_output_tokens;
+        let mut context_safety_margin_tokens = config.model.context_safety_margin_tokens;
         if let Some(profile_id) = config.compaction_profile_id {
             match config::load_model_profile(config.pile_path.as_path(), profile_id) {
                 Ok(Some((profile, _name))) => {
@@ -4620,6 +4759,9 @@ impl SemanticCompactor {
                     base_url = profile.base_url;
                     api_key = profile.api_key;
                     chars_per_token = profile.chars_per_token.max(1);
+                    context_window_tokens = profile.context_window_tokens;
+                    max_output_tokens = profile.max_output_tokens;
+                    context_safety_margin_tokens = profile.context_safety_margin_tokens;
                 }
                 Ok(None) => eprintln!(
                     "warning: compaction profile {profile_id:x} not found; using active model profile"
@@ -4636,6 +4778,10 @@ impl SemanticCompactor {
             api_key,
             model,
             chars_per_token,
+            context_window_tokens,
+            max_output_tokens,
+            context_safety_margin_tokens,
+            system_prompt: config.system_prompt.clone(),
             memory_lenses: config.memory_lenses.clone(),
         })
     }
@@ -4644,32 +4790,42 @@ impl SemanticCompactor {
         self.memory_lenses.as_slice()
     }
 
-    fn merge(&self, lens: &MemoryLensConfig, chunks: &[String]) -> Result<String> {
-        if chunks.len() < 2 {
-            return Err(anyhow!("semantic merge needs at least 2 chunks"));
-        }
-        let input_chars = chunks
-            .iter()
-            .map(|chunk| chunk.chars().count())
-            .fold(0usize, usize::saturating_add)
-            .max(1);
-        let compression = chunks.len().max(2);
-        let target_chars = input_chars / compression;
-        let target_chars = target_chars.max(1);
-        let max_tokens = target_chars.div_ceil(self.chars_per_token as usize) as u64;
+    fn primary_lens_id(&self) -> Option<Id> {
+        self.memory_lenses.first().map(|lens| lens.id)
+    }
 
-        let mut user = String::new();
-        for (idx, chunk) in chunks.iter().enumerate() {
-            user.push_str(format!("CHUNK {}:\n{}\n\n", idx + 1, chunk).as_str());
-        }
-        user.push_str(
-            format!(
-                "Merge them into one summary and compress by ~1/{compression}. Keep critical details; drop repetition."
-            )
-            .as_str(),
-        );
-        let payload =
-            self.build_payload(lens.compaction_prompt.as_str(), user.as_str(), max_tokens);
+    /// Compute the body budget (in chars) for a fork context, given the system
+    /// prompt size. Mirrors `context_body_budget_chars()` but uses the
+    /// compaction model's parameters.
+    fn fork_body_budget_chars(&self, system_prompt_chars: usize) -> usize {
+        let reserved = self
+            .max_output_tokens
+            .saturating_add(self.context_safety_margin_tokens);
+        let input_tokens = self.context_window_tokens.saturating_sub(reserved);
+        let chars = (input_tokens as u128) * (self.chars_per_token.max(1) as u128);
+        let total = usize::try_from(chars).unwrap_or(usize::MAX);
+        total.saturating_sub(system_prompt_chars)
+    }
+
+    /// Send one turn to the model and return the response text.
+    /// Uses the shared system prompt. Body messages contain memory cover +
+    /// breath + moment + injected command + lens instructions.
+    fn send_turn(
+        &self,
+        body_messages: &[ChatMessage],
+        max_output_tokens: u64,
+    ) -> Result<String> {
+        let mut messages = Vec::with_capacity(body_messages.len() + 1);
+        messages.push(ChatMessage::system(self.system_prompt.clone()));
+        messages.extend_from_slice(body_messages);
+
+        let payload = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": false,
+            "temperature": 0,
+            "max_tokens": max_output_tokens.max(1),
+        });
 
         let mut last_err = None;
         for attempt in 1..=3usize {
@@ -4685,7 +4841,7 @@ impl SemanticCompactor {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow!("semantic compaction failed without error detail")))
+        Err(last_err.unwrap_or_else(|| anyhow!("fork context request failed without error detail")))
     }
 
     fn send_once(&self, payload: &serde_json::Value) -> Result<String> {
@@ -4701,7 +4857,7 @@ impl SemanticCompactor {
                 .text()
                 .unwrap_or_else(|_| "<failed to read error body>".to_string());
             return Err(anyhow!(
-                "semantic compaction request failed: HTTP {} for url ({}){}",
+                "fork context request failed: HTTP {} for url ({}){}",
                 status,
                 self.endpoint_url,
                 if body.trim().is_empty() {
@@ -4717,18 +4873,137 @@ impl SemanticCompactor {
         Ok(text.trim().to_string())
     }
 
-    fn build_payload(&self, system: &str, user: &str, max_output_tokens: u64) -> serde_json::Value {
-        serde_json::json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "stream": false,
-            "temperature": 0,
-            "max_tokens": max_output_tokens.max(1),
-        })
+    /// Run a multi-turn fork loop. The model runs real commands through a real
+    /// shell until it calls `exit` or reaches the turn limit.
+    ///
+    /// `initial_messages` must end with the injected `memory summarise <lens>`
+    /// assistant message. This method appends the lens instructions as a user
+    /// message, then loops: send_turn → parse command → execute_command →
+    /// format output → append messages.
+    ///
+    /// Returns `Ok(Some(summary_text))` if the model called `memory_create`,
+    /// or `Ok(None)` if it exited without creating.
+    fn run_fork_loop(
+        &self,
+        mut messages: Vec<ChatMessage>,
+        lens_instructions: &str,
+        fork_env: &exec_worker::ExecCommandEnv,
+        exec_cwd: Option<&str>,
+    ) -> Result<Option<String>> {
+        const MAX_TURNS: usize = 16;
+
+        // Lens instructions delivered as user message (shell response to
+        // `memory summarise <lens>`).
+        messages.push(ChatMessage::user(lens_instructions.to_string()));
+
+        let mut captured_summary: Option<String> = None;
+
+        for _turn in 0..MAX_TURNS {
+            let response = self.send_turn(&messages, self.max_output_tokens)?;
+            let command = response.trim().to_string();
+            messages.push(ChatMessage::assistant(command.clone()));
+
+            // The model calls `exit` to terminate the fork.
+            if command == "exit" || command.starts_with("exit ") {
+                break;
+            }
+
+            // Detect memory_create: capture summary from command arguments.
+            if let Some(summary) = parse_memory_create_summary(&command) {
+                captured_summary = Some(summary);
+            }
+
+            // Execute through the real shell.
+            let output = exec_worker::execute_command(
+                &command,
+                exec_cwd,
+                None,
+                fork_env,
+                Duration::from_secs(30),
+                &None,
+                || Ok(None),
+            );
+
+            let user_msg = format_fork_output(&output);
+            messages.push(ChatMessage::user(user_msg));
+        }
+
+        Ok(captured_summary)
     }
+}
+
+/// Parse the summary text from a `memory_create <lens> <summary...>` command.
+fn parse_memory_create_summary(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let rest = trimmed.strip_prefix("memory_create")?;
+    if rest.is_empty() {
+        return None;
+    }
+    // Must be followed by whitespace (not a different command like memory_create_foo).
+    let rest = rest.strip_prefix(char::is_whitespace)?;
+    // Skip the lens name (first word).
+    let rest = rest.trim_start();
+    let summary_start = rest.find(char::is_whitespace)?;
+    let summary = rest[summary_start..].trim();
+    if summary.is_empty() {
+        return None;
+    }
+    // Strip surrounding quotes if present.
+    let summary = if (summary.starts_with('"') && summary.ends_with('"'))
+        || (summary.starts_with('\'') && summary.ends_with('\''))
+    {
+        &summary[1..summary.len() - 1]
+    } else {
+        summary
+    };
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary.to_string())
+    }
+}
+
+/// Format an ExecOutput as a user message for fork context turns.
+fn format_fork_output(output: &exec_worker::ExecOutput) -> String {
+    let stdout = output
+        .stdout_text
+        .as_deref()
+        .unwrap_or_else(|| std::str::from_utf8(&output.stdout).unwrap_or(""));
+    let stderr = output
+        .stderr_text
+        .as_deref()
+        .unwrap_or_else(|| std::str::from_utf8(&output.stderr).unwrap_or(""));
+
+    let mut text = String::new();
+    if !stdout.is_empty() {
+        text.push_str(stdout);
+        if !stdout.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    if !stderr.is_empty() {
+        text.push_str("stderr:\n");
+        text.push_str(stderr);
+        if !stderr.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    if let Some(error) = &output.error {
+        if !error.is_empty() {
+            text.push_str("error: ");
+            text.push_str(error);
+            if !error.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+    }
+    if output.exit_code.is_some_and(|code| code != 0) {
+        text.push_str(&format!("exit: {}\n", output.exit_code.unwrap()));
+    }
+    if text.is_empty() {
+        text.push_str("[ok]\n");
+    }
+    text
 }
 
 fn chat_completions_url(api_base_url: &str) -> String {
@@ -4774,6 +5049,151 @@ fn extract_output_text(json: &serde_json::Value) -> String {
     }
 
     String::new()
+}
+
+/// Create a level-0 memory chunk by running a fork agent loop with the full
+/// memory | breath | moment structure. The model runs real commands through
+/// a real shell, and when it calls `memory_create`, the summary text is
+/// captured. Returns `Ok(Some(summary))` if a chunk was created, `Ok(None)`
+/// if the model shut down without creating.
+fn fork_summarize_leaf(
+    ws: &mut Workspace<Pile>,
+    fork: &ForkContext,
+    index: &ContextChunkIndex,
+    lens: &MemoryLensConfig,
+    primary_lens_id: Id,
+    event_command: &str,
+    event_output: &str,
+    reason_events: &[ReasonProjectionEvent],
+    event_time_key: i128,
+    fork_env: &exec_worker::ExecCommandEnv,
+    exec_cwd: Option<&str>,
+) -> Result<Option<String>> {
+    let system_prompt_chars = fork.system_prompt.chars().count();
+
+    // Build moment content so we can calculate its size and subtract from budget.
+    let mut moment_messages = Vec::new();
+    for event in reason_events {
+        if should_project_reason_event(event) {
+            moment_messages.push(ChatMessage::assistant(synthetic_reason_command(&event.text)));
+            moment_messages.push(ChatMessage::user(synthetic_reason_output(event)));
+        }
+    }
+    moment_messages.push(ChatMessage::assistant(event_command.to_string()));
+    moment_messages.push(ChatMessage::user(event_output.to_string()));
+    // Injected command: the model "decides" to summarize.
+    moment_messages.push(ChatMessage::assistant(format!("memory summarise {}", lens.name)));
+
+    let moment_chars: usize = moment_messages
+        .iter()
+        .map(|m| m.content_chars())
+        .fold(0, usize::saturating_add);
+    // Lens instructions will be appended by run_fork_loop, but count them for budget.
+    let instructions_chars = lens.instructions.chars().count();
+    // Breath messages (fixed cost).
+    let breath_chars = "breath 100".len() + "context filled to 100%. present moment begins.".len();
+
+    let body_budget = fork.fork_body_budget_chars(system_prompt_chars);
+    let cover_budget = body_budget
+        .saturating_sub(moment_chars)
+        .saturating_sub(instructions_chars)
+        .saturating_sub(breath_chars);
+
+    let (mut messages, used_chars, breath_idx) = build_memory_cover_messages(
+        ws,
+        index,
+        primary_lens_id,
+        cover_budget,
+        Some(event_time_key),
+        None,
+    )?;
+
+    // Insert breath boundary (mirrors the `breath` faculty).
+    if !messages.is_empty() {
+        let total_used = used_chars + moment_chars + instructions_chars + breath_chars;
+        let fill_pct = if body_budget > 0 {
+            (total_used * 100) / body_budget
+        } else {
+            0
+        };
+        let breath_output = format!("context filled to {fill_pct}%. present moment begins.");
+        messages.insert(breath_idx, ChatMessage::user(breath_output));
+        messages.insert(breath_idx, ChatMessage::assistant(format!("breath {fill_pct}")));
+    }
+
+    // Append moment.
+    messages.extend(moment_messages);
+
+    fork.run_fork_loop(messages, &lens.instructions, fork_env, exec_cwd)
+}
+
+/// Merge level-N memory chunks by running a fork agent loop with the full
+/// memory | breath | moment structure, where the moment contains the children
+/// being merged. Returns `Ok(Some(summary))` if a merged chunk was created.
+fn fork_summarize_merge(
+    ws: &mut Workspace<Pile>,
+    fork: &ForkContext,
+    index: &ContextChunkIndex,
+    lens: &MemoryLensConfig,
+    children: &[ContextChunk],
+    primary_lens_id: Id,
+    fork_env: &exec_worker::ExecCommandEnv,
+    exec_cwd: Option<&str>,
+) -> Result<Option<String>> {
+    let system_prompt_chars = fork.system_prompt.chars().count();
+
+    // Build moment content: children rendered as memory turns.
+    let mut moment_messages = Vec::new();
+    let mut turn_cache: HashMap<Id, MemoryCoverTurn> = HashMap::new();
+    for child in children {
+        let turn = memory_cover_turn(ws, index, &mut turn_cache, child.id)?;
+        moment_messages.push(ChatMessage::assistant(turn.command));
+        moment_messages.push(ChatMessage::user(turn.output));
+    }
+    // Injected command.
+    moment_messages.push(ChatMessage::assistant(format!("memory summarise {}", lens.name)));
+
+    let moment_chars: usize = moment_messages
+        .iter()
+        .map(|m| m.content_chars())
+        .fold(0, usize::saturating_add);
+    let instructions_chars = lens.compaction_instructions.chars().count();
+    let breath_chars = "breath 100".len() + "context filled to 100%. present moment begins.".len();
+
+    let body_budget = fork.fork_body_budget_chars(system_prompt_chars);
+    let cover_budget = body_budget
+        .saturating_sub(moment_chars)
+        .saturating_sub(instructions_chars)
+        .saturating_sub(breath_chars);
+
+    // Exclude children from cover so they only appear in the moment.
+    let child_ids: HashSet<Id> = children.iter().map(|c| c.id).collect();
+    let (mut messages, used_chars, breath_idx) = build_memory_cover_messages(
+        ws,
+        index,
+        primary_lens_id,
+        cover_budget,
+        None,
+        Some(&child_ids),
+    )?;
+
+    // Insert breath boundary (mirrors the `breath` faculty).
+    if !messages.is_empty() {
+        let total_used = used_chars + moment_chars + instructions_chars + breath_chars;
+        let fill_pct = if body_budget > 0 {
+            (total_used * 100) / body_budget
+        } else {
+            0
+        };
+        let breath_output = format!("context filled to {fill_pct}%. present moment begins.");
+        messages.insert(breath_idx, ChatMessage::user(breath_output));
+        messages.insert(breath_idx, ChatMessage::assistant(format!("breath {fill_pct}")));
+    }
+
+    // Append moment (children + injected command).
+    messages.extend(moment_messages);
+
+    fork.run_fork_loop(messages, &lens.compaction_instructions, fork_env, exec_cwd)
 }
 
 #[derive(Debug, Clone)]
@@ -4916,55 +5336,6 @@ fn synthetic_reason_output(event: &ReasonProjectionEvent) -> String {
     format!("reason_id: {:x}\nsource: {source}", event.id)
 }
 
-fn format_exec_outputs_by_lens(
-    turn_id: Id,
-    command: &str,
-    result: ExecResult,
-    reason_events: &[ReasonProjectionEvent],
-    semantic_compactor: &SemanticCompactor,
-) -> Result<Vec<(Id, String)>> {
-    let ExecResult {
-        stdout_text,
-        stderr_text,
-        stdout,
-        stderr,
-        exit_code,
-        error,
-    } = result;
-    let stdout = format_output_text(stdout_text.as_deref(), stdout.as_ref());
-    let stderr = format_output_text(stderr_text.as_deref(), stderr.as_ref());
-    let error = error.unwrap_or_default();
-    let exit_code_value = exit_code
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "none".to_string());
-    let status = if exit_code.is_some_and(|code| code != 0) || !error.trim().is_empty() {
-        "error"
-    } else {
-        "ok"
-    };
-
-    let mut text = String::new();
-    append_section(&mut text, "turn_id", format!("{turn_id:x}").as_str());
-    for event in reason_events {
-        if !should_project_reason_event(event) {
-            continue;
-        }
-        append_section(&mut text, "assistant", synthetic_reason_command(event.text.as_str()).as_str());
-        append_section(&mut text, "user", synthetic_reason_output(event).as_str());
-    }
-    append_section(&mut text, "command", command);
-    append_section(&mut text, "stdout", stdout.as_str());
-    append_section(&mut text, "stderr", stderr.as_str());
-    append_section(&mut text, "error", error.as_str());
-    append_section(&mut text, "status", status);
-    text.push_str(&format!("exit_code: {exit_code_value}\n"));
-    Ok(semantic_compactor
-        .lenses()
-        .iter()
-        .map(|lens| (lens.id, text.clone()))
-        .collect())
-}
-
 fn append_section(text: &mut String, label: &str, body: &str) {
     text.push_str(label);
     text.push_str(":\n");
@@ -4986,9 +5357,8 @@ fn format_output_text(text: Option<&str>, bytes: Option<&Bytes>) -> String {
 }
 
 /// Formats an exec result as concise shell output for moment turns.
-/// Unlike `format_exec_outputs_by_lens`, this produces raw output without
-/// section headers or lens duplication — just what the model would see from
-/// an actual shell command.
+/// Produces raw output without section headers — just what the model would
+/// see from an actual shell command.
 fn format_moment_output(result: &ExecResult) -> String {
     let stdout = format_output_text(result.stdout_text.as_deref(), result.stdout.as_ref());
     let stderr = format_output_text(result.stderr_text.as_deref(), result.stderr.as_ref());

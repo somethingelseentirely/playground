@@ -52,21 +52,23 @@ struct CommandRequestIndex {
 }
 
 #[derive(Debug)]
-struct ExecOutput {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    exit_code: Option<i32>,
-    stdout_text: Option<String>,
-    stderr_text: Option<String>,
-    error: Option<String>,
+pub(crate) struct ExecOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stdout_text: Option<String>,
+    pub(crate) stderr_text: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct ExecCommandEnv {
-    pile: String,
-    config_branch_id: String,
-    worker_id: String,
-    turn_id: String,
+pub(crate) struct ExecCommandEnv {
+    pub(crate) pile: String,
+    pub(crate) config_branch_id: String,
+    pub(crate) worker_id: String,
+    pub(crate) turn_id: String,
+    /// Additional env vars (e.g. FORK_LENS_ID, FORK_EVENT_TIME).
+    pub(crate) extra: Vec<(String, String)>,
 }
 
 pub(crate) fn run_exec_loop(
@@ -126,6 +128,7 @@ pub(crate) fn run_exec_loop(
                 config_branch_id: CONFIG_BRANCH_ID_HEX.to_string(),
                 worker_id: format!("{worker_id:x}"),
                 turn_id: format!("{request_id:x}", request_id = request.id),
+                extra: Vec::new(),
             };
 
             let started_at = epoch_interval(now_epoch());
@@ -246,7 +249,7 @@ fn stop_requested(stop: &Option<Arc<AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
-fn execute_command(
+pub(crate) fn execute_command(
     command: &str,
     cwd: Option<&str>,
     stdin: Option<Bytes>,
@@ -271,6 +274,9 @@ fn execute_command(
     cmd.env("CONFIG_BRANCH_ID", &env.config_branch_id);
     cmd.env("WORKER_ID", &env.worker_id);
     cmd.env("TURN_ID", &env.turn_id);
+    for (key, value) in &env.extra {
+        cmd.env(key, value);
+    }
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }

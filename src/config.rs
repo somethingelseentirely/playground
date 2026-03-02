@@ -27,16 +27,16 @@ const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
 const DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS: u64 = 512;
 const DEFAULT_PROMPT_CHARS_PER_TOKEN: u64 = 4;
 const DEFAULT_MEMORY_COMPACTION_ARITY: u64 = 8;
-const DEFAULT_MEMORY_LENS_FACTUAL_PROMPT: &str = include_str!("../prompts/memory_lens_factual.md");
-const DEFAULT_MEMORY_LENS_TECHNICAL_PROMPT: &str =
+const DEFAULT_MEMORY_LENS_FACTUAL_INSTRUCTIONS: &str = include_str!("../prompts/memory_lens_factual.md");
+const DEFAULT_MEMORY_LENS_TECHNICAL_INSTRUCTIONS: &str =
     include_str!("../prompts/memory_lens_technical.md");
-const DEFAULT_MEMORY_LENS_EMOTIONAL_PROMPT: &str =
+const DEFAULT_MEMORY_LENS_EMOTIONAL_INSTRUCTIONS: &str =
     include_str!("../prompts/memory_lens_emotional.md");
-const DEFAULT_MEMORY_LENS_FACTUAL_COMPACTION_PROMPT: &str =
+const DEFAULT_MEMORY_LENS_FACTUAL_COMPACTION_INSTRUCTIONS: &str =
     include_str!("../prompts/memory_lens_factual_compaction.md");
-const DEFAULT_MEMORY_LENS_TECHNICAL_COMPACTION_PROMPT: &str =
+const DEFAULT_MEMORY_LENS_TECHNICAL_COMPACTION_INSTRUCTIONS: &str =
     include_str!("../prompts/memory_lens_technical_compaction.md");
-const DEFAULT_MEMORY_LENS_EMOTIONAL_COMPACTION_PROMPT: &str =
+const DEFAULT_MEMORY_LENS_EMOTIONAL_COMPACTION_INSTRUCTIONS: &str =
     include_str!("../prompts/memory_lens_emotional_compaction.md");
 const DEFAULT_MEMORY_LENS_FACTUAL_MAX_OUTPUT_TOKENS: u64 = 192;
 const DEFAULT_MEMORY_LENS_TECHNICAL_MAX_OUTPUT_TOKENS: u64 = 224;
@@ -150,8 +150,8 @@ pub struct ExecConfig {
 pub struct MemoryLensConfig {
     pub id: Id,
     pub name: String,
-    pub prompt: String,
-    pub compaction_prompt: String,
+    pub instructions: String,
+    pub compaction_instructions: String,
     pub max_output_tokens: u64,
 }
 
@@ -403,15 +403,15 @@ fn has_memory_lens_entries(catalog: &TribleSet) -> bool {
     find!(
         (
             entity_id: Id,
-            prompt: Value<Handle<Blake3, LongString>>,
-            compaction_prompt: Value<Handle<Blake3, LongString>>,
+            instructions: Value<Handle<Blake3, LongString>>,
+            compaction_instructions: Value<Handle<Blake3, LongString>>,
             max_output_tokens: Value<U256BE>
         ),
         pattern!(catalog, [{
             ?entity_id @
             playground_config::kind: playground_config::kind_memory_lens,
-            playground_config::memory_lens_prompt: ?prompt,
-            playground_config::memory_lens_compaction_prompt: ?compaction_prompt,
+            playground_config::memory_lens_instructions: ?instructions,
+            playground_config::memory_lens_compaction_instructions: ?compaction_instructions,
             playground_config::memory_lens_max_output_tokens: ?max_output_tokens,
         }])
     )
@@ -776,16 +776,16 @@ fn load_memory_lenses_for_snapshot(
         }
         let name = load_string_attr(ws, catalog, entry_id, metadata::name)?
             .unwrap_or_else(|| format!("lens-{lens_id:x}"));
-        let prompt =
-            load_string_attr(ws, catalog, entry_id, playground_config::memory_lens_prompt)?
-                .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing prompt"))?;
-        let compaction_prompt = load_string_attr(
+        let instructions =
+            load_string_attr(ws, catalog, entry_id, playground_config::memory_lens_instructions)?
+                .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing instructions"))?;
+        let compaction_instructions = load_string_attr(
             ws,
             catalog,
             entry_id,
-            playground_config::memory_lens_compaction_prompt,
+            playground_config::memory_lens_compaction_instructions,
         )?
-        .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing compaction_prompt"))?;
+        .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing compaction_instructions"))?;
         let max_output_tokens = load_u256_attr(
             catalog,
             entry_id,
@@ -796,8 +796,8 @@ fn load_memory_lenses_for_snapshot(
         let lens = MemoryLensConfig {
             id: lens_id,
             name: name.clone(),
-            prompt,
-            compaction_prompt,
+            instructions,
+            compaction_instructions,
             max_output_tokens,
         };
         let key = name.to_lowercase();
@@ -936,16 +936,16 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     for lens in &memory_lenses {
         let lens_entry_id = ufoid();
         let lens_name = ws.put(lens.name.clone());
-        let lens_prompt = ws.put(lens.prompt.clone());
-        let lens_compaction_prompt = ws.put(lens.compaction_prompt.clone());
+        let lens_instructions = ws.put(lens.instructions.clone());
+        let lens_compaction_instructions = ws.put(lens.compaction_instructions.clone());
         let lens_max_output_tokens: Value<U256BE> = lens.max_output_tokens.to_value();
         change += entity! { &lens_entry_id @
             playground_config::kind: playground_config::kind_memory_lens,
             playground_config::updated_at: now,
             playground_config::memory_lens_id: lens.id,
             metadata::name: lens_name,
-            playground_config::memory_lens_prompt: lens_prompt,
-            playground_config::memory_lens_compaction_prompt: lens_compaction_prompt,
+            playground_config::memory_lens_instructions: lens_instructions,
+            playground_config::memory_lens_compaction_instructions: lens_compaction_instructions,
             playground_config::memory_lens_max_output_tokens: lens_max_output_tokens,
         };
     }
@@ -1068,22 +1068,22 @@ fn default_memory_lenses() -> Vec<MemoryLensConfig> {
         MemoryLensConfig {
             id: MEMORY_LENS_ID_FACTUAL,
             name: "factual".to_string(),
-            prompt: DEFAULT_MEMORY_LENS_FACTUAL_PROMPT.to_string(),
-            compaction_prompt: DEFAULT_MEMORY_LENS_FACTUAL_COMPACTION_PROMPT.to_string(),
+            instructions: DEFAULT_MEMORY_LENS_FACTUAL_INSTRUCTIONS.to_string(),
+            compaction_instructions: DEFAULT_MEMORY_LENS_FACTUAL_COMPACTION_INSTRUCTIONS.to_string(),
             max_output_tokens: DEFAULT_MEMORY_LENS_FACTUAL_MAX_OUTPUT_TOKENS,
         },
         MemoryLensConfig {
             id: MEMORY_LENS_ID_TECHNICAL,
             name: "technical".to_string(),
-            prompt: DEFAULT_MEMORY_LENS_TECHNICAL_PROMPT.to_string(),
-            compaction_prompt: DEFAULT_MEMORY_LENS_TECHNICAL_COMPACTION_PROMPT.to_string(),
+            instructions: DEFAULT_MEMORY_LENS_TECHNICAL_INSTRUCTIONS.to_string(),
+            compaction_instructions: DEFAULT_MEMORY_LENS_TECHNICAL_COMPACTION_INSTRUCTIONS.to_string(),
             max_output_tokens: DEFAULT_MEMORY_LENS_TECHNICAL_MAX_OUTPUT_TOKENS,
         },
         MemoryLensConfig {
             id: MEMORY_LENS_ID_EMOTIONAL,
             name: "emotional".to_string(),
-            prompt: DEFAULT_MEMORY_LENS_EMOTIONAL_PROMPT.to_string(),
-            compaction_prompt: DEFAULT_MEMORY_LENS_EMOTIONAL_COMPACTION_PROMPT.to_string(),
+            instructions: DEFAULT_MEMORY_LENS_EMOTIONAL_INSTRUCTIONS.to_string(),
+            compaction_instructions: DEFAULT_MEMORY_LENS_EMOTIONAL_COMPACTION_INSTRUCTIONS.to_string(),
             max_output_tokens: DEFAULT_MEMORY_LENS_EMOTIONAL_MAX_OUTPUT_TOKENS,
         },
     ]
