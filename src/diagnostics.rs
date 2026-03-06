@@ -376,7 +376,6 @@ struct TurnMemoryRow {
 #[derive(Debug, Clone)]
 struct ContextChunkRow {
     id: Id,
-    level: u64,
     summary: Value<Handle<Blake3, LongString>>,
     start_at: Option<i128>,
     end_at: Option<i128>,
@@ -549,13 +548,6 @@ struct AgentConfigRow {
     model_context_safety_margin_tokens: Option<u64>,
     model_chars_per_token: Option<u64>,
     model_api_key: Option<String>,
-    compaction_profile_id: Option<Id>,
-    compaction_profile_name: Option<String>,
-    compaction_model: Option<String>,
-    compaction_base_url: Option<String>,
-    compaction_chars_per_token: Option<u64>,
-    compaction_api_key: Option<String>,
-    memory_compaction_arity: Option<u64>,
     tavily_api_key: Option<String>,
     exa_api_key: Option<String>,
     exec_default_cwd: Option<String>,
@@ -1878,49 +1870,6 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
     );
     let model_api_key =
         load_optional_string_attr(data, ws, model_entity_id, playground_config::model_api_key);
-    let compaction_profile_id = load_optional_id_attr(
-        data,
-        config_id,
-        playground_config::active_compaction_profile_id,
-    );
-    let (compaction_entity_id, compaction_profile_name) =
-        if let Some(profile_id) = compaction_profile_id {
-            if let Some(entry_id) = latest_model_profile_entry_id(data, profile_id) {
-                (
-                    entry_id,
-                    load_optional_string_attr(data, ws, entry_id, metadata::name),
-                )
-            } else {
-                (model_entity_id, None)
-            }
-        } else {
-            (model_entity_id, model_profile_name.clone())
-        };
-    let compaction_model = load_optional_string_attr(
-        data,
-        ws,
-        compaction_entity_id,
-        playground_config::model_name,
-    );
-    let compaction_base_url = load_optional_string_attr(
-        data,
-        ws,
-        compaction_entity_id,
-        playground_config::model_base_url,
-    );
-    let compaction_chars_per_token = load_optional_u64_attr(
-        data,
-        compaction_entity_id,
-        playground_config::model_chars_per_token,
-    );
-    let compaction_api_key = load_optional_string_attr(
-        data,
-        ws,
-        compaction_entity_id,
-        playground_config::model_api_key,
-    );
-    let memory_compaction_arity =
-        load_optional_u64_attr(data, config_id, playground_config::memory_compaction_arity);
     let tavily_api_key =
         load_optional_string_attr(data, ws, config_id, playground_config::tavily_api_key);
     let exa_api_key =
@@ -1962,13 +1911,6 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         model_context_safety_margin_tokens,
         model_chars_per_token,
         model_api_key,
-        compaction_profile_id,
-        compaction_profile_name,
-        compaction_model,
-        compaction_base_url,
-        compaction_chars_per_token,
-        compaction_api_key,
-        memory_compaction_arity,
         tavily_api_key,
         exa_api_key,
         exec_default_cwd,
@@ -3390,10 +3332,9 @@ fn collect_reason_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Reason
 fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
     let mut rows: HashMap<Id, ContextChunkRow> = HashMap::new();
 
-    for (chunk_id, level, summary, start_at, end_at) in find!(
+    for (chunk_id, summary, start_at, end_at) in find!(
         (
             chunk_id: Id,
-            level: Value<U256BE>,
             summary: Value<Handle<Blake3, LongString>>,
             start_at: Value<NsTAIInterval>,
             end_at: Value<NsTAIInterval>
@@ -3401,7 +3342,6 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
         pattern!(data, [{
             ?chunk_id @
             playground_context::kind: playground_context::kind_chunk,
-            playground_context::level: ?level,
             playground_context::summary: ?summary,
             playground_context::start_at: ?start_at,
             playground_context::end_at: ?end_at,
@@ -3411,7 +3351,6 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
             chunk_id,
             ContextChunkRow {
                 id: chunk_id,
-                level: u256be_to_u64(level).unwrap_or_default(),
                 summary,
                 start_at: Some(interval_key(start_at)),
                 end_at: Some(interval_key(end_at)),
@@ -3488,7 +3427,7 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
         });
         row.children.dedup();
     }
-    list.sort_by_key(|row| (row.level, row.start_at.unwrap_or(i128::MIN)));
+    list.sort_by_key(|row| row.start_at.unwrap_or(i128::MIN));
     list
 }
 
@@ -4882,73 +4821,6 @@ fn render_agent_config(
             });
             ui.end_row();
 
-            ui.label("model.compaction.profile");
-            ui.horizontal(|ui| {
-                let label = if config.compaction_profile_id.is_none() {
-                    "inherits model.profile".to_string()
-                } else {
-                    config
-                        .compaction_profile_name
-                        .as_deref()
-                        .unwrap_or("-")
-                        .to_string()
-                };
-                ui.label(label);
-                if let Some(id) = config.compaction_profile_id {
-                    ui.monospace(format!("({id:x})"));
-                }
-            });
-            ui.end_row();
-
-            ui.label("model.compaction.model");
-            ui.label(config.compaction_model.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("model.compaction.base_url");
-            ui.label(config.compaction_base_url.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("model.compaction.chars_per_token");
-            ui.monospace(
-                config
-                    .compaction_chars_per_token
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("memory.compaction.arity");
-            ui.monospace(
-                config
-                    .memory_compaction_arity
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("model.compaction.api_key");
-            ui.horizontal(|ui| {
-                let Some(key) = config.compaction_api_key.as_deref() else {
-                    ui.label("-");
-                    return;
-                };
-                if state.config_reveal_secrets {
-                    ui.monospace(key);
-                } else {
-                    ui.monospace(mask_secret(key));
-                }
-                let button = if state.config_reveal_secrets {
-                    "Hide"
-                } else {
-                    "Reveal"
-                };
-                if ui.add(Button::new(button)).clicked() {
-                    state.config_reveal_secrets = !state.config_reveal_secrets;
-                    ui.ctx().request_repaint();
-                }
-            });
-            ui.end_row();
-
             ui.label("integrations.tavily_api_key");
             ui.horizontal(|ui| {
                 let Some(key) = config.tavily_api_key.as_deref() else {
@@ -5198,7 +5070,7 @@ fn render_context_compaction(
         .iter()
         .filter(|row| !children.contains(&row.id))
         .collect();
-    roots.sort_by_key(|row| (row.level, row.start_at.unwrap_or(i128::MIN)));
+    roots.sort_by_key(|row| row.start_at.unwrap_or(i128::MIN));
 
     let mut leaf_counts: HashMap<Id, usize> = HashMap::new();
 
@@ -5206,7 +5078,7 @@ fn render_context_compaction(
         ui.label("Frontier:");
         for root in &roots {
             let count = context_leaf_count(root.id, &by_id, &mut leaf_counts);
-            let label = format!("L{} {} ({})", root.level, id_prefix(root.id), count);
+            let label = format!("{} ({})", id_prefix(root.id), count);
             if ui.add(Button::new(label)).clicked() {
                 state.context_selection_stack.clear();
                 state.context_selected_chunk = Some(root.id);
@@ -5281,9 +5153,8 @@ fn render_context_chunk_node(
     let end = format_age(now_key, node.end_at);
 
     let mut label = format!(
-        "{}L{} {}  {start}..{end}  leaves:{count}",
+        "{}{} {start}..{end} leaves:{count}",
         if selected { "*" } else { " " },
-        node.level,
         id_prefix(node.id),
     );
     if let Some(exec_id) = node.about_exec_result {
@@ -5334,8 +5205,7 @@ fn render_context_selected_details(
     let start = format_age(now_key, node.start_at);
     let end = format_age(now_key, node.end_at);
     ui.monospace(format!(
-        "selected: L{} {}  {start}..{end}  leaves:{count}",
-        node.level,
+        "selected: {} {start}..{end} leaves:{count}",
         id_prefix(node.id)
     ));
 
@@ -5427,9 +5297,8 @@ fn render_context_selected_details(
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.monospace(format!(
-                            "child[{}]: L{} {}  {child_start}..{child_end}  leaves:{child_count}",
+                            "child[{}]: {} {child_start}..{child_end} leaves:{child_count}",
                             child.index,
-                            child_node.level,
                             id_prefix(child.chunk_id),
                         ));
                         if ui.add(Button::new("Focus")).clicked() {

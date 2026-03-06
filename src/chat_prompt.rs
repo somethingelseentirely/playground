@@ -34,7 +34,4 @@ impl ChatMessage {
         Self::new(ChatRole::Assistant, content)
     }
 
-    pub fn content_chars(&self) -> usize {
-        self.content.chars().count()
-    }
 }

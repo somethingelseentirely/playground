@@ -26,7 +26,6 @@ pub mod playground_config {
         "98A194178CFD7CBB915C1BC9EB561A7F" as pub author_role: Handle<Blake3, LongString>;
         "D1DC11B303725409AB8A30C6B59DB2D7" as pub persona_id: GenId;
         "79E1B50756FB64A30916E9353225E179" as pub active_model_profile_id: GenId;
-        "B919F28377B1241E4275808DBB1D423D" as pub active_compaction_profile_id: GenId;
         "698519DFB681FABC3F06160ACAC9DA8E" as pub poll_ms: U256BE;
         "6691CF3F872C6107DCFAD0BCF7CDC1A0" as pub model_profile_id: GenId;
         "85BE7BDA465B3CB0F800F76EEF8FAC9B" as pub model_name: Handle<Blake3, LongString>;
@@ -41,11 +40,6 @@ pub mod playground_config {
         "4200F6746B36F2784DEBA1555595D6AC" as pub model_max_output_tokens: U256BE;
         "1FF004BB48F7A4F8F72541F4D4FA75FF" as pub model_context_safety_margin_tokens: U256BE;
         "095FAECDB8FF205DF591DF594E593B01" as pub model_chars_per_token: U256BE;
-        "167BABF8DFCD69AB4DB69773AAB18C4B" as pub memory_compaction_arity: U256BE;
-        "24CF9D532E03C44CF719546DDE7E0493" as pub memory_lens_id: GenId;
-        "1F0A596CD677F732CD5C506F74C61F6B" as pub memory_lens_instructions: Handle<Blake3, LongString>;
-        "1067F34FE4517B058A74BC2118868DA4" as pub memory_lens_compaction_instructions: Handle<Blake3, LongString>;
-        "84F32838DC66B0FB6F774150854521F8" as pub memory_lens_max_output_tokens: U256BE;
         "120F9C6BBB103FAFFB31A66E2ABC15E6" as pub exec_default_cwd: Handle<Blake3, LongString>;
         "D18A351B6E03A460E4F400D97D285F96" as pub exec_sandbox_profile: GenId;
     }
@@ -61,10 +55,6 @@ pub mod playground_config {
     /// Tag for model profile entries (versioned by `updated_at`).
     #[allow(non_upper_case_globals)]
     pub const kind_model_profile: Id = id_hex!("B08E356C4B08F44AB7EC177D47129447");
-    /// Tag for memory lens entries (versioned by `updated_at`).
-    #[allow(non_upper_case_globals)]
-    pub const kind_memory_lens: Id = id_hex!("D982F64C48F263A312D6E342D09554B0");
-
     /// Tag for playground_config protocol metadata.
     #[allow(non_upper_case_globals)]
     pub const tag_protocol: Id = id_hex!("B66C73996CEC00801602A6EF02E31204");
@@ -141,14 +131,6 @@ where
         metadata::tag: playground_config::tag_kind,
     };
 
-    tribles += entity! { ExclusiveId::force_ref(&playground_config::kind_memory_lens) @
-        metadata::name: blobs.put("kind_memory_lens".to_string())?,
-        metadata::description: blobs.put(
-            "Memory lens entry entity kind.".to_string(),
-        )?,
-        metadata::tag: playground_config::tag_kind,
-    };
-
     Ok(tribles)
 }
 
@@ -183,7 +165,6 @@ where
     metadata += describe_attribute(blobs, &playground_config::author_role)?;
     metadata += describe_attribute(blobs, &playground_config::persona_id)?;
     metadata += describe_attribute(blobs, &playground_config::active_model_profile_id)?;
-    metadata += describe_attribute(blobs, &playground_config::active_compaction_profile_id)?;
     metadata += describe_attribute(blobs, &playground_config::poll_ms)?;
     metadata += describe_attribute(blobs, &playground_config::model_profile_id)?;
     metadata += describe_attribute(blobs, &playground_config::model_name)?;
@@ -198,11 +179,6 @@ where
     metadata += describe_attribute(blobs, &playground_config::model_max_output_tokens)?;
     metadata += describe_attribute(blobs, &playground_config::model_context_safety_margin_tokens)?;
     metadata += describe_attribute(blobs, &playground_config::model_chars_per_token)?;
-    metadata += describe_attribute(blobs, &playground_config::memory_compaction_arity)?;
-    metadata += describe_attribute(blobs, &playground_config::memory_lens_id)?;
-    metadata += describe_attribute(blobs, &playground_config::memory_lens_instructions)?;
-    metadata += describe_attribute(blobs, &playground_config::memory_lens_compaction_instructions)?;
-    metadata += describe_attribute(blobs, &playground_config::memory_lens_max_output_tokens)?;
     metadata += describe_attribute(blobs, &playground_config::exec_default_cwd)?;
     metadata += describe_attribute(blobs, &playground_config::exec_sandbox_profile)?;
 

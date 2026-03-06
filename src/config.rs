@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,21 +25,6 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
 const DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS: u64 = 512;
 const DEFAULT_PROMPT_CHARS_PER_TOKEN: u64 = 4;
-const DEFAULT_MEMORY_COMPACTION_ARITY: u64 = 8;
-const DEFAULT_MEMORY_LENS_FACTUAL_INSTRUCTIONS: &str = include_str!("../prompts/memory_lens_factual.md");
-const DEFAULT_MEMORY_LENS_TECHNICAL_INSTRUCTIONS: &str =
-    include_str!("../prompts/memory_lens_technical.md");
-const DEFAULT_MEMORY_LENS_EMOTIONAL_INSTRUCTIONS: &str =
-    include_str!("../prompts/memory_lens_emotional.md");
-const DEFAULT_MEMORY_LENS_FACTUAL_COMPACTION_INSTRUCTIONS: &str =
-    include_str!("../prompts/memory_lens_factual_compaction.md");
-const DEFAULT_MEMORY_LENS_TECHNICAL_COMPACTION_INSTRUCTIONS: &str =
-    include_str!("../prompts/memory_lens_technical_compaction.md");
-const DEFAULT_MEMORY_LENS_EMOTIONAL_COMPACTION_INSTRUCTIONS: &str =
-    include_str!("../prompts/memory_lens_emotional_compaction.md");
-const DEFAULT_MEMORY_LENS_FACTUAL_MAX_OUTPUT_TOKENS: u64 = 192;
-const DEFAULT_MEMORY_LENS_TECHNICAL_MAX_OUTPUT_TOKENS: u64 = 224;
-const DEFAULT_MEMORY_LENS_EMOTIONAL_MAX_OUTPUT_TOKENS: u64 = 96;
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../prompts/system_prompt.md");
 // The branch that carries the core cognition loop + exec/LLM request state.
 const DEFAULT_BRANCH: &str = "cognition";
@@ -60,22 +44,12 @@ const DEFAULT_PILE_PATH: &str = "self.pile";
 const CONFIG_BRANCH: &str = "config";
 #[allow(non_upper_case_globals)]
 const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
-#[allow(non_upper_case_globals)]
-const MEMORY_LENS_ID_FACTUAL: Id = id_hex!("E39414C1875CB127BC7E2F4C42CB3C17");
-#[allow(non_upper_case_globals)]
-const MEMORY_LENS_ID_TECHNICAL: Id = id_hex!("6D6BC80F284B56CAA2AFDE8C841EE894");
-#[allow(non_upper_case_globals)]
-const MEMORY_LENS_ID_EMOTIONAL: Id = id_hex!("1B7C34E5C9718DE01020CA3C0EF50387");
-
 #[derive(Clone, Debug)]
 pub struct Config {
     pub pile_path: PathBuf,
     pub model: ModelConfig,
     pub model_profile_id: Option<Id>,
     pub model_profile_name: String,
-    pub compaction_profile_id: Option<Id>,
-    pub memory_compaction_arity: u64,
-    pub memory_lenses: Vec<MemoryLensConfig>,
     pub tavily_api_key: Option<String>,
     pub exa_api_key: Option<String>,
     pub exec: ExecConfig,
@@ -146,15 +120,6 @@ pub struct ExecConfig {
     pub sandbox_profile: Option<Id>,
 }
 
-#[derive(Clone, Debug)]
-pub struct MemoryLensConfig {
-    pub id: Id,
-    pub name: String,
-    pub instructions: String,
-    pub compaction_instructions: String,
-    pub max_output_tokens: u64,
-}
-
 impl Default for ExecConfig {
     fn default() -> Self {
         Self {
@@ -214,35 +179,12 @@ impl Config {
     }
 }
 
-pub fn load_model_profile(pile_path: &Path, profile_id: Id) -> Result<Option<(ModelConfig, String)>> {
-    let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let result = (|| -> Result<Option<(ModelConfig, String)>> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout config workspace")?;
-        load_latest_model_profile(&mut ws, &catalog, profile_id)
-    })();
-
-    if let Err(err) = close_repo(repo).context("close config pile") {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-
-    result
-}
-
 fn default_config(pile_path: PathBuf) -> Config {
     Config {
         pile_path,
         model: ModelConfig::default(),
         model_profile_id: None,
         model_profile_name: "default".to_string(),
-        compaction_profile_id: None,
-        memory_compaction_arity: default_memory_compaction_arity(),
-        memory_lenses: default_memory_lenses(),
         tavily_api_key: None,
         exa_api_key: None,
         exec: ExecConfig::default(),
@@ -280,8 +222,7 @@ fn load_from_pile(pile_path: &Path) -> Result<Config> {
         };
 
         let ids_changed = ensure_registered_branch_ids(&mut config);
-        let lenses_missing = !has_memory_lens_entries(&catalog);
-        if ids_changed || lenses_missing {
+        if ids_changed {
             store_config(&mut ws, &config).context("store config with branch ids")?;
             push_workspace(&mut repo, &mut ws).context("push config with branch ids")?;
         }
@@ -399,56 +340,6 @@ fn ensure_registered_branches_exist(repo: &mut Repository<Pile>, config: &Config
     Ok(())
 }
 
-fn has_memory_lens_entries(catalog: &TribleSet) -> bool {
-    find!(
-        (
-            entity_id: Id,
-            instructions: Value<Handle<Blake3, LongString>>,
-            compaction_instructions: Value<Handle<Blake3, LongString>>,
-            max_output_tokens: Value<U256BE>
-        ),
-        pattern!(catalog, [{
-            ?entity_id @
-            playground_config::kind: playground_config::kind_memory_lens,
-            playground_config::memory_lens_instructions: ?instructions,
-            playground_config::memory_lens_compaction_instructions: ?compaction_instructions,
-            playground_config::memory_lens_max_output_tokens: ?max_output_tokens,
-        }])
-    )
-    .into_iter()
-    .next()
-    .is_some()
-}
-
-fn latest_memory_lens_entries(catalog: &TribleSet) -> HashMap<Id, (Id, i128)> {
-    let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-    for (entry_id, lens_id, updated_at) in find!(
-        (
-            entry_id: Id,
-            lens_id: Value<GenId>,
-            updated_at: Value<NsTAIInterval>
-        ),
-        pattern!(catalog, [{
-            ?entry_id @
-            playground_config::kind: playground_config::kind_memory_lens,
-            playground_config::updated_at: ?updated_at,
-            playground_config::memory_lens_id: ?lens_id,
-        }])
-    ) {
-        let lens_id = Id::from_value(&lens_id);
-        let key = interval_key(updated_at);
-        latest
-            .entry(lens_id)
-            .and_modify(|slot| {
-                if key > slot.1 || (key == slot.1 && entry_id > slot.0) {
-                    *slot = (entry_id, key);
-                }
-            })
-            .or_insert((entry_id, key));
-    }
-    latest
-}
-
 fn close_repo(repo: Repository<Pile>) -> Result<()> {
     repo.into_storage().close().context("close pile")
 }
@@ -476,7 +367,7 @@ fn load_latest_config(
         }
     }
 
-    let Some((config_id, config_updated_key)) = latest else {
+    let Some((config_id, _)) = latest else {
         return Ok(None);
     };
 
@@ -501,13 +392,6 @@ fn load_latest_config(
     }
     if let Some(id) = load_id_attr(catalog, config_id, playground_config::active_model_profile_id) {
         config.model_profile_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(
-        catalog,
-        config_id,
-        playground_config::active_compaction_profile_id,
-    ) {
-        config.compaction_profile_id = Some(id);
     }
     if let Some(model) = load_string_attr(ws, catalog, config_id, playground_config::model_name)? {
         config.model.model = model;
@@ -638,26 +522,11 @@ fn load_latest_config(
     {
         config.model.chars_per_token = chars;
     }
-    if let Some(factor) = load_u256_attr(
-        catalog,
-        config_id,
-        playground_config::memory_compaction_arity,
-    )
-    .and_then(u256be_to_u64)
-    {
-        config.memory_compaction_arity = factor.max(2);
-    }
-
     if let Some(profile_id) = config.model_profile_id {
         if let Some((model_cfg, name)) = load_latest_model_profile(ws, catalog, profile_id)? {
             config.model = model_cfg;
             config.model_profile_name = name;
         }
-    }
-
-    let lenses = load_memory_lenses_for_snapshot(ws, catalog, config_updated_key)?;
-    if !lenses.is_empty() {
-        config.memory_lenses = lenses;
     }
 
     Ok(Some(config))
@@ -763,76 +632,12 @@ fn load_latest_model_profile(
     Ok(Some((model, name)))
 }
 
-fn load_memory_lenses_for_snapshot(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-    snapshot_key: i128,
-) -> Result<Vec<MemoryLensConfig>> {
-    let latest = latest_memory_lens_entries(catalog);
-    let mut lenses_by_name: HashMap<String, (MemoryLensConfig, i128)> = HashMap::new();
-    for (lens_id, (entry_id, updated_key)) in latest {
-        if updated_key != snapshot_key {
-            continue;
-        }
-        let name = load_string_attr(ws, catalog, entry_id, metadata::name)?
-            .unwrap_or_else(|| format!("lens-{lens_id:x}"));
-        let instructions =
-            load_string_attr(ws, catalog, entry_id, playground_config::memory_lens_instructions)?
-                .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing instructions"))?;
-        let compaction_instructions = load_string_attr(
-            ws,
-            catalog,
-            entry_id,
-            playground_config::memory_lens_compaction_instructions,
-        )?
-        .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing compaction_instructions"))?;
-        let max_output_tokens = load_u256_attr(
-            catalog,
-            entry_id,
-            playground_config::memory_lens_max_output_tokens,
-        )
-        .and_then(u256be_to_u64)
-        .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing max_output_tokens"))?;
-        let lens = MemoryLensConfig {
-            id: lens_id,
-            name: name.clone(),
-            instructions,
-            compaction_instructions,
-            max_output_tokens,
-        };
-        let key = name.to_lowercase();
-        lenses_by_name
-            .entry(key)
-            .and_modify(|slot| {
-                if updated_key > slot.1 {
-                    *slot = (lens.clone(), updated_key);
-                }
-            })
-            .or_insert((lens, updated_key));
-    }
-    let mut lenses: Vec<MemoryLensConfig> =
-        lenses_by_name.into_values().map(|(lens, _)| lens).collect();
-    lenses.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-    Ok(lenses)
-}
-
 fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let now = epoch_interval(now_epoch());
     let config_id = ufoid();
     let profile_id = config
         .model_profile_id
         .ok_or_else(|| anyhow!("config missing active LLM profile id"))?;
-    let mut memory_lenses = if config.memory_lenses.is_empty() {
-        default_memory_lenses()
-    } else {
-        config.memory_lenses.clone()
-    };
-    memory_lenses.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.id.cmp(&b.id))
-    });
 
     let system_prompt = ws.put(config.system_prompt.clone());
     let branch = ws.put(config.branch.clone());
@@ -851,11 +656,6 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         playground_config::poll_ms: poll_ms,
         playground_config::active_model_profile_id: profile_id,
     };
-    let memory_compaction_arity: Value<U256BE> = config.memory_compaction_arity.max(2).to_value();
-    change += entity! { &config_id @
-        playground_config::memory_compaction_arity: memory_compaction_arity,
-    };
-
     if let Some(id) = config.branch_id {
         change += entity! { &config_id @ playground_config::branch_id: id };
     }
@@ -888,9 +688,6 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     }
     if let Some(id) = config.persona_id {
         change += entity! { &config_id @ playground_config::persona_id: id };
-    }
-    if let Some(id) = config.compaction_profile_id {
-        change += entity! { &config_id @ playground_config::active_compaction_profile_id: id };
     }
     if let Some(key) = config.tavily_api_key.as_ref() {
         let handle = ws.put(key.clone());
@@ -932,23 +729,6 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         playground_config::model_context_safety_margin_tokens: model_context_safety_margin_tokens,
         playground_config::model_chars_per_token: model_chars_per_token,
     };
-
-    for lens in &memory_lenses {
-        let lens_entry_id = ufoid();
-        let lens_name = ws.put(lens.name.clone());
-        let lens_instructions = ws.put(lens.instructions.clone());
-        let lens_compaction_instructions = ws.put(lens.compaction_instructions.clone());
-        let lens_max_output_tokens: Value<U256BE> = lens.max_output_tokens.to_value();
-        change += entity! { &lens_entry_id @
-            playground_config::kind: playground_config::kind_memory_lens,
-            playground_config::updated_at: now,
-            playground_config::memory_lens_id: lens.id,
-            metadata::name: lens_name,
-            playground_config::memory_lens_instructions: lens_instructions,
-            playground_config::memory_lens_compaction_instructions: lens_compaction_instructions,
-            playground_config::memory_lens_max_output_tokens: lens_max_output_tokens,
-        };
-    }
 
     if let Some(key) = config.model.api_key.as_ref() {
         let handle = ws.put(key.clone());
@@ -1057,36 +837,6 @@ fn default_context_safety_margin_tokens() -> u64 {
 
 fn default_chars_per_token() -> u64 {
     DEFAULT_PROMPT_CHARS_PER_TOKEN
-}
-
-fn default_memory_compaction_arity() -> u64 {
-    DEFAULT_MEMORY_COMPACTION_ARITY
-}
-
-fn default_memory_lenses() -> Vec<MemoryLensConfig> {
-    vec![
-        MemoryLensConfig {
-            id: MEMORY_LENS_ID_FACTUAL,
-            name: "factual".to_string(),
-            instructions: DEFAULT_MEMORY_LENS_FACTUAL_INSTRUCTIONS.to_string(),
-            compaction_instructions: DEFAULT_MEMORY_LENS_FACTUAL_COMPACTION_INSTRUCTIONS.to_string(),
-            max_output_tokens: DEFAULT_MEMORY_LENS_FACTUAL_MAX_OUTPUT_TOKENS,
-        },
-        MemoryLensConfig {
-            id: MEMORY_LENS_ID_TECHNICAL,
-            name: "technical".to_string(),
-            instructions: DEFAULT_MEMORY_LENS_TECHNICAL_INSTRUCTIONS.to_string(),
-            compaction_instructions: DEFAULT_MEMORY_LENS_TECHNICAL_COMPACTION_INSTRUCTIONS.to_string(),
-            max_output_tokens: DEFAULT_MEMORY_LENS_TECHNICAL_MAX_OUTPUT_TOKENS,
-        },
-        MemoryLensConfig {
-            id: MEMORY_LENS_ID_EMOTIONAL,
-            name: "emotional".to_string(),
-            instructions: DEFAULT_MEMORY_LENS_EMOTIONAL_INSTRUCTIONS.to_string(),
-            compaction_instructions: DEFAULT_MEMORY_LENS_EMOTIONAL_COMPACTION_INSTRUCTIONS.to_string(),
-            max_output_tokens: DEFAULT_MEMORY_LENS_EMOTIONAL_MAX_OUTPUT_TOKENS,
-        },
-    ]
 }
 
 fn default_branch() -> String {

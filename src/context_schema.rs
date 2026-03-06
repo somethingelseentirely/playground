@@ -2,7 +2,7 @@ use triblespace::core::metadata;
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{
-    Blake3, GenId, Handle, NsTAIInterval, U256BE,
+    Blake3, GenId, Handle, NsTAIInterval,
 };
 use triblespace::prelude::*;
 
@@ -11,7 +11,6 @@ pub mod playground_context {
 
     attributes! {
         "81E520987033BE71EB0AFFA8297DE613" as pub kind: GenId;
-        "8D5B05B6360EDFB6101A3E9A73A32F43" as pub level: U256BE;
         "3292CF0B3B6077991D8ECE6E2973D4B6" as pub summary: Handle<Blake3, LongString>;
         "3D5865566AF5118471DA1FF7F87CB791" as pub created_at: NsTAIInterval;
         "4EAF7FE3122A0AE2D8309B79DCCB8D75" as pub start_at: NsTAIInterval;
@@ -21,7 +20,6 @@ pub mod playground_context {
         "9B83D68AECD6888AA9CE95E754494768" as pub child: GenId;
         "316834CC6B0EA6F073BF5362D67AC530" as pub about_exec_result: GenId;
         "A4E2B712CA28AB1EED76C34DE72AFA39" as pub about_archive_message: GenId;
-        "2407DD8440508B474B073A5ECF098500" as pub lens_id: GenId;
     }
 
     /// Root id for describing the playground_context protocol.
@@ -113,11 +111,9 @@ where
 
     metadata += <GenId as metadata::ConstDescribe>::describe(blobs)?;
     metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
-    metadata += <U256BE as metadata::ConstDescribe>::describe(blobs)?;
     metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
 
     metadata += describe_attribute(blobs, &playground_context::kind)?;
-    metadata += describe_attribute(blobs, &playground_context::level)?;
     metadata += describe_attribute(blobs, &playground_context::summary)?;
     metadata += describe_attribute(blobs, &playground_context::created_at)?;
     metadata += describe_attribute(blobs, &playground_context::start_at)?;
@@ -127,7 +123,6 @@ where
     metadata += describe_attribute(blobs, &playground_context::child)?;
     metadata += describe_attribute(blobs, &playground_context::about_exec_result)?;
     metadata += describe_attribute(blobs, &playground_context::about_archive_message)?;
-    metadata += describe_attribute(blobs, &playground_context::lens_id)?;
 
     Ok(metadata)
 }

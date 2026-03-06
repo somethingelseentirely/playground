@@ -425,19 +425,6 @@ How does the replay loop work in practice?
   progressive ingestion (ingest on demand when the model queries a time period
   with no memories).
 
-### Transition from existing memories
-
-Existing memories have `lens_id` and `level`. Backward compatibility options:
-
-- **Ignore lens_id**: treat all existing memories as plain memories regardless of
-  which lens produced them. The cover shows all of them (may have overlapping
-  time ranges from different lenses covering the same event — handled by cover
-  selection).
-- **Prefer factual**: for overlapping same-range memories from different lenses,
-  prefer the factual one.
-- **Re-ingest**: discard existing memories, re-process from raw data using the
-  new mechanism.
-
 ### Spontaneous vs guided memory creation
 
 Should memory creation always be the model's conscious choice, or should the
