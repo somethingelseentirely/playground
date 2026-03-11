@@ -43,6 +43,8 @@ use repo_util::{
 use schema::{model_chat, playground_cog, playground_context, playground_exec};
 use time_util::{epoch_interval, format_tai_interval_timestamp, format_time_range, interval_key, interval_width, now_epoch};
 
+const MEMORY_BRANCH_NAME: &str = "memory";
+
 mod reason_events {
     use triblespace::prelude::attributes;
     use triblespace::prelude::blobschemas;
@@ -896,11 +898,18 @@ fn create_thought_and_request(
     }
 
     let now = epoch_interval(now_epoch());
+    let memory_catalog = match repo.ensure_branch(MEMORY_BRANCH_NAME, None) {
+        Ok(memory_branch_id) => {
+            let mut memory_ws = pull_workspace(repo, memory_branch_id, "pull memory branch")?;
+            memory_ws.checkout(..).context("checkout memory branch")?
+        }
+        Err(_) => TribleSet::new(),
+    };
     let context_json = if let Some(exec_result_id) = about_exec_result {
         context_for_exec_result_with_history(
             &mut ws,
             &core_index,
-            &catalog,
+            &memory_catalog,
             exec_result_id,
             config,
         )?
@@ -1822,14 +1831,14 @@ fn sorted_finished_command_results(core_index: &CoreIndex) -> Vec<CommandResultI
 fn context_for_exec_result_with_history(
     ws: &mut Workspace<Pile>,
     core_index: &CoreIndex,
-    catalog: &TribleSet,
+    memory_catalog: &TribleSet,
     exec_result_id: Id,
     config: &Config,
 ) -> Result<String> {
     let mut messages = build_context_messages(
         ws,
         core_index,
-        catalog,
+        memory_catalog,
         exec_result_id,
         config,
     )?;
@@ -1841,11 +1850,11 @@ fn context_for_exec_result_with_history(
 fn build_context_messages(
     ws: &mut Workspace<Pile>,
     core_index: &CoreIndex,
-    catalog: &TribleSet,
+    memory_catalog: &TribleSet,
     exec_result_id: Id,
     config: &Config,
 ) -> Result<Vec<ChatMessage>> {
-    let index = load_context_chunks(catalog);
+    let index = load_context_chunks(memory_catalog);
     let body_budget_chars = context_body_budget_chars(config);
     // Sort all command results in chronological order (oldest -> newest).
     let results = sorted_finished_command_results(core_index);
