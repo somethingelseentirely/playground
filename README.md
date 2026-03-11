@@ -203,7 +203,7 @@ This command:
 
 Commands executed by the exec worker receive:
 - `PILE` (active pile path),
-- `CONFIG_BRANCH_ID` (`4790808CF044F979FC7C2E47FCCB4A64`),
+- `CONFIG_BRANCH_ID` (`6069A136254E1B87E4C0D2E0295DB382`),
 - `WORKER_ID` (exec worker id),
 - `TURN_ID` (current exec request id).
 
@@ -217,5 +217,5 @@ Reason notes (useful when a model/provider does not expose reasoning output):
 `reason` logs a structured rationale event into the active exec/cognition branch
 and (when a command is provided) then runs it.
 
-Pass a pile path as the first argument if you want a non-default location. To apply Lima config
-template changes, set `PLAYGROUND_LIMA_RECREATE=1` before re-running the command.
+Pass a pile path as the first argument if you want a non-default location. The Lima VM is
+recreated on every run to ensure the exec environment matches the host.

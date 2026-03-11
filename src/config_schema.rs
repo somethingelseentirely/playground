@@ -11,16 +11,6 @@ pub mod playground_config {
         "DDF83FEC915816ACAE7F3FEBB57E5137" as pub updated_at: NsTAIInterval;
         "950B556A74F71AC7CB008AB23FBB6544" as pub system_prompt: Handle<Blake3, LongString>;
         "35E36AE7B60AD946661BD63B3CD64672" as pub branch: Handle<Blake3, LongString>;
-        "4E2F9CA7A8456DED8C43A3BE741ADA58" as pub branch_id: GenId;
-        "EDEFFF6AFF6318E44CCF6A602B012604" as pub compass_branch_id: GenId;
-        "C188E12ABBDD83D283A23DBAD4B784AF" as pub exec_branch_id: GenId;
-        "2ED6FF7EAB93CB5608555AE4B9664CF8" as pub local_messages_branch_id: GenId;
-        "D35F4F02E29825FBC790E324EFCD1B34" as pub relations_branch_id: GenId;
-        "22A0E76B8044311563369298306906E3" as pub teams_branch_id: GenId;
-        "20D37D92C2AEF5C98899C4C35AA1E35E" as pub workspace_branch_id: GenId;
-        "047112FC535518D289E64FBE0B60F06E" as pub archive_branch_id: GenId;
-        "A4DFF7BE658B1EA16F866E3039FFF8D6" as pub web_branch_id: GenId;
-        "229941B84503AAE4976A49E020D1282B" as pub media_branch_id: GenId;
         "F0F90572249284CD57E48580369DEB6D" as pub author: Handle<Blake3, LongString>;
         "98A194178CFD7CBB915C1BC9EB561A7F" as pub author_role: Handle<Blake3, LongString>;
         "D1DC11B303725409AB8A30C6B59DB2D7" as pub persona_id: GenId;

@@ -120,7 +120,7 @@ cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/self.pile exe
 
 When the exec worker launches a command, it exports these environment variables:
 - `PILE`: active pile path (same value passed via `--pile`)
-- `CONFIG_BRANCH_ID`: fixed config branch id (`4790808CF044F979FC7C2E47FCCB4A64`)
+- `CONFIG_BRANCH_ID`: fixed config branch id (`6069A136254E1B87E4C0D2E0295DB382`)
 - `WORKER_ID`: exec worker id (hex)
 - `TURN_ID`: current exec request id (hex)
 

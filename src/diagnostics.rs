@@ -523,16 +523,6 @@ struct AgentConfigRow {
     updated_at: Option<i128>,
     persona_id: Option<Id>,
     branch: Option<String>,
-    branch_id: Option<Id>,
-    compass_branch_id: Option<Id>,
-    exec_branch_id: Option<Id>,
-    local_messages_branch_id: Option<Id>,
-    relations_branch_id: Option<Id>,
-    teams_branch_id: Option<Id>,
-    workspace_branch_id: Option<Id>,
-    archive_branch_id: Option<Id>,
-    web_branch_id: Option<Id>,
-    media_branch_id: Option<Id>,
     author: Option<String>,
     author_role: Option<String>,
     poll_ms: Option<u64>,
@@ -1095,7 +1085,8 @@ fn ensure_repo_open(state: &mut DashboardState) -> Result<(), String> {
             }
             return Err(err.to_string());
         }
-        let repo = Repository::new(pile, state.signing_key.clone());
+        let repo = Repository::new(pile, state.signing_key.clone(), TribleSet::new())
+            .map_err(|err| format!("create repository: {err:?}"))?;
         state.repo = Some(repo);
         state.repo_open_path = Some(open_path);
     }
@@ -1154,24 +1145,24 @@ fn apply_branch_defaults_from_agent_config(state: &mut DashboardState, config: &
         return;
     }
 
-    // Use the config entry as a stable "defaults bundle" for diagnostics selectors.
-    if let Some(id) = config.exec_branch_id.or(config.branch_id) {
-        state.config.exec_branches = format!("{id:x}");
+    // Use well-known branch names as defaults for diagnostics selectors.
+    if let Some(branch) = config.branch.as_deref() {
+        state.config.exec_branches = branch.to_string();
     }
-    if let Some(id) = config.compass_branch_id {
-        state.config.compass_branches = format!("{id:x}");
+    if state.config.compass_branches.is_empty() {
+        state.config.compass_branches = "compass".to_string();
     }
-    if let Some(id) = config.local_messages_branch_id {
-        state.config.local_message_branches = format!("{id:x}");
+    if state.config.local_message_branches.is_empty() {
+        state.config.local_message_branches = "local-messages".to_string();
     }
-    if let Some(id) = config.relations_branch_id {
-        state.config.relations_branches = format!("{id:x}");
+    if state.config.relations_branches.is_empty() {
+        state.config.relations_branches = "relations".to_string();
     }
-    if let Some(id) = config.teams_branch_id {
-        state.config.teams_branches = format!("{id:x}");
+    if state.config.teams_branches.is_empty() {
+        state.config.teams_branches = "teams".to_string();
     }
-    if let Some(id) = config.workspace_branch_id {
-        state.config.workspace_branches = format!("{id:x}");
+    if state.config.workspace_branches.is_empty() {
+        state.config.workspace_branches = "workspace".to_string();
     }
 
     state.config_last_applied_id = Some(config.id);
@@ -1191,6 +1182,23 @@ fn load_snapshot(
     let previous_for_reuse = previous
         .as_ref()
         .filter(|snapshot| snapshot.pile_path == pile_path);
+
+    // Auto-create well-known branches so the dashboard never errors on a missing name.
+    for name in [
+        "config",
+        "cognition",
+        "compass",
+        "local-messages",
+        "relations",
+        "teams",
+        "workspace",
+        "archive",
+        "web",
+        "media",
+    ] {
+        let _ = repo.ensure_branch(name, None);
+    }
+
     let branches = list_branches(repo.storage_mut())?;
     let mut previous_map = previous_for_reuse
         .map(|snapshot| snapshot.branch_data.clone())
@@ -1794,23 +1802,6 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
 
     let persona_id = load_optional_id_attr(data, config_id, playground_config::persona_id);
     let branch = load_optional_string_attr(data, ws, config_id, playground_config::branch);
-    let branch_id = load_optional_id_attr(data, config_id, playground_config::branch_id);
-    let compass_branch_id =
-        load_optional_id_attr(data, config_id, playground_config::compass_branch_id);
-    let exec_branch_id = load_optional_id_attr(data, config_id, playground_config::exec_branch_id);
-    let local_messages_branch_id =
-        load_optional_id_attr(data, config_id, playground_config::local_messages_branch_id);
-    let relations_branch_id =
-        load_optional_id_attr(data, config_id, playground_config::relations_branch_id);
-    let teams_branch_id =
-        load_optional_id_attr(data, config_id, playground_config::teams_branch_id);
-    let workspace_branch_id =
-        load_optional_id_attr(data, config_id, playground_config::workspace_branch_id);
-    let archive_branch_id =
-        load_optional_id_attr(data, config_id, playground_config::archive_branch_id);
-    let web_branch_id = load_optional_id_attr(data, config_id, playground_config::web_branch_id);
-    let media_branch_id =
-        load_optional_id_attr(data, config_id, playground_config::media_branch_id);
     let author = load_optional_string_attr(data, ws, config_id, playground_config::author);
     let author_role =
         load_optional_string_attr(data, ws, config_id, playground_config::author_role);
@@ -1886,16 +1877,6 @@ fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<Ag
         updated_at: Some(updated_key),
         persona_id,
         branch,
-        branch_id,
-        compass_branch_id,
-        exec_branch_id,
-        local_messages_branch_id,
-        relations_branch_id,
-        teams_branch_id,
-        workspace_branch_id,
-        archive_branch_id,
-        web_branch_id,
-        media_branch_id,
         author,
         author_role,
         poll_ms,
@@ -4356,7 +4337,7 @@ fn send_local_message(
         local_messages::created_at: now_interval,
     };
 
-    ws.commit(change, None, Some("local message"));
+    ws.commit(change, "local message");
     repo.push(&mut ws)
         .map_err(|err| format!("push message: {err:?}"))?;
     Ok(())
@@ -4619,96 +4600,6 @@ fn render_agent_config(
 
             ui.label("branch");
             ui.label(config.branch.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("branch_id");
-            ui.monospace(
-                config
-                    .branch_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("exec_branch_id");
-            ui.monospace(
-                config
-                    .exec_branch_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("compass_branch_id");
-            ui.monospace(
-                config
-                    .compass_branch_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("local_messages_branch_id");
-            ui.monospace(
-                config
-                    .local_messages_branch_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("relations_branch_id");
-            ui.monospace(
-                config
-                    .relations_branch_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("teams_branch_id");
-            ui.monospace(
-                config
-                    .teams_branch_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("workspace_branch_id");
-            ui.monospace(
-                config
-                    .workspace_branch_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("archive_branch_id");
-            ui.monospace(
-                config
-                    .archive_branch_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("web_branch_id");
-            ui.monospace(
-                config
-                    .web_branch_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("media_branch_id");
-            ui.monospace(
-                config
-                    .media_branch_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
             ui.end_row();
 
             ui.label("author");

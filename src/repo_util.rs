@@ -12,15 +12,11 @@ use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle};
 use triblespace::prelude::*;
 
-use crate::branch_util::ensure_branch;
 use crate::config::Config;
 pub(crate) use crate::repo_ops::push_workspace;
 use crate::schema::build_playground_metadata;
 
 pub(crate) fn init_repo(config: &Config) -> Result<(Repository<Pile>, Id)> {
-    let branch_id = config.branch_id.ok_or_else(|| {
-        anyhow!("config is missing branch_id; run `playground config set branch-id <ID>`")
-    })?;
     if let Some(parent) = config.pile_path.parent() {
         fs::create_dir_all(parent).context("create pile directory")?;
     }
@@ -33,10 +29,14 @@ pub(crate) fn init_repo(config: &Config) -> Result<(Repository<Pile>, Id)> {
         return Err(err);
     }
 
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
+    let metadata = build_playground_metadata(&mut pile)
+        .map_err(|err| anyhow!("build playground metadata: {err:?}"))?;
+    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), metadata)
+        .map_err(|err| anyhow!("create repository: {err:?}"))?;
+    let branch_id = repo
+        .ensure_branch(&config.branch, None)
+        .map_err(|e| anyhow!("ensure branch '{}': {e:?}", config.branch))?;
     let result = (|| -> Result<()> {
-        ensure_branch(&mut repo, branch_id, config.branch.as_str())
-            .with_context(|| format!("materialize core branch {branch_id:x}"))?;
         pull_workspace(&mut repo, branch_id, &format!("pull branch {branch_id:x}"))?;
         Ok(())
     })();
@@ -100,14 +100,6 @@ pub(crate) fn refresh_cached_checkout(
     Ok(delta)
 }
 
-pub(crate) fn seed_metadata(repo: &mut Repository<Pile>) -> Result<()> {
-    let metadata = build_playground_metadata(repo.storage_mut())
-        .map_err(|err| anyhow!("build playground metadata: {err:?}"))?;
-    repo.set_default_metadata(metadata)
-        .map_err(|err| anyhow!("set playground metadata: {err:?}"))?;
-    Ok(())
-}
-
 pub(crate) fn load_text(
     ws: &mut Workspace<Pile>,
     handle: Value<Handle<Blake3, LongString>>,
@@ -146,7 +138,7 @@ pub(crate) fn ensure_worker_name(
     change += entity! { ExclusiveId::force_ref(&worker_id) @
         metadata::name: name_handle
     };
-    ws.commit(change, None, Some("worker name"));
+    ws.commit(change, "worker name");
     push_workspace(repo, &mut ws).context("push worker name")?;
     Ok(())
 }

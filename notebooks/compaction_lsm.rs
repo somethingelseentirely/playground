@@ -56,7 +56,7 @@ const CURVE_SCALE_LADDER: [f32; 14] = [
     0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0,
 ];
 #[allow(non_upper_case_globals)]
-const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
+const CONFIG_BRANCH_ID: Id = id_hex!("6069A136254E1B87E4C0D2E0295DB382");
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
 const DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS: u64 = 512;
@@ -368,7 +368,8 @@ fn load_profile_calibration(args: &NotebookArgs) -> Result<Option<ProfileCalibra
         Pile::open(pile_path).with_context(|| format!("open pile '{}'", pile_path.display()))?;
     pile.restore()
         .with_context(|| format!("restore pile '{}'", pile_path.display()))?;
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
+    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+        .map_err(|err| anyhow!("create repository: {err:?}"))?;
 
     let result = (|| -> Result<Option<ProfileCalibration>> {
         let mut ws = match repo.pull(CONFIG_BRANCH_ID) {

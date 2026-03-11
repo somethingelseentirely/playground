@@ -18,13 +18,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
-use triblespace::core::repo::branch as branch_proto;
-use triblespace::core::repo::{PushResult, Repository, Workspace};
+use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
 const DEFAULT_BRANCH: &str = "relations";
-const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
+const CONFIG_BRANCH_ID: Id = id_hex!("6069A136254E1B87E4C0D2E0295DB382");
 const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 
@@ -120,7 +119,8 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
     }
 
     let signing_key = SigningKey::generate(&mut OsRng);
-    Ok(Repository::new(pile, signing_key))
+    Repository::new(pile, signing_key, TribleSet::new())
+        .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
 fn with_repo<T>(
@@ -248,39 +248,6 @@ fn resolve_branch_id(
     )
 }
 
-fn ensure_branch_with_id(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_id: Id,
-    branch_name: &str,
-) -> Result<()> {
-    if repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let name_blob = branch_name.to_owned().to_blob();
-    let name_handle = name_blob.get_handle::<valueschemas::Blake3>();
-    repo.storage_mut()
-        .put(name_blob)
-        .map_err(|e| anyhow!("store branch name {branch_name}: {e:?}"))?;
-    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
-    let metadata_handle = repo
-        .storage_mut()
-        .put(metadata.to_blob())
-        .map_err(|e| anyhow!("store branch metadata {branch_name}: {e:?}"))?;
-    let result = repo
-        .storage_mut()
-        .update(branch_id, None, Some(metadata_handle))
-        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
-    match result {
-        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
-    }
-}
-
 fn run(cli: Cli) -> Result<()> {
     with_repo(&cli.pile, |repo| {
         let cfg = load_config_branches(repo)?;
@@ -291,8 +258,6 @@ fn run(cli: Cli) -> Result<()> {
             cfg.relations_branch_id,
             &cli.branch,
         )?;
-        ensure_branch_with_id(repo, branch_id, &cli.branch)?;
-
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -377,7 +342,7 @@ fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
 
-        ws.commit(delta, None, Some("relations normalize lookup keys"));
+        ws.commit(delta, "relations normalize lookup keys");
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push normalized lookup keys: {e:?}"))?;
         println!(

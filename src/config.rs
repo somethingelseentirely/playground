@@ -7,12 +7,10 @@ use rand::rngs::OsRng;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
-use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
-use crate::branch_util::ensure_branch;
 use crate::repo_ops::push_workspace;
 use crate::schema::playground_config;
 use crate::time_util::{epoch_interval, interval_key, now_epoch};
@@ -28,22 +26,10 @@ const DEFAULT_PROMPT_CHARS_PER_TOKEN: u64 = 4;
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../prompts/system_prompt.md");
 // The branch that carries the core cognition loop + exec/LLM request state.
 const DEFAULT_BRANCH: &str = "cognition";
-const DEFAULT_EXEC_BRANCH: &str = "cognition";
-const DEFAULT_COMPASS_BRANCH: &str = "compass";
-const DEFAULT_LOCAL_MESSAGES_BRANCH: &str = "local-messages";
-const DEFAULT_RELATIONS_BRANCH: &str = "relations";
-const DEFAULT_TEAMS_BRANCH: &str = "teams";
-const DEFAULT_WORKSPACE_BRANCH: &str = "workspace";
-const DEFAULT_ARCHIVE_BRANCH: &str = "archive";
-const DEFAULT_WEB_BRANCH: &str = "web";
-const DEFAULT_MEDIA_BRANCH: &str = "media";
 const DEFAULT_AUTHOR: &str = "agent";
 const DEFAULT_AUTHOR_ROLE: &str = "user";
 const DEFAULT_POLL_MS: u64 = 1;
 const DEFAULT_PILE_PATH: &str = "self.pile";
-const CONFIG_BRANCH: &str = "config";
-#[allow(non_upper_case_globals)]
-const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 #[derive(Clone, Debug)]
 pub struct Config {
     pub pile_path: PathBuf,
@@ -54,17 +40,7 @@ pub struct Config {
     pub exa_api_key: Option<String>,
     pub exec: ExecConfig,
     pub system_prompt: String,
-    pub branch_id: Option<Id>,
     pub branch: String,
-    pub compass_branch_id: Option<Id>,
-    pub exec_branch_id: Option<Id>,
-    pub local_messages_branch_id: Option<Id>,
-    pub relations_branch_id: Option<Id>,
-    pub teams_branch_id: Option<Id>,
-    pub workspace_branch_id: Option<Id>,
-    pub archive_branch_id: Option<Id>,
-    pub web_branch_id: Option<Id>,
-    pub media_branch_id: Option<Id>,
     pub author: String,
     pub author_role: String,
     pub persona_id: Option<Id>,
@@ -189,17 +165,7 @@ fn default_config(pile_path: PathBuf) -> Config {
         exa_api_key: None,
         exec: ExecConfig::default(),
         system_prompt: default_system_prompt(),
-        branch_id: None,
         branch: default_branch(),
-        compass_branch_id: None,
-        exec_branch_id: None,
-        local_messages_branch_id: None,
-        relations_branch_id: None,
-        teams_branch_id: None,
-        workspace_branch_id: None,
-        archive_branch_id: None,
-        web_branch_id: None,
-        media_branch_id: None,
         author: default_author(),
         author_role: default_author_role(),
         persona_id: None,
@@ -221,12 +187,11 @@ fn load_from_pile(pile_path: &Path) -> Result<Config> {
             default_config(pile_path.to_path_buf())
         };
 
-        let ids_changed = ensure_registered_branch_ids(&mut config);
-        if ids_changed {
-            store_config(&mut ws, &config).context("store config with branch ids")?;
-            push_workspace(&mut repo, &mut ws).context("push config with branch ids")?;
+        let profile_changed = ensure_registered_model_profile_id(&mut config.model_profile_id);
+        if profile_changed {
+            store_config(&mut ws, &config).context("store config with profile id")?;
+            push_workspace(&mut repo, &mut ws).context("push config with profile id")?;
         }
-        ensure_registered_branches_exist(&mut repo, &config)?;
         Ok(config)
     })();
 
@@ -253,49 +218,12 @@ fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile>, Id)> {
         return Err(err);
     }
 
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
-    let branch_id = match ensure_config_branch(&mut repo) {
-        Ok(branch_id) => branch_id,
-        Err(err) => {
-            let close_res = repo.close().context("close pile after init failure");
-            if let Err(close_err) = close_res {
-                eprintln!("warning: failed to close pile cleanly: {close_err:#}");
-            }
-            return Err(err);
-        }
-    };
-    Ok((repo, branch_id))
-}
-
-fn ensure_config_branch(repo: &mut Repository<Pile>) -> Result<Id> {
-    ensure_branch(repo, CONFIG_BRANCH_ID, CONFIG_BRANCH)
-        .context("materialize fixed config branch")?;
-    Ok(CONFIG_BRANCH_ID)
-}
-
-fn ensure_registered_branch_ids(config: &mut Config) -> bool {
-    let mut changed = false;
-
-    changed |= ensure_registered_branch_id(&mut config.branch_id);
-    changed |= ensure_registered_branch_id(&mut config.exec_branch_id);
-    changed |= ensure_registered_branch_id(&mut config.compass_branch_id);
-    changed |= ensure_registered_branch_id(&mut config.local_messages_branch_id);
-    changed |= ensure_registered_branch_id(&mut config.relations_branch_id);
-    changed |= ensure_registered_branch_id(&mut config.workspace_branch_id);
-    changed |= ensure_registered_branch_id(&mut config.archive_branch_id);
-    changed |= ensure_registered_branch_id(&mut config.web_branch_id);
-    changed |= ensure_registered_branch_id(&mut config.media_branch_id);
-    changed |= ensure_registered_model_profile_id(&mut config.model_profile_id);
-
-    changed
-}
-
-fn ensure_registered_branch_id(slot: &mut Option<Id>) -> bool {
-    if slot.is_some() {
-        return false;
-    }
-    *slot = Some(*genid());
-    true
+    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+        .map_err(|err| anyhow!("create repository: {err:?}"))?;
+    let config_branch_id = repo
+        .ensure_branch("config", None)
+        .map_err(|e| anyhow!("ensure config branch: {e:?}"))?;
+    Ok((repo, config_branch_id))
 }
 
 fn ensure_registered_model_profile_id(slot: &mut Option<Id>) -> bool {
@@ -304,40 +232,6 @@ fn ensure_registered_model_profile_id(slot: &mut Option<Id>) -> bool {
     }
     *slot = Some(*genid());
     true
-}
-
-fn ensure_registered_branches_exist(repo: &mut Repository<Pile>, config: &Config) -> Result<()> {
-    let required = [
-        (config.branch_id, config.branch.as_str()),
-        (config.exec_branch_id, DEFAULT_EXEC_BRANCH),
-        (config.compass_branch_id, DEFAULT_COMPASS_BRANCH),
-        (
-            config.local_messages_branch_id,
-            DEFAULT_LOCAL_MESSAGES_BRANCH,
-        ),
-        (config.relations_branch_id, DEFAULT_RELATIONS_BRANCH),
-        (config.workspace_branch_id, DEFAULT_WORKSPACE_BRANCH),
-        (config.archive_branch_id, DEFAULT_ARCHIVE_BRANCH),
-        (config.web_branch_id, DEFAULT_WEB_BRANCH),
-        (config.media_branch_id, DEFAULT_MEDIA_BRANCH),
-    ];
-
-    for (id, name) in required {
-        let id = id.ok_or_else(|| anyhow!("config missing id for branch '{name}'"))?;
-        ensure_branch(repo, id, name)
-            .with_context(|| format!("materialize branch '{name}' ({id:x})"))?;
-    }
-
-    // Optional integrations: allow a persona to omit the branch id to disable the facility.
-    if let Some(id) = config.teams_branch_id {
-        ensure_branch(repo, id, DEFAULT_TEAMS_BRANCH).with_context(|| {
-            format!(
-                "materialize branch '{name}' ({id:x})",
-                name = DEFAULT_TEAMS_BRANCH
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn load_latest_config(
@@ -438,40 +332,6 @@ fn load_latest_config(
         config.exec.default_cwd = Some(PathBuf::from(cwd));
     }
 
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::branch_id) {
-        config.branch_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::compass_branch_id) {
-        config.compass_branch_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::exec_branch_id) {
-        config.exec_branch_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(
-        catalog,
-        config_id,
-        playground_config::local_messages_branch_id,
-    ) {
-        config.local_messages_branch_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::relations_branch_id) {
-        config.relations_branch_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::teams_branch_id) {
-        config.teams_branch_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::workspace_branch_id) {
-        config.workspace_branch_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::archive_branch_id) {
-        config.archive_branch_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::web_branch_id) {
-        config.web_branch_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::media_branch_id) {
-        config.media_branch_id = Some(id);
-    }
     if let Some(id) = load_id_attr(catalog, config_id, playground_config::exec_sandbox_profile) {
         config.exec.sandbox_profile = Some(id);
     }
@@ -652,36 +512,6 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         playground_config::poll_ms: poll_ms,
         playground_config::active_model_profile_id: profile_id,
     };
-    if let Some(id) = config.branch_id {
-        change += entity! { &config_id @ playground_config::branch_id: id };
-    }
-    if let Some(id) = config.compass_branch_id {
-        change += entity! { &config_id @ playground_config::compass_branch_id: id };
-    }
-    if let Some(id) = config.exec_branch_id {
-        change += entity! { &config_id @ playground_config::exec_branch_id: id };
-    }
-    if let Some(id) = config.local_messages_branch_id {
-        change += entity! { &config_id @ playground_config::local_messages_branch_id: id };
-    }
-    if let Some(id) = config.relations_branch_id {
-        change += entity! { &config_id @ playground_config::relations_branch_id: id };
-    }
-    if let Some(id) = config.teams_branch_id {
-        change += entity! { &config_id @ playground_config::teams_branch_id: id };
-    }
-    if let Some(id) = config.workspace_branch_id {
-        change += entity! { &config_id @ playground_config::workspace_branch_id: id };
-    }
-    if let Some(id) = config.archive_branch_id {
-        change += entity! { &config_id @ playground_config::archive_branch_id: id };
-    }
-    if let Some(id) = config.web_branch_id {
-        change += entity! { &config_id @ playground_config::web_branch_id: id };
-    }
-    if let Some(id) = config.media_branch_id {
-        change += entity! { &config_id @ playground_config::media_branch_id: id };
-    }
     if let Some(id) = config.persona_id {
         change += entity! { &config_id @ playground_config::persona_id: id };
     }
@@ -739,7 +569,7 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         change += entity! { &profile_entry_id @ playground_config::model_reasoning_summary: handle };
     }
 
-    ws.commit(change, None, Some("playground config"));
+    ws.commit(change, "playground config");
     Ok(())
 }
 

@@ -16,8 +16,6 @@ use crate::repo_util::load_text;
 use crate::schema::playground_workspace;
 use crate::time_util::interval_key;
 
-pub const DEFAULT_WORKSPACE_BRANCH: &str = "workspace";
-
 #[derive(Debug, Clone, Copy)]
 pub struct MergeRestoreReport {
     pub snapshot_id: Id,

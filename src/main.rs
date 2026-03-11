@@ -21,7 +21,6 @@ use triblespace::prelude::*;
 
 mod archive_schema;
 mod blob_refs;
-mod branch_util;
 mod chat_prompt;
 mod config;
 #[cfg(feature = "diagnostics")]
@@ -42,7 +41,7 @@ use repo_util::{
     refresh_cached_checkout,
 };
 use schema::{model_chat, playground_cog, playground_context, playground_exec};
-use time_util::{epoch_interval, format_tai_interval_timestamp, format_tai_timestamp, format_time_range, interval_key, interval_width, now_epoch};
+use time_util::{epoch_interval, format_tai_interval_timestamp, format_time_range, interval_key, interval_width, now_epoch};
 
 mod reason_events {
     use triblespace::prelude::attributes;
@@ -132,8 +131,6 @@ struct LimaExecArgs {
     config: Option<PathBuf>,
     #[arg(long, default_value = "/workspace")]
     vm_root: PathBuf,
-    #[arg(long)]
-    recreate: bool,
 }
 #[derive(Args, Debug, Clone)]
 #[command(about = "Set a single config field in the pile")]
@@ -167,16 +164,6 @@ struct ConfigUnsetArgs {
 enum ConfigField {
     SystemPrompt,
     Branch,
-    BranchId,
-    CompassBranchId,
-    ExecBranchId,
-    LocalMessagesBranchId,
-    RelationsBranchId,
-    TeamsBranchId,
-    WorkspaceBranchId,
-    ArchiveBranchId,
-    WebBranchId,
-    MediaBranchId,
     Author,
     AuthorRole,
     PersonaId,
@@ -190,7 +177,6 @@ enum ConfigField {
 #[derive(ValueEnum, Debug, Clone, Copy)]
 #[value(rename_all = "kebab-case")]
 enum OptionalConfigField {
-    TeamsBranchId,
     PersonaId,
     TavilyApiKey,
     ExaApiKey,
@@ -278,10 +264,16 @@ fn run_with_exec(mut config: Config, args: RunArgs) -> Result<()> {
         model_worker::run_model_loop(model_config, model_worker_id, poll_ms, Some(model_stop))
     });
 
+    let instance = env_string("PLAYGROUND_LIMA_INSTANCE").unwrap_or_else(|| args.lima.instance.clone());
     prepare_lima_service(&config, &args.lima)?;
 
     let core_result = run_loop(config);
     stop.store(true, Ordering::Relaxed);
+
+    // Stop the Lima VM so it doesn't keep writing to the pile after exit.
+    if let Err(e) = limactl_output(&["stop", &instance]) {
+        eprintln!("warning: failed to stop Lima VM '{instance}': {e:#}");
+    }
 
     let model_result = model_handle
         .join()
@@ -332,37 +324,6 @@ fn apply_config_set(config: &mut Config, field: ConfigField, value: &str) -> Res
         ConfigField::Branch => {
             config.branch = load_value_or_file(value, "branch")?;
         }
-        ConfigField::BranchId => {
-            config.branch_id = Some(parse_hex_id(value, "branch_id")?);
-        }
-        ConfigField::CompassBranchId => {
-            config.compass_branch_id = Some(parse_hex_id(value, "compass_branch_id")?);
-        }
-        ConfigField::ExecBranchId => {
-            config.exec_branch_id = Some(parse_hex_id(value, "exec_branch_id")?);
-        }
-        ConfigField::LocalMessagesBranchId => {
-            config.local_messages_branch_id =
-                Some(parse_hex_id(value, "local_messages_branch_id")?);
-        }
-        ConfigField::RelationsBranchId => {
-            config.relations_branch_id = Some(parse_hex_id(value, "relations_branch_id")?);
-        }
-        ConfigField::TeamsBranchId => {
-            config.teams_branch_id = Some(parse_hex_id(value, "teams_branch_id")?);
-        }
-        ConfigField::WorkspaceBranchId => {
-            config.workspace_branch_id = Some(parse_hex_id(value, "workspace_branch_id")?);
-        }
-        ConfigField::ArchiveBranchId => {
-            config.archive_branch_id = Some(parse_hex_id(value, "archive_branch_id")?);
-        }
-        ConfigField::WebBranchId => {
-            config.web_branch_id = Some(parse_hex_id(value, "web_branch_id")?);
-        }
-        ConfigField::MediaBranchId => {
-            config.media_branch_id = Some(parse_hex_id(value, "media_branch_id")?);
-        }
         ConfigField::Author => {
             config.author = load_value_or_file(value, "author")?;
         }
@@ -394,7 +355,6 @@ fn apply_config_set(config: &mut Config, field: ConfigField, value: &str) -> Res
 
 fn apply_config_unset(config: &mut Config, field: OptionalConfigField) -> Result<()> {
     match field {
-        OptionalConfigField::TeamsBranchId => config.teams_branch_id = None,
         OptionalConfigField::PersonaId => config.persona_id = None,
         OptionalConfigField::TavilyApiKey => config.tavily_api_key = None,
         OptionalConfigField::ExaApiKey => config.exa_api_key = None,
@@ -463,32 +423,21 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
         &vm_root,
     )?;
 
-    ensure_lima_instance(&instance, &config_path, args.recreate)?;
+    ensure_lima_instance(&instance, &config_path)?;
     Ok(())
 }
 
-fn ensure_lima_instance(instance: &str, config_path: &Path, recreate: bool) -> Result<()> {
+fn ensure_lima_instance(instance: &str, config_path: &Path) -> Result<()> {
     limactl_output(&["list"])?; // validates limactl exists
     let names = limactl_output(&["list", "--format", "{{.Name}}"])?;
     let exists = names.lines().any(|line| line.trim() == instance);
 
-    let recreate = if recreate {
-        true
-    } else {
-        env_flag("PLAYGROUND_LIMA_RECREATE")
-    };
-
-    if exists && recreate {
+    if exists {
         limactl_output(&["delete", "--force", instance])?;
     }
 
-    let exists = if recreate { false } else { exists };
-    if exists {
-        limactl_output(&["start", instance])?;
-    } else {
-        let config_arg = config_path.to_string_lossy();
-        limactl_output(&["start", "--name", instance, config_arg.as_ref()])?;
-    }
+    let config_arg = config_path.to_string_lossy();
+    limactl_output(&["start", "--name", instance, config_arg.as_ref()])?;
     Ok(())
 }
 
@@ -589,15 +538,6 @@ fn repo_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn env_flag(key: &str) -> bool {
-    let value = std::env::var(key).ok();
-    let Some(value) = value else {
-        return false;
-    };
-    let trimmed = value.trim();
-    trimmed == "1" || trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("yes")
-}
-
 fn env_string(key: &str) -> Option<String> {
     std::env::var(key).ok().and_then(|value| {
         let trimmed = value.trim();
@@ -639,13 +579,6 @@ fn parse_u64(raw: &str, label: &str) -> Result<u64> {
 fn print_config(config: &Config, show_secrets: bool) {
     println!("pile = \"{}\"", config.pile_path.display());
     println!("branch = \"{}\"", config.branch);
-    println!(
-        "branch_id = {}",
-        config
-            .branch_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
-    );
     println!("poll_ms = {}", config.poll_ms);
     println!("author = \"{}\"", config.author);
     println!("author_role = \"{}\"", config.author_role);
@@ -659,71 +592,6 @@ fn print_config(config: &Config, show_secrets: bool) {
     println!(
         "system_prompt = \"{}\"",
         config.system_prompt.replace('\"', "\\\"")
-    );
-
-    println!("\n[branches]");
-    println!(
-        "compass_branch_id = {}",
-        config
-            .compass_branch_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
-    );
-    println!(
-        "exec_branch_id = {}",
-        config
-            .exec_branch_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
-    );
-    println!(
-        "local_messages_branch_id = {}",
-        config
-            .local_messages_branch_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
-    );
-    println!(
-        "relations_branch_id = {}",
-        config
-            .relations_branch_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
-    );
-    println!(
-        "teams_branch_id = {}",
-        config
-            .teams_branch_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
-    );
-    println!(
-        "workspace_branch_id = {}",
-        config
-            .workspace_branch_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
-    );
-    println!(
-        "archive_branch_id = {}",
-        config
-            .archive_branch_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
-    );
-    println!(
-        "web_branch_id = {}",
-        config
-            .web_branch_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
-    );
-    println!(
-        "media_branch_id = {}",
-        config
-            .media_branch_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
     );
 
     println!("\n[model]");
@@ -807,7 +675,6 @@ fn print_config(config: &Config, show_secrets: bool) {
 
 fn run_loop(config: Config) -> Result<()> {
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
-    repo_util::seed_metadata(&mut repo)?;
     let exec_cwd = config
         .exec
         .default_cwd
@@ -826,7 +693,13 @@ fn run_loop(config: Config) -> Result<()> {
                     "warning: model request {request_id:x} failed: {error}",
                     request_id = request_info.id
                 );
-                request_info = ensure_model_request(&mut repo, branch_id, &config)?;
+                // Retry the same thought instead of bootstrapping a new orient cycle.
+                request_info = retry_model_request(
+                    &mut repo,
+                    branch_id,
+                    request_info.thought_id,
+                    &config,
+                )?;
                 sleep(Duration::from_millis(config.poll_ms));
                 continue;
             }
@@ -1056,7 +929,7 @@ fn create_thought_and_request(
         model_chat::model: config.model.model.as_str(),
     };
 
-    ws.commit(change, None, Some("create thought + model request"));
+    ws.commit(change, "create thought + model request");
     push_workspace(repo, &mut ws).context("push thought + request")?;
 
     Ok(ModelRequestInfo {
@@ -1090,8 +963,48 @@ fn create_request_for_thought_from_index(
         model_chat::requested_at: now,
         model_chat::model: config.model.model.as_str(),
     };
-    ws.commit(change, None, Some("create model request"));
+    ws.commit(change, "create model request");
     Ok(*request_id)
+}
+
+/// Re-submit a model request for the same thought after a transient failure.
+/// Avoids bootstrapping a new orient cycle on every error.
+fn retry_model_request(
+    repo: &mut Repository<Pile>,
+    branch_id: Id,
+    thought_id: Option<Id>,
+    config: &Config,
+) -> Result<ModelRequestInfo> {
+    if let Some(thought_id) = thought_id {
+        let mut ws = pull_workspace(repo, branch_id, "pull workspace for model retry")?;
+        let catalog = ws.checkout(..).context("checkout workspace for retry")?;
+        let mut core_index = CoreIndex::default();
+        core_index.apply_delta(&catalog, &catalog);
+
+        let Some(context_handle) = core_index.thought_context_handle(thought_id) else {
+            return Err(anyhow!("thought {thought_id:x} missing context for retry"));
+        };
+
+        let now = epoch_interval(now_epoch());
+        let request_id = ufoid();
+        let mut change = TribleSet::new();
+        change += entity! { &request_id @
+            metadata::tag: model_chat::kind_request,
+            model_chat::about_thought: thought_id,
+            model_chat::context: context_handle,
+            model_chat::requested_at: now,
+            model_chat::model: config.model.model.as_str(),
+        };
+        ws.commit(change, "retry model request");
+        push_workspace(repo, &mut ws).context("push model retry")?;
+        Ok(ModelRequestInfo {
+            id: *request_id,
+            thought_id: Some(thought_id),
+        })
+    } else {
+        // No thought to retry — fall back to the full discovery chain.
+        ensure_model_request(repo, branch_id, config)
+    }
 }
 
 #[derive(Debug)]
@@ -1817,7 +1730,7 @@ fn ensure_command_request(
     if let Some(profile) = sandbox_profile {
         change += entity! { &request_id @ playground_exec::sandbox_profile: profile };
     }
-    ws.commit(change, None, Some("playground_exec request"));
+    ws.commit(change, "playground_exec request");
     push_workspace(repo, &mut ws).context("push command request")?;
     Ok(*request_id)
 }
@@ -1949,52 +1862,90 @@ fn build_context_messages(
         results.as_slice(),
         core_index.latest_moment_boundary_turn_id(),
     );
-    let (mut messages, used_chars, breath_idx) = build_memory_cover_messages(
+    let (mut messages, used_chars, breath_idx, cover_end_key) = build_memory_cover_messages(
         ws,
         &index,
         body_budget_chars,
         moment_boundary_end_key,
     )?;
 
+    // The moment floor is the later of: the breath boundary and the memory cover's end.
+    // Turns at or before this point are already summarized in memory and should be skipped.
+    let moment_floor = match (moment_boundary_end_key, cover_end_key) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+
     // Insert breath boundary between memory and moment segments.
     // Mirrors what happens when the model calls the `breath` faculty.
-    if !messages.is_empty() {
+    {
         let fill_pct = if body_budget_chars > 0 {
             (used_chars * 100) / body_budget_chars
         } else {
             0
         };
-        let now = now_epoch();
         let breath_output = format!(
-            "{} — context filled to {fill_pct}%. present moment begins.",
-            format_tai_timestamp(now),
+            "context filled to {fill_pct}%. present moment begins.",
         );
         messages.insert(breath_idx, ChatMessage::user(breath_output));
         messages.insert(breath_idx, ChatMessage::assistant(format!("breath {fill_pct}")));
     }
 
     // Project post-boundary exec results as raw shell interaction turns.
-    if let Some(boundary) = moment_boundary_end_key {
+    // Budget-aware: keep the most recent turns that fit in the remaining body budget.
+    {
+        let breath_chars = messages.iter().map(|m| m.content.chars().count()).sum::<usize>();
+        let moment_budget = body_budget_chars.saturating_sub(used_chars).saturating_sub(breath_chars);
+
+        // Collect moment turns in chronological order with their cost.
+        struct MomentTurn {
+            messages: Vec<ChatMessage>,
+            cost: usize,
+        }
+        let mut moment_turns: Vec<MomentTurn> = Vec::new();
+
         for result in &results {
             let Some(finished_at) = result.finished_at else {
                 continue;
             };
-            if interval_key(finished_at) <= boundary {
-                continue;
+            if let Some(floor) = moment_floor {
+                if interval_key(finished_at) <= floor {
+                    continue;
+                }
             }
             let projection = load_exec_turn_projection(ws, core_index, result)?;
             let exec_output = load_exec_result(ws, result.clone())?;
 
+            let mut turn_messages = Vec::new();
+            let mut turn_cost = 0usize;
+
             for event in &projection.reason_events {
                 if should_project_reason_event(event) {
-                    messages.push(ChatMessage::assistant(synthetic_reason_command(&event.text)));
-                    messages.push(ChatMessage::user(synthetic_reason_output_brief(event)));
+                    let cmd = synthetic_reason_command(&event.text);
+                    let out = synthetic_reason_output_brief(event);
+                    turn_cost += cmd.chars().count() + out.chars().count();
+                    turn_messages.push(ChatMessage::assistant(cmd));
+                    turn_messages.push(ChatMessage::user(out));
                 }
             }
 
-            messages.push(ChatMessage::assistant(projection.command));
             let timestamp = format_tai_interval_timestamp(finished_at);
-            messages.push(ChatMessage::user(format!("{timestamp}\n{}", format_moment_output(&exec_output))));
+            let output = format!("{timestamp}\n{}", format_moment_output(&exec_output));
+            turn_cost += projection.command.chars().count() + output.chars().count();
+            turn_messages.push(ChatMessage::assistant(projection.command));
+            turn_messages.push(ChatMessage::user(output));
+
+            moment_turns.push(MomentTurn { messages: turn_messages, cost: turn_cost });
+        }
+
+        // Drop oldest turns until total fits in budget, keeping the most recent.
+        let mut total_cost: usize = moment_turns.iter().map(|t| t.cost).sum();
+        while total_cost > moment_budget && moment_turns.len() > 1 {
+            total_cost -= moment_turns.remove(0).cost;
+        }
+
+        for turn in moment_turns {
+            messages.extend(turn.messages);
         }
     }
 
@@ -2055,15 +2006,17 @@ struct SplitCandidate {
     range_width: i128,
 }
 
-/// Returns (messages, used_chars, breath_insert_index).
+/// Returns (messages, used_chars, breath_insert_index, cover_end_key).
+/// `cover_end_key` is the latest `end_at` across all selected cover chunks —
+/// moment turns at or before this time are already summarized and should be skipped.
 fn build_memory_cover_messages(
     ws: &mut Workspace<Pile>,
     index: &ContextChunkIndex,
     budget_chars: usize,
     moment_boundary_end_key: Option<i128>,
-) -> Result<(Vec<ChatMessage>, usize, usize)> {
+) -> Result<(Vec<ChatMessage>, usize, usize, Option<i128>)> {
     if budget_chars == 0 {
-        return Ok((Vec::new(), 0, 0));
+        return Ok((Vec::new(), 0, 0, None));
     }
 
     // Start from roots (already sorted by time). Exclude post-boundary chunks:
@@ -2082,7 +2035,7 @@ fn build_memory_cover_messages(
         })
         .collect();
     if cover.is_empty() {
-        return Ok((Vec::new(), 0, 0));
+        return Ok((Vec::new(), 0, 0, None));
     }
 
     let mut turn_cache: HashMap<Id, MemoryCoverTurn> = HashMap::new();
@@ -2100,7 +2053,7 @@ fn build_memory_cover_messages(
         used = used.saturating_sub(turn.cost);
     }
     if cover.is_empty() {
-        return Ok((Vec::new(), 0, 0));
+        return Ok((Vec::new(), 0, 0, None));
     }
 
     loop {
@@ -2152,6 +2105,13 @@ fn build_memory_cover_messages(
         used = used.saturating_add(candidate.extra_cost);
     }
 
+    // Compute the latest end_at across all selected cover chunks.
+    let cover_end_key = cover
+        .iter()
+        .filter_map(|id| index.chunks.get(id))
+        .map(|chunk| interval_key(chunk.end_at))
+        .max();
+
     let mut messages = Vec::new();
     for chunk_id in cover {
         let turn = memory_cover_turn(ws, index, &mut turn_cache, chunk_id)?;
@@ -2162,7 +2122,7 @@ fn build_memory_cover_messages(
     // All cover entries are memory (post-boundary chunks are excluded above),
     // so breath goes at the end.
     let breath_insert_index = messages.len();
-    Ok((messages, used, breath_insert_index))
+    Ok((messages, used, breath_insert_index, cover_end_key))
 }
 
 fn memory_cover_turn(

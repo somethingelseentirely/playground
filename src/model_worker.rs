@@ -24,7 +24,7 @@ use crate::chat_prompt::{ChatMessage, ChatRole};
 use crate::config::Config;
 use crate::repo_util::{
     close_repo, current_branch_head, ensure_worker_name, init_repo, load_text, pull_workspace,
-    push_workspace, refresh_cached_checkout, seed_metadata,
+    push_workspace, refresh_cached_checkout,
 };
 use crate::schema::model_chat;
 use crate::time_util::{epoch_interval, interval_key, now_epoch};
@@ -278,7 +278,6 @@ pub(crate) fn run_model_loop(
 ) -> Result<()> {
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
     let result = (|| -> Result<()> {
-        seed_metadata(&mut repo)?;
         let label = format!("model-{}", id_prefix(worker_id));
         ensure_worker_name(&mut repo, branch_id, worker_id, &label)?;
         let mut cached_head = None;
@@ -331,7 +330,7 @@ pub(crate) fn run_model_loop(
                         model_chat::attempt: attempt,
                         model_chat::error: handle,
                     };
-                    ws.commit(change, None, Some("model_chat result (context parse error)"));
+                    ws.commit(change, "model_chat result (context parse error)");
                     push_workspace(&mut repo, &mut ws).context("push context parse error")?;
                     sleep(Duration::from_millis(poll_ms));
                     continue;
@@ -356,7 +355,7 @@ pub(crate) fn run_model_loop(
                 model_chat::worker: worker_id,
                 model_chat::attempt: attempt,
             };
-            ws.commit(change, None, Some("model_chat in_progress"));
+            ws.commit(change, "model_chat in_progress");
             push_workspace(&mut repo, &mut ws).context("push in_progress")?;
 
             let result = client.send_payload(&payload);
@@ -372,7 +371,6 @@ pub(crate) fn run_model_loop(
             };
 
             let mut import_data = None;
-            let mut import_metadata = None;
 
             match result {
                 Ok(result) => {
@@ -402,10 +400,6 @@ pub(crate) fn run_model_loop(
                         JsonObjectImporter::<_, Blake3>::new(&mut import_blobs, None);
                     match importer.import_blob(raw_blob) {
                         Ok(fragment) => {
-                            let metadata = importer
-                                .metadata()
-                                .context("build response import metadata")?
-                                .into_facts();
                             let import_reader = import_blobs
                                 .reader()
                                 .context("read response import blobs")?;
@@ -420,7 +414,6 @@ pub(crate) fn run_model_loop(
                             }
 
                             import_data = Some(fragment);
-                            import_metadata = Some(metadata);
                         }
                         Err(err) => {
                             eprintln!("Failed to import response JSON: {err}");
@@ -435,10 +428,10 @@ pub(crate) fn run_model_loop(
                 }
             }
 
-            if let (Some(data), Some(metadata)) = (import_data, import_metadata) {
-                ws.commit(data, Some(metadata), Some("import response json"));
+            if let Some(data) = import_data {
+                ws.commit(data, "import response json");
             }
-            ws.commit(change, None, Some("model_chat result"));
+            ws.commit(change, "model_chat result");
             push_workspace(&mut repo, &mut ws).context("push result")?;
         }
 
@@ -792,12 +785,16 @@ fn build_anthropic_payload(
     }
 
     // Extended thinking support.
+    // The Anthropic API requires max_tokens > budget_tokens, where max_tokens
+    // is the total envelope (thinking + output). So we set budget_tokens based
+    // on reasoning effort and then raise max_tokens to fit both.
     if let Some(ref effort) = config.model.reasoning_effort {
         let budget = match effort.as_str() {
             "low" => max_tokens.max(1024),
             "medium" => max_tokens.saturating_mul(2).max(2048),
             _ => max_tokens.saturating_mul(4).max(4096),
         };
+        payload["max_tokens"] = serde_json::json!(budget + max_tokens);
         payload["thinking"] = serde_json::json!({
             "type": "enabled",
             "budget_tokens": budget,
@@ -1264,7 +1261,8 @@ mod tests {
         let path = test_repo_path();
         let mut pile = Pile::<Blake3>::open(path.as_path()).expect("open test pile");
         pile.restore().expect("restore test pile");
-        let mut repo = Repository::new(pile, SigningKey::from_bytes(&[7u8; 32]));
+        let mut repo = Repository::new(pile, SigningKey::from_bytes(&[7u8; 32]), TribleSet::new())
+            .expect("create test repository");
         let branch_id = repo
             .create_branch("test", None)
             .expect("create test branch")

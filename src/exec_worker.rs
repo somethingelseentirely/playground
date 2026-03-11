@@ -20,17 +20,15 @@ use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
-use crate::branch_util::ensure_branch;
 use crate::config::Config;
 use crate::repo_util::{
     close_repo, current_branch_head, ensure_worker_name, init_repo, load_text, pull_workspace,
-    push_workspace, refresh_cached_checkout, seed_metadata,
+    push_workspace, refresh_cached_checkout,
 };
 use crate::schema::playground_exec;
 use crate::time_util::{epoch_interval, interval_key, now_epoch};
-use crate::workspace_snapshot::{DEFAULT_WORKSPACE_BRANCH, restore_snapshot_merge};
+use crate::workspace_snapshot::restore_snapshot_merge;
 
-const CONFIG_BRANCH_ID_HEX: &str = "4790808CF044F979FC7C2E47FCCB4A64";
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 300_000;
 const EXEC_CONTROL_POLL_MS: u64 = 100;
 
@@ -65,7 +63,6 @@ pub(crate) struct ExecOutput {
 #[derive(Debug, Clone)]
 pub(crate) struct ExecCommandEnv {
     pub(crate) pile: String,
-    pub(crate) config_branch_id: String,
     pub(crate) worker_id: String,
     pub(crate) turn_id: String,
     /// Additional env vars (e.g. FORK_LENS_ID, FORK_EVENT_TIME).
@@ -86,7 +83,6 @@ pub(crate) fn run_exec_loop(
 
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
     let result = (|| -> Result<()> {
-        seed_metadata(&mut repo)?;
         let label = format!("exec-{}", id_prefix(worker_id));
         ensure_worker_name(&mut repo, branch_id, worker_id, &label)?;
         maybe_bootstrap_workspace(&mut repo, &config)?;
@@ -126,7 +122,6 @@ pub(crate) fn run_exec_loop(
             let attempt: u64 = 1;
             let env = ExecCommandEnv {
                 pile: config.pile_path.to_string_lossy().to_string(),
-                config_branch_id: CONFIG_BRANCH_ID_HEX.to_string(),
                 worker_id: format!("{worker_id:x}"),
                 turn_id: format!("{request_id:x}", request_id = request.id),
                 extra: Vec::new(),
@@ -142,7 +137,7 @@ pub(crate) fn run_exec_loop(
                 playground_exec::started_at: started_at,
                 playground_exec::attempt: attempt,
             };
-            ws.commit(change, None, Some("playground_exec in_progress"));
+            ws.commit(change, "playground_exec in_progress");
             push_workspace(&mut repo, &mut ws).context("push in_progress")?;
 
             let initial_timeout_ms = request
@@ -227,7 +222,7 @@ pub(crate) fn run_exec_loop(
                 change += entity! { &result_id @ playground_exec::error: handle };
             }
 
-            ws.commit(change, None, Some("playground_exec result"));
+            ws.commit(change, "playground_exec result");
             push_workspace(&mut repo, &mut ws).context("push result")?;
         }
 
@@ -272,7 +267,6 @@ pub(crate) fn execute_command(
     };
     cmd.env("PATH", merged_path);
     cmd.env("PILE", &env.pile);
-    cmd.env("CONFIG_BRANCH_ID", &env.config_branch_id);
     cmd.env("WORKER_ID", &env.worker_id);
     cmd.env("TURN_ID", &env.turn_id);
     for (key, value) in &env.extra {
@@ -465,21 +459,17 @@ fn format_timeout_hint(duration: Duration) -> String {
     )
 }
 
-fn maybe_bootstrap_workspace(repo: &mut Repository<Pile>, config: &Config) -> Result<()> {
+fn maybe_bootstrap_workspace(repo: &mut Repository<Pile>, _config: &Config) -> Result<()> {
     let root = PathBuf::from("/workspace");
-    let branch_id = config.workspace_branch_id.ok_or_else(|| {
-        anyhow!(
-            "config missing workspace_branch_id; run `playground config set workspace-branch-id <ID>`"
-        )
-    })?;
+    let branch_id = repo
+        .ensure_branch("workspace", None)
+        .map_err(|e| anyhow!("ensure workspace branch: {e:?}"))?;
 
     if !root.exists() {
         fs::create_dir_all(&root)
             .with_context(|| format!("create workspace root {}", root.display()))?;
     }
 
-    ensure_branch(repo, branch_id, DEFAULT_WORKSPACE_BRANCH)
-        .with_context(|| format!("ensure workspace branch {branch_id:x}"))?;
     if let Some(report) = restore_snapshot_merge(repo, branch_id, None, &root)? {
         if report.created_entries > 0 || report.conflicting_entries > 0 {
             eprintln!(

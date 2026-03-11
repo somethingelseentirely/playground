@@ -1,4 +1,3 @@
-use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
@@ -13,9 +12,6 @@ pub mod playground_archive {
         "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<Blake3, LongString>;
         "0DA5DD275AA34F86B0297CC35F1B7395" as pub created_at: NsTAIInterval;
     }
-
-    #[allow(non_upper_case_globals)]
-    pub const kind_message: Id = id_hex!("1A0841C92BBDA0A26EA9A8252D6ECD9B");
 }
 
 pub mod playground_archive_import {
