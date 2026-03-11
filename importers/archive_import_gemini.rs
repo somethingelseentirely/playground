@@ -135,7 +135,7 @@ fn import_gemini_parsed_file(
     let mut change = TribleSet::new();
     let mut author_cache: HashMap<String, Id> = HashMap::new();
     let conversation_fragment = entity! { _ @
-        common::import_schema::kind: common::import_schema::kind_conversation,
+        common::metadata::tag: common::import_schema::kind_conversation,
         common::import_schema::source_format: "gemini",
         common::import_schema::source_conversation_id: ws.put(conversation_id),
     };
@@ -178,7 +178,7 @@ fn import_gemini_parsed_file(
             .map(|(_, parent_source_id)| ws.put(parent_source_id.clone()));
         let content_handle = ws.put(message.content.clone());
         change += entity! { &message_entity @
-            common::archive::kind: common::archive::kind_message,
+            common::metadata::tag: common::archive::kind_message,
             common::archive::author: author_id,
             common::archive::content: content_handle,
             common::archive::created_at: created_at,
@@ -211,7 +211,6 @@ fn import_gemini_parsed_file(
         catalog,
         catalog_head,
         change,
-        None,
         "import gemini",
     )? {
         stats.commits += 1;

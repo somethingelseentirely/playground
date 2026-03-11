@@ -48,10 +48,6 @@ fn import_copilot_path(
         .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
     let mut catalog = ws.checkout(..).context("checkout workspace")?;
     let mut catalog_head = ws.head();
-    let json_tree_metadata =
-        triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
-            .into_facts();
     println!("copilot phase pull: done in {:?}", start.elapsed());
 
     if path.is_dir() {
@@ -87,7 +83,6 @@ fn import_copilot_path(
                 &mut ws,
                 &mut catalog,
                 &mut catalog_head,
-                &json_tree_metadata,
             )
             .with_context(|| format!("import {}", file.display()))?;
             total.files += stats.files;
@@ -122,7 +117,6 @@ fn import_copilot_path(
         &mut ws,
         &mut catalog,
         &mut catalog_head,
-        &json_tree_metadata,
     )
 }
 
@@ -133,7 +127,6 @@ fn import_copilot_parsed_file(
     ws: &mut common::Ws,
     catalog: &mut TribleSet,
     catalog_head: &mut Option<common::CommitHandle>,
-    json_tree_metadata: &TribleSet,
 ) -> Result<ImportStats> {
     let ParsedCopilotFile {
         raw,
@@ -168,7 +161,6 @@ fn import_copilot_parsed_file(
             catalog,
             catalog_head,
             fragment.facts().clone(),
-            Some(json_tree_metadata),
             "import copilot json tree",
         )? {
             stats.commits += 1;
@@ -185,7 +177,7 @@ fn import_copilot_parsed_file(
     records.sort_by_key(|m| m.order);
 
     let conversation_fragment = entity! { _ @
-        common::import_schema::kind: common::import_schema::kind_conversation,
+        common::metadata::tag: common::import_schema::kind_conversation,
         common::import_schema::source_format: "copilot",
         common::import_schema::source_conversation_id: ws.put(conversation_id.clone()),
         common::import_schema::source_raw_root: raw_root,
@@ -234,7 +226,7 @@ fn import_copilot_parsed_file(
             .map(|(_, parent_source_id)| ws.put(parent_source_id.clone()));
         let content_handle = ws.put(message.content.clone());
         change += entity! { &message_entity @
-            common::archive::kind: common::archive::kind_message,
+            common::metadata::tag: common::archive::kind_message,
             common::archive::author: author_id,
             common::archive::content: content_handle,
             common::archive::created_at: created_at,
@@ -267,7 +259,6 @@ fn import_copilot_parsed_file(
         catalog,
         catalog_head,
         change,
-        None,
         "import copilot",
     )? {
         stats.commits += 1;

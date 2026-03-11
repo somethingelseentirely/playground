@@ -32,10 +32,6 @@ fn import_chatgpt_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> R
         .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
     let mut catalog = ws.checkout(..).context("checkout workspace")?;
     let mut catalog_head = ws.head();
-    let json_tree_metadata =
-        triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
-            .into_facts();
     println!("chatgpt phase pull: done in {:?}", start.elapsed());
 
     if path.is_dir() {
@@ -71,7 +67,6 @@ fn import_chatgpt_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> R
                 &mut ws,
                 &mut catalog,
                 &mut catalog_head,
-                &json_tree_metadata,
             )
             .with_context(|| format!("import {}", convo_path.display()))?;
             total.conversations += stats.conversations;
@@ -108,7 +103,6 @@ fn import_chatgpt_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> R
         &mut ws,
         &mut catalog,
         &mut catalog_head,
-        &json_tree_metadata,
     )
 }
 
@@ -119,7 +113,6 @@ fn import_chatgpt_parsed_file(
     ws: &mut common::Ws,
     catalog: &mut TribleSet,
     catalog_head: &mut Option<common::CommitHandle>,
-    json_tree_metadata: &TribleSet,
 ) -> Result<ImportStats> {
     let ParsedChatgptFile { conversations } = parsed;
     let total_conversations = conversations.len();
@@ -173,7 +166,6 @@ fn import_chatgpt_parsed_file(
             catalog,
             catalog_head,
             raw_fragment.facts().clone(),
-            Some(json_tree_metadata),
             "import chatgpt json tree",
         )? {
             stats.commits += 1;
@@ -190,7 +182,7 @@ fn import_chatgpt_parsed_file(
             .ok_or_else(|| anyhow!("conversation {convo_id} missing mapping"))?;
 
         let conversation_fragment = entity! { _ @
-            common::import_schema::kind: common::import_schema::kind_conversation,
+            common::metadata::tag: common::import_schema::kind_conversation,
             common::import_schema::source_format: "chatgpt",
             common::import_schema::source_conversation_id: ws.put(convo_id.to_string()),
             common::import_schema::source_raw_root: raw_root,
@@ -285,7 +277,7 @@ fn import_chatgpt_parsed_file(
                 } = attachment;
                 let source_id_handle = ws.put(source_id.clone());
                 let attachment_fragment = entity! { _ @
-                    common::archive::kind: common::archive::kind_attachment,
+                    common::metadata::tag: common::archive::kind_attachment,
                     common::archive::attachment_source_id: source_id_handle,
                 };
                 let attachment_id = attachment_fragment
@@ -318,7 +310,7 @@ fn import_chatgpt_parsed_file(
                 }
 
                 change += entity! { &attachment_entity @
-                    common::archive::kind: common::archive::kind_attachment,
+                    common::metadata::tag: common::archive::kind_attachment,
                     common::archive::attachment_source_id: source_id_handle,
                     common::archive::attachment_source_pointer?: source_pointer_handle,
                     common::archive::attachment_name?: attachment_name,
@@ -342,7 +334,7 @@ fn import_chatgpt_parsed_file(
                 .unwrap_or((None, None));
 
             change += entity! { &message_entity @
-                common::archive::kind: common::archive::kind_message,
+                common::metadata::tag: common::archive::kind_message,
                 common::archive::author: author_id,
                 common::archive::content: content_handle,
                 common::archive::created_at: created_at,
@@ -364,7 +356,6 @@ fn import_chatgpt_parsed_file(
             catalog,
             catalog_head,
             change,
-            None,
             "import chatgpt",
         )? {
             stats.commits += 1;

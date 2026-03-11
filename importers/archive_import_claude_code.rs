@@ -45,10 +45,6 @@ fn import_claude_code_path(
         .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
     let mut catalog = ws.checkout(..).context("checkout workspace")?;
     let mut catalog_head = ws.head();
-    let json_tree_metadata =
-        triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
-            .into_facts();
     println!("claude-code phase pull: done in {:?}", start.elapsed());
 
     if path.is_dir() {
@@ -88,7 +84,6 @@ fn import_claude_code_path(
                 &mut ws,
                 &mut catalog,
                 &mut catalog_head,
-                &json_tree_metadata,
             )
             .with_context(|| format!("import {}", file.display()))?;
             total.files += stats.files;
@@ -119,7 +114,6 @@ fn import_claude_code_path(
         &mut ws,
         &mut catalog,
         &mut catalog_head,
-        &json_tree_metadata,
     )
 }
 
@@ -130,7 +124,6 @@ fn import_claude_code_records(
     ws: &mut common::Ws,
     catalog: &mut TribleSet,
     catalog_head: &mut Option<common::CommitHandle>,
-    json_tree_metadata: &TribleSet,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats {
         files: 1,
@@ -162,7 +155,6 @@ fn import_claude_code_records(
             catalog,
             catalog_head,
             fragment.facts().clone(),
-            Some(json_tree_metadata),
             "import claude-code json tree",
         )? {
             stats.commits += 1;
@@ -232,7 +224,7 @@ fn import_claude_code_records(
         // --- Pass 2: create conversation entity (identity = format + session id). ---
         // The conversation is a stable g-set: message edges accumulate monotonically.
         let conversation_fragment = entity! { _ @
-            common::import_schema::kind: common::import_schema::kind_conversation,
+            common::metadata::tag: common::import_schema::kind_conversation,
             common::import_schema::source_format: "claude-code",
             common::import_schema::source_conversation_id: ws.put(conversation_id_str.clone()),
         };
@@ -287,7 +279,7 @@ fn import_claude_code_records(
             let model_handle = msg.model.as_ref().map(|m| ws.put(m.clone()));
 
             change += entity! { &message_entity @
-                common::archive::kind: common::archive::kind_message,
+                common::metadata::tag: common::archive::kind_message,
                 common::archive::author: author_id,
                 common::archive::content: content_handle,
                 common::archive::created_at: created_at,
@@ -326,7 +318,6 @@ fn import_claude_code_records(
         catalog,
         catalog_head,
         change,
-        None,
         "import claude-code",
     )? {
         stats.commits += 1;
