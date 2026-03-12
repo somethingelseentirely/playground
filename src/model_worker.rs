@@ -785,31 +785,50 @@ fn build_anthropic_payload(
         }));
     }
 
-    // Add cache_control breakpoints to every user message except the last.
-    // The last user message contains a changing context-pressure suffix, so it
-    // must NOT be cached.  Everything before it — memory cover, static breath,
-    // and stable moment turns — benefits from prefix caching.
-    // NOTE: this must happen BEFORE building the payload, because json!()
-    // deep-copies api_messages via to_value().
+    // Strategic cache_control breakpoint placement (max 4 per request).
+    // We place 2 on messages (no system prompt breakpoint needed — it's always
+    // the prefix start and is implicitly covered by any message cache hit):
+    //   1. Breath user message ("present moment begins.") — stable memory boundary.
+    //      The 20-block lookback from this breakpoint finds the longest cached
+    //      memory prefix, even after compaction (memory cover delay in main.rs
+    //      ensures the old prefix gets one more cached turn before switching).
+    //   2. Second-to-last user message — growing conversation edge.
+    //      The last message has a changing fill_pct suffix and is intentionally
+    //      uncached. When the next turn arrives, it becomes second-to-last
+    //      (clean, without fill_pct), naturally extending the cached prefix.
+    // NOTE: must happen BEFORE building the payload (json!() deep-copies).
     {
-        let last_user_idx = api_messages.iter().rposition(|m| {
+        let breath_idx = api_messages.iter().position(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .map_or(false, |t| t == "present moment begins.")
         });
 
-        for (i, msg) in api_messages.iter_mut().enumerate() {
-            if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
-                continue;
+        let user_indices: Vec<usize> = api_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .map(|(i, _)| i)
+            .collect();
+        let second_to_last_user_idx = if user_indices.len() >= 2 {
+            Some(user_indices[user_indices.len() - 2])
+        } else {
+            None
+        };
+
+        let mut breakpoints: Vec<usize> = Vec::new();
+        if let Some(idx) = breath_idx {
+            breakpoints.push(idx);
+        }
+        if let Some(idx) = second_to_last_user_idx {
+            if !breakpoints.contains(&idx) {
+                breakpoints.push(idx);
             }
-            if Some(i) == last_user_idx {
-                continue;
-            }
-            if let Some(text) = msg.get("content").and_then(|c| c.as_str()).map(String::from) {
-                msg["content"] = serde_json::json!([{
-                    "type": "text",
-                    "text": text,
-                    "cache_control": { "type": "ephemeral" },
-                }]);
-            }
+        }
+
+        for idx in breakpoints {
+            apply_message_cache_control(&mut api_messages[idx]);
         }
     }
 
@@ -822,12 +841,7 @@ fn build_anthropic_payload(
     });
 
     if !system_parts.is_empty() {
-        // System prompt is extremely stable — cache it.
-        payload["system"] = serde_json::json!([{
-            "type": "text",
-            "text": system_parts.join("\n\n"),
-            "cache_control": { "type": "ephemeral" },
-        }]);
+        payload["system"] = serde_json::Value::String(system_parts.join("\n\n"));
     }
 
     // Extended thinking support.
@@ -848,6 +862,22 @@ fn build_anthropic_payload(
     }
 
     payload
+}
+
+/// Adds `cache_control` to a message's content.
+/// String content is wrapped in a content array; array content gets the tag on its last element.
+fn apply_message_cache_control(msg: &mut JsonValue) {
+    if let Some(text) = msg.get("content").and_then(|c| c.as_str()).map(String::from) {
+        msg["content"] = serde_json::json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": { "type": "ephemeral" },
+        }]);
+    } else if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+        if let Some(last) = content.last_mut() {
+            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+        }
+    }
 }
 
 fn build_anthropic_input_content(
@@ -1451,17 +1481,12 @@ mod tests {
             ];
             let payload = build_anthropic_payload(&config, ws, "claude-sonnet-4-6", &messages);
 
-            // System prompt should be a top-level content array with cache_control.
-            let system = payload
-                .get("system")
-                .and_then(JsonValue::as_array)
-                .expect("system field should be array");
-            assert_eq!(system.len(), 1);
+            // System prompt should be a plain string (no cache_control — implicitly
+            // covered by message-level cache hits).
             assert_eq!(
-                system[0].get("text").and_then(JsonValue::as_str),
+                payload.get("system").and_then(JsonValue::as_str),
                 Some("You are helpful.")
             );
-            assert!(system[0].get("cache_control").is_some());
 
             // Messages should only contain user/assistant, no system.
             let msgs = payload
@@ -1473,6 +1498,63 @@ mod tests {
                 let role = msg.get("role").and_then(JsonValue::as_str).unwrap();
                 assert_ne!(role, "system");
             }
+        });
+    }
+
+    #[test]
+    fn anthropic_cache_control_strategic_breakpoints() {
+        with_test_workspace(|ws| {
+            let config = test_config();
+            // Simulate: system, memory turns, breath, moment turns.
+            let messages = vec![
+                ChatMessage::system("You are helpful."),
+                ChatMessage::user("memory block 1"),
+                ChatMessage::assistant("ack"),
+                ChatMessage::assistant("breath"),
+                ChatMessage::user("present moment begins."),
+                ChatMessage::user("turn 1"),
+                ChatMessage::assistant("response 1"),
+                ChatMessage::user("turn 2"),
+                ChatMessage::assistant("response 2"),
+                ChatMessage::user("turn 3\ncontext filled to 42%."),
+            ];
+            let payload = build_anthropic_payload(&config, ws, "claude-sonnet-4-6", &messages);
+            let msgs = payload
+                .get("messages")
+                .and_then(JsonValue::as_array)
+                .expect("messages array");
+
+            // Helper: check if a message has cache_control in its content array.
+            let has_cache = |m: &JsonValue| -> bool {
+                m.get("content")
+                    .and_then(|c| c.as_array())
+                    .map_or(false, |arr| arr.iter().any(|b| b.get("cache_control").is_some()))
+            };
+
+            // Count cache_control blocks in messages.
+            let cached_count = msgs.iter().filter(|m| has_cache(m)).count();
+            assert!(
+                cached_count <= 3,
+                "expected at most 3 message breakpoints, got {cached_count}"
+            );
+
+            // Breath user message (index 3 after removing system) should have a breakpoint.
+            assert!(
+                has_cache(&msgs[3]),
+                "breath user message should have cache_control"
+            );
+
+            // Second-to-last user message ("turn 2", index 6) should have a breakpoint.
+            assert!(
+                has_cache(&msgs[6]),
+                "second-to-last user message should have cache_control"
+            );
+
+            // Last user message (with fill_pct) should NOT have a breakpoint.
+            assert!(
+                !has_cache(&msgs[msgs.len() - 1]),
+                "last user message should not have cache_control"
+            );
         });
     }
 

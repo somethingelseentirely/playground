@@ -685,7 +685,8 @@ fn run_loop(config: Config) -> Result<()> {
     let exec_profile = config.exec.sandbox_profile;
 
     let result = (|| -> Result<()> {
-        let mut request_info = ensure_model_request(&mut repo, branch_id, &config)?;
+        let mut prev_cover: Option<MemoryCoverState> = None;
+        let mut request_info = ensure_model_request(&mut repo, branch_id, &config, &mut prev_cover)?;
 
         loop {
             let model_result =
@@ -701,6 +702,7 @@ fn run_loop(config: Config) -> Result<()> {
                     branch_id,
                     request_info.thought_id,
                     &config,
+                    &mut prev_cover,
                 )?;
                 sleep(Duration::from_millis(config.poll_ms));
                 continue;
@@ -722,7 +724,7 @@ fn run_loop(config: Config) -> Result<()> {
             let command_result_id =
                 wait_for_command_result(&mut repo, branch_id, command_request_id, config.poll_ms)?;
             request_info =
-                create_thought_and_request(&mut repo, branch_id, Some(command_result_id), &config)?;
+                create_thought_and_request(&mut repo, branch_id, Some(command_result_id), &config, &mut prev_cover)?;
         }
         Ok(())
     })();
@@ -741,6 +743,16 @@ fn run_loop(config: Config) -> Result<()> {
 struct ModelRequestInfo {
     id: Id,
     thought_id: Option<Id>,
+}
+
+/// Snapshot of the memory cover from the last context we sent.
+/// Used to detect changes and delay context updates by one turn so that the
+/// Anthropic prompt cache can seed entries for the old prefix before switching.
+struct MemoryCoverState {
+    messages: Vec<ChatMessage>,
+    used_chars: usize,
+    breath_idx: usize,
+    cover_end_key: Option<i128>,
 }
 
 #[derive(Debug, Clone)]
@@ -816,6 +828,7 @@ fn ensure_model_request(
     repo: &mut Repository<Pile>,
     branch_id: Id,
     config: &Config,
+    prev_cover: &mut Option<MemoryCoverState>,
 ) -> Result<ModelRequestInfo> {
     let mut cached_head = None;
     let mut cached_catalog = TribleSet::new();
@@ -842,7 +855,7 @@ fn ensure_model_request(
 
         if let Some(exec_result) = core_index.latest_unprocessed_exec_result() {
             drop(ws);
-            return create_thought_and_request(repo, branch_id, Some(exec_result.id), config);
+            return create_thought_and_request(repo, branch_id, Some(exec_result.id), config, prev_cover);
         }
 
         if let Some(request) = core_index.latest_pending_model_request() {
@@ -863,7 +876,7 @@ fn ensure_model_request(
         // The breath is injected into the context, giving the model
         // enough to decide its first action.
         drop(ws);
-        return create_thought_and_request(repo, branch_id, None, config);
+        return create_thought_and_request(repo, branch_id, None, config, prev_cover);
     }
 }
 
@@ -872,6 +885,7 @@ fn create_thought_and_request(
     branch_id: Id,
     about_exec_result: Option<Id>,
     config: &Config,
+    prev_cover: &mut Option<MemoryCoverState>,
 ) -> Result<ModelRequestInfo> {
     let mut ws = pull_workspace(repo, branch_id, "pull workspace for thought")?;
     let catalog = ws.checkout(..).context("checkout workspace")?;
@@ -905,14 +919,24 @@ fn create_thought_and_request(
             &memory_catalog,
             exec_result_id,
             config,
+            prev_cover,
         )?
     } else {
         // Cold start: no exec result yet. Build a minimal context with
         // memory cover + breath so the model can orient itself.
         let index = load_context_chunks(&memory_catalog);
         let body_budget_chars = context_body_budget_chars(config);
-        let (mut messages, used_chars, breath_idx, _cover_end_key) =
+        let (mut messages, used_chars, breath_idx, cover_end_key) =
             build_memory_cover_messages(&mut ws, &index, body_budget_chars, None)?;
+
+        // Record as the initial cover state (no delay on first request).
+        *prev_cover = Some(MemoryCoverState {
+            messages: messages.clone(),
+            used_chars,
+            breath_idx,
+            cover_end_key,
+        });
+
         let fill_pct = if body_budget_chars > 0 {
             (used_chars * 100) / body_budget_chars
         } else {
@@ -992,6 +1016,7 @@ fn retry_model_request(
     branch_id: Id,
     thought_id: Option<Id>,
     config: &Config,
+    prev_cover: &mut Option<MemoryCoverState>,
 ) -> Result<ModelRequestInfo> {
     if let Some(thought_id) = thought_id {
         let mut ws = pull_workspace(repo, branch_id, "pull workspace for model retry")?;
@@ -1021,7 +1046,7 @@ fn retry_model_request(
         })
     } else {
         // No thought to retry — fall back to the full discovery chain.
-        ensure_model_request(repo, branch_id, config)
+        ensure_model_request(repo, branch_id, config, prev_cover)
     }
 }
 
@@ -1843,6 +1868,7 @@ fn context_for_exec_result_with_history(
     memory_catalog: &TribleSet,
     exec_result_id: Id,
     config: &Config,
+    prev_cover: &mut Option<MemoryCoverState>,
 ) -> Result<String> {
     let mut messages = build_context_messages(
         ws,
@@ -1850,6 +1876,7 @@ fn context_for_exec_result_with_history(
         memory_catalog,
         exec_result_id,
         config,
+        prev_cover,
     )?;
     messages.insert(0, ChatMessage::system(config.system_prompt.clone()));
     let context_json = serde_json::to_string(&messages).context("serialize context messages")?;
@@ -1862,6 +1889,7 @@ fn build_context_messages(
     memory_catalog: &TribleSet,
     exec_result_id: Id,
     config: &Config,
+    prev_cover: &mut Option<MemoryCoverState>,
 ) -> Result<Vec<ChatMessage>> {
     let index = load_context_chunks(memory_catalog);
     let body_budget_chars = context_body_budget_chars(config);
@@ -1880,12 +1908,43 @@ fn build_context_messages(
         results.as_slice(),
         core_index.latest_moment_boundary_turn_id(),
     );
-    let (mut messages, used_chars, breath_idx, cover_end_key) = build_memory_cover_messages(
-        ws,
-        &index,
-        body_budget_chars,
-        moment_boundary_end_key,
-    )?;
+    let (new_messages, new_used_chars, new_breath_idx, new_cover_end_key) =
+        build_memory_cover_messages(ws, &index, body_budget_chars, moment_boundary_end_key)?;
+
+    // Memory cover delay: if the cover changed since the last turn, use the
+    // old cover this turn (seeding the cache for the old prefix at the breath
+    // breakpoint). Track the new cover for comparison next turn.
+    let (mut messages, used_chars, breath_idx, cover_end_key) =
+        if let Some(ref prev) = *prev_cover {
+            if prev.messages != new_messages {
+                // Memory changed — use old cover this turn, record new for next.
+                let old = (
+                    prev.messages.clone(),
+                    prev.used_chars,
+                    prev.breath_idx,
+                    prev.cover_end_key,
+                );
+                *prev_cover = Some(MemoryCoverState {
+                    messages: new_messages,
+                    used_chars: new_used_chars,
+                    breath_idx: new_breath_idx,
+                    cover_end_key: new_cover_end_key,
+                });
+                old
+            } else {
+                // No change — use current, keep prev_cover as-is.
+                (new_messages, new_used_chars, new_breath_idx, new_cover_end_key)
+            }
+        } else {
+            // First call — record and use current.
+            *prev_cover = Some(MemoryCoverState {
+                messages: new_messages.clone(),
+                used_chars: new_used_chars,
+                breath_idx: new_breath_idx,
+                cover_end_key: new_cover_end_key,
+            });
+            (new_messages, new_used_chars, new_breath_idx, new_cover_end_key)
+        };
 
     // The moment floor is the later of: the breath boundary and the memory cover's end.
     // Turns at or before this point are already summarized in memory and should be skipped.
