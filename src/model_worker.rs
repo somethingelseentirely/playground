@@ -688,6 +688,12 @@ fn resolve_blob_image(
             .map(str::to_owned)
             .ok_or_else(|| "blob is not a supported image format".to_string())?,
     };
+    eprintln!(
+        "resolve_blob_image: digest={} size={} mime={}",
+        digest_hex,
+        bytes.len(),
+        mime,
+    );
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
     Ok((mime, encoded))
 }
