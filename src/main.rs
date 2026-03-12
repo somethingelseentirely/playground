@@ -434,7 +434,7 @@ fn ensure_lima_instance(instance: &str, config_path: &Path) -> Result<()> {
         .status();
 
     let status = Command::new("limactl")
-        .args(["start", "--name", instance, &config_path.to_string_lossy()])
+        .args(["start", "--tty=false", "--name", instance, &config_path.to_string_lossy()])
         .status()
         .context("run limactl start")?;
     if !status.success() {
