@@ -3018,17 +3018,10 @@ fn collect_reasoning_summary_row(
         let raw = load_text(ws, raw_handle).unwrap_or_default();
         let response_json = parse_response_json(&raw)?;
         let summaries = extract_reasoning_summaries(&response_json);
-        if summaries.is_empty() {
-            return None;
-        }
         summaries.join("\n")
     } else {
-        return None;
+        String::new()
     };
-
-    if summary.trim().is_empty() {
-        return None;
-    }
 
     let input_tokens = find!(
         (v: Value<U256BE>),
@@ -3049,6 +3042,13 @@ fn collect_reasoning_summary_row(
         (v: Value<U256BE>),
         pattern!(data, [{ result_id @ model_chat::cache_read_input_tokens: ?v }])
     ).into_iter().next().and_then(|(v,)| u256be_to_u64(v));
+
+    let has_content = !summary.trim().is_empty()
+        || input_tokens.is_some()
+        || output_tokens.is_some();
+    if !has_content {
+        return None;
+    }
 
     Some(ReasoningSummaryRow {
         result_id,
@@ -3125,19 +3125,18 @@ fn collect_reasoning_summaries(
             load_text(ws, handle).unwrap_or_default()
         } else if let Some(handle) = raw_by_result.get(&result_id).copied() {
             let raw = load_text(ws, handle).unwrap_or_default();
-            let Some(response_json) = parse_response_json(&raw) else {
-                continue;
-            };
-            let summaries = extract_reasoning_summaries(&response_json);
-            if summaries.is_empty() {
-                continue;
+            match parse_response_json(&raw) {
+                Some(response_json) => extract_reasoning_summaries(&response_json).join("\n"),
+                None => String::new(),
             }
-            summaries.join("\n")
         } else {
-            continue;
+            String::new()
         };
 
-        if summary.trim().is_empty() {
+        let it = input_tok.get(&result_id).copied();
+        let ot = output_tok.get(&result_id).copied();
+        let has_content = !summary.trim().is_empty() || it.is_some() || ot.is_some();
+        if !has_content {
             continue;
         }
 
@@ -3145,8 +3144,8 @@ fn collect_reasoning_summaries(
             result_id,
             created_at: Some(interval_key(finished_at)),
             summary,
-            input_tokens: input_tok.get(&result_id).copied(),
-            output_tokens: output_tok.get(&result_id).copied(),
+            input_tokens: it,
+            output_tokens: ot,
             cache_creation_input_tokens: cache_create_tok.get(&result_id).copied(),
             cache_read_input_tokens: cache_read_tok.get(&result_id).copied(),
         });
