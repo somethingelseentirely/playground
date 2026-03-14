@@ -1,21 +1,19 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use triblespace::core::blob::Bytes;
 use triblespace::core::blob::schemas::UnknownBlob;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::Workspace;
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
@@ -27,7 +25,6 @@ use crate::repo_util::{
 };
 use crate::schema::playground_exec;
 use crate::time_util::{epoch_interval, interval_key, now_epoch};
-use crate::workspace_snapshot::restore_snapshot_merge;
 
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 300_000;
 const EXEC_CONTROL_POLL_MS: u64 = 100;
@@ -85,7 +82,6 @@ pub(crate) fn run_exec_loop(
     let result = (|| -> Result<()> {
         let label = format!("exec-{}", id_prefix(worker_id));
         ensure_worker_name(&mut repo, branch_id, worker_id, &label)?;
-        maybe_bootstrap_workspace(&mut repo, &config)?;
         let mut cached_head = None;
         let mut cached_catalog = TribleSet::new();
         let mut request_index = CommandRequestIndex::default();
@@ -457,33 +453,6 @@ fn format_timeout_hint(duration: Duration) -> String {
         "command timed out after {:.1}s; for long-running work, retry with `patience <duration> -- <command>`",
         duration.as_secs_f64()
     )
-}
-
-fn maybe_bootstrap_workspace(repo: &mut Repository<Pile>, _config: &Config) -> Result<()> {
-    let root = PathBuf::from("/workspace");
-    let branch_id = repo
-        .ensure_branch("workspace", None)
-        .map_err(|e| anyhow!("ensure workspace branch: {e:?}"))?;
-
-    if !root.exists() {
-        fs::create_dir_all(&root)
-            .with_context(|| format!("create workspace root {}", root.display()))?;
-    }
-
-    if let Some(report) = restore_snapshot_merge(repo, branch_id, None, &root)? {
-        if report.created_entries > 0 || report.conflicting_entries > 0 {
-            eprintln!(
-                "workspace bootstrap: snapshot {snapshot:x}, lineage={}, merged={}, created={}, unchanged={}, conflicts={}",
-                report.lineage_len,
-                report.merged_entries,
-                report.created_entries,
-                report.unchanged_entries,
-                report.conflicting_entries,
-                snapshot = report.snapshot_id
-            );
-        }
-    }
-    Ok(())
 }
 
 impl CommandRequestIndex {

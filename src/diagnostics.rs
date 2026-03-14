@@ -38,7 +38,6 @@ use crate::schema::playground_cog;
 use crate::schema::playground_config;
 use crate::schema::playground_context;
 use crate::schema::playground_exec;
-use crate::schema::playground_workspace;
 
 mod archive {
     use triblespace::macros::id_hex;
@@ -115,7 +114,6 @@ const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
 const RELATIONS_SCROLL_HEIGHT: f32 = 260.0;
 const TEAMS_SCROLL_HEIGHT: f32 = 520.0;
 const TEAMS_CHAT_LIST_WIDTH: f32 = 220.0;
-const WORKSPACE_SNAPSHOT_LIMIT: usize = 10;
 const SNAPSHOT_REFRESH_MS: u64 = 1000;
 
 static DIAGNOSTICS_PILE_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -194,7 +192,6 @@ struct DashboardConfig {
     local_me: String,
     local_peer: String,
     teams_branches: String,
-    workspace_branches: String,
 }
 
 impl Default for DashboardConfig {
@@ -213,7 +210,6 @@ impl Default for DashboardConfig {
             local_me: "jp".to_string(),
             local_peer: "agent".to_string(),
             teams_branches: "teams".to_string(),
-            workspace_branches: "workspace".to_string(),
         }
     }
 }
@@ -232,7 +228,6 @@ struct DashboardState {
     config_last_applied_id: Option<Id>,
     compass_expanded_goal: Option<Id>,
     teams_selected_chat: Option<Id>,
-    workspace_selected_snapshot: Option<Id>,
     context_selected_chunk: Option<Id>,
     turn_memory_selected_request: Option<Id>,
     context_selection_stack: Vec<Id>,
@@ -269,7 +264,6 @@ impl Default for DashboardState {
             config_last_applied_id: None,
             compass_expanded_goal: None,
             teams_selected_chat: None,
-            workspace_selected_snapshot: None,
             context_selected_chunk: None,
             turn_memory_selected_request: None,
             context_selection_stack: Vec::new(),
@@ -582,36 +576,8 @@ struct DashboardSnapshot {
     teams_messages: Vec<TeamsMessageRow>,
     teams_chats: Vec<TeamsChatRow>,
     teams_error: Option<String>,
-    workspace_snapshots: Vec<WorkspaceSnapshotRow>,
-    workspace_entries: Vec<WorkspaceEntryRow>,
-    workspace_error: Option<String>,
     labels: HashMap<Id, String>,
     now_key: i128,
-}
-
-#[derive(Debug, Clone)]
-struct WorkspaceSnapshotRow {
-    id: Id,
-    created_at: Option<i128>,
-    label: Option<String>,
-    root_path: Option<String>,
-    state_handle: Option<Value<Handle<Blake3, SimpleArchive>>>,
-    entry_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct WorkspaceEntryRow {
-    kind: WorkspaceEntryKind,
-    path: String,
-    link_target: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkspaceEntryKind {
-    File,
-    Dir,
-    Symlink,
-    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -701,15 +667,6 @@ _Live view of the agent pile, exec queue, and message activity._"
                         "teams_branch_picker",
                         &picker_branches,
                         &mut state.config.teams_branches,
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Workspace branches");
-                    render_branch_picker(
-                        ui,
-                        "workspace_branch_picker",
-                        &picker_branches,
-                        &mut state.config.workspace_branches,
                     );
                 });
 
@@ -1005,28 +962,6 @@ _Live view of the agent pile, exec queue, and message activity._"
         });
     });
 
-    nb.view(move |ui| {
-        let mut state = dashboard.read_mut(ui);
-        with_padding(ui, padding, |ui| {
-            ui.heading("Workspace");
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                snapshot.clone()
-            };
-            if let Some(err) = &snapshot.workspace_error {
-                ui.colored_label(egui::Color32::RED, err);
-            }
-            render_workspace(
-                ui,
-                &mut state,
-                snapshot.now_key,
-                &snapshot.workspace_snapshots,
-                &snapshot.workspace_entries,
-            );
-        });
-    });
 }
 
 pub fn run_diagnostics(
@@ -1107,7 +1042,6 @@ fn refresh_snapshot(state: &mut DashboardState) {
         .and_then(|result| result.as_ref().ok())
         .cloned();
     let config = state.config.clone();
-    let workspace_selected = state.workspace_selected_snapshot;
     let context_selected = state.context_selected_chunk;
     let context_show_children = state.context_show_children;
     let context_show_origins = state.context_show_origins;
@@ -1123,7 +1057,6 @@ fn refresh_snapshot(state: &mut DashboardState) {
         repo,
         &config,
         previous,
-        workspace_selected,
         context_selected,
         context_show_children,
         context_show_origins,
@@ -1168,9 +1101,6 @@ fn apply_branch_defaults_from_agent_config(state: &mut DashboardState, config: &
     if state.config.teams_branches.is_empty() {
         state.config.teams_branches = "teams".to_string();
     }
-    if state.config.workspace_branches.is_empty() {
-        state.config.workspace_branches = "workspace".to_string();
-    }
 
     state.config_last_applied_id = Some(config.id);
 }
@@ -1179,7 +1109,6 @@ fn load_snapshot(
     repo: &mut Repository<Pile>,
     config: &DashboardConfig,
     previous: Option<DashboardSnapshot>,
-    workspace_selected_snapshot: Option<Id>,
     context_selected_chunk: Option<Id>,
     context_show_children: bool,
     context_show_origins: bool,
@@ -1198,7 +1127,6 @@ fn load_snapshot(
         "local-messages",
         "relations",
         "teams",
-        "workspace",
         "archive",
         "web",
         "media",
@@ -1217,7 +1145,6 @@ fn load_snapshot(
     let local_refs = parse_branch_list(&config.local_message_branches);
     let relations_refs = parse_branch_list(&config.relations_branches);
     let teams_refs = parse_branch_list(&config.teams_branches);
-    let workspace_refs = parse_branch_list(&config.workspace_branches);
 
     let branch_lookup = BranchLookup::new(&branches);
     let config_res = resolve_branch_ids(&branch_lookup, &config_refs);
@@ -1226,7 +1153,6 @@ fn load_snapshot(
     let local_res = resolve_branch_ids(&branch_lookup, &local_refs);
     let relations_res = resolve_branch_ids(&branch_lookup, &relations_refs);
     let teams_res = resolve_branch_ids(&branch_lookup, &teams_refs);
-    let workspace_res = resolve_branch_ids(&branch_lookup, &workspace_refs);
 
     let agent_config_error = config_res.as_ref().err().cloned();
     let exec_error = exec_res.as_ref().err().cloned();
@@ -1234,7 +1160,6 @@ fn load_snapshot(
     let local_message_error = local_res.as_ref().err().cloned();
     let relations_error = relations_res.as_ref().err().cloned();
     let teams_error = teams_res.as_ref().err().cloned();
-    let workspace_error = workspace_res.as_ref().err().cloned();
 
     let config_ids = config_res.unwrap_or_default();
     let exec_ids = exec_res.unwrap_or_default();
@@ -1242,7 +1167,6 @@ fn load_snapshot(
     let local_ids = local_res.unwrap_or_default();
     let relations_ids = relations_res.unwrap_or_default();
     let teams_ids = teams_res.unwrap_or_default();
-    let workspace_ids = workspace_res.unwrap_or_default();
 
     let mut needed_ids: Vec<Id> = Vec::new();
     extend_unique(&mut needed_ids, &config_ids);
@@ -1251,7 +1175,6 @@ fn load_snapshot(
     extend_unique(&mut needed_ids, &local_ids);
     extend_unique(&mut needed_ids, &relations_ids);
     extend_unique(&mut needed_ids, &teams_ids);
-    extend_unique(&mut needed_ids, &workspace_ids);
 
     let mut branch_data: HashMap<Id, BranchSnapshot> = HashMap::new();
     let mut reader_ws: Option<Workspace<Pile>> = None;
@@ -1273,14 +1196,12 @@ fn load_snapshot(
     let local_data = union_branches(&branch_data, &local_ids);
     let relations_data = union_branches(&branch_data, &relations_ids);
     let teams_data = union_branches(&branch_data, &teams_ids);
-    let workspace_data = union_branches(&branch_data, &workspace_ids);
     let config_delta = union_branch_deltas(&branch_data, &config_ids);
     let exec_delta = union_branch_deltas(&branch_data, &exec_ids);
     let compass_delta = union_branch_deltas(&branch_data, &compass_ids);
     let local_delta = union_branch_deltas(&branch_data, &local_ids);
     let relations_delta = union_branch_deltas(&branch_data, &relations_ids);
     let teams_delta = union_branch_deltas(&branch_data, &teams_ids);
-    let workspace_delta = union_branch_deltas(&branch_data, &workspace_ids);
 
     let mut reader_ws = if let Some(ws) = reader_ws {
         ws
@@ -1315,9 +1236,6 @@ fn load_snapshot(
             teams_messages: Vec::new(),
             teams_chats: Vec::new(),
             teams_error,
-            workspace_snapshots: Vec::new(),
-            workspace_entries: Vec::new(),
-            workspace_error,
             labels: HashMap::new(),
             now_key,
         });
@@ -1330,7 +1248,6 @@ fn load_snapshot(
         local_data,
         relations_data,
         teams_data,
-        workspace_data,
         pile_path,
         branches,
         branch_data,
@@ -1340,7 +1257,6 @@ fn load_snapshot(
         local_message_error,
         relations_error,
         teams_error,
-        workspace_error,
         config,
         &mut reader_ws,
         previous_for_reuse,
@@ -1350,8 +1266,6 @@ fn load_snapshot(
         &local_delta,
         &relations_delta,
         &teams_delta,
-        &workspace_delta,
-        workspace_selected_snapshot,
         context_selected_chunk,
         context_show_children,
         context_show_origins,
@@ -1366,7 +1280,6 @@ fn build_snapshot(
     local_data: TribleSet,
     relations_data: TribleSet,
     teams_data: TribleSet,
-    workspace_data: TribleSet,
     pile_path: PathBuf,
     branches: Vec<BranchEntry>,
     branch_data: HashMap<Id, BranchSnapshot>,
@@ -1376,7 +1289,6 @@ fn build_snapshot(
     local_message_error: Option<String>,
     relations_error: Option<String>,
     teams_error: Option<String>,
-    workspace_error: Option<String>,
     config: &DashboardConfig,
     ws: &mut Workspace<Pile>,
     previous: Option<&DashboardSnapshot>,
@@ -1386,8 +1298,6 @@ fn build_snapshot(
     local_delta: &TribleSet,
     relations_delta: &TribleSet,
     teams_delta: &TribleSet,
-    workspace_delta: &TribleSet,
-    workspace_selected_snapshot: Option<Id>,
     context_selected_chunk: Option<Id>,
     context_show_children: bool,
     context_show_origins: bool,
@@ -1495,16 +1405,6 @@ fn build_snapshot(
     } else {
         collect_teams_messages(&teams_data, ws)
     };
-    let workspace_snapshots = if workspace_delta.is_empty() {
-        previous
-            .map(|snapshot| snapshot.workspace_snapshots.clone())
-            .unwrap_or_else(|| collect_workspace_snapshots(&workspace_data, ws))
-    } else {
-        collect_workspace_snapshots(&workspace_data, ws)
-    };
-    let workspace_latest_id = workspace_snapshots.first().map(|row| row.id);
-    let workspace_preview_id = workspace_selected_snapshot.or(workspace_latest_id);
-    let workspace_entries = collect_workspace_entries(&workspace_data, ws, workspace_preview_id);
     let labels = if exec_delta.is_empty() {
         previous
             .map(|snapshot| snapshot.labels.clone())
@@ -1557,9 +1457,6 @@ fn build_snapshot(
         teams_messages,
         teams_chats,
         teams_error,
-        workspace_snapshots,
-        workspace_entries,
-        workspace_error,
         labels,
         now_key,
     }
@@ -2722,144 +2619,6 @@ fn collect_teams_messages(
     (messages, chat_list)
 }
 
-fn collect_workspace_snapshots(
-    data: &TribleSet,
-    ws: &mut Workspace<Pile>,
-) -> Vec<WorkspaceSnapshotRow> {
-    let mut rows = Vec::new();
-
-    for (snapshot_id, created_at) in find!(
-        (snapshot_id: Id, created_at: Value<NsTAIInterval>),
-        pattern!(data, [{
-            ?snapshot_id @
-            metadata::tag: playground_workspace::kind_snapshot,
-            playground_workspace::created_at: ?created_at,
-        }])
-    ) {
-        let created_key = interval_key(created_at);
-        let label = load_optional_string_attr(data, ws, snapshot_id, playground_workspace::label);
-        let root_path =
-            load_optional_string_attr(data, ws, snapshot_id, playground_workspace::root_path);
-        let state_handle =
-            load_optional_archive_handle_attr(data, snapshot_id, playground_workspace::state);
-        let entry_count = count_workspace_entries(data, snapshot_id);
-
-        rows.push(WorkspaceSnapshotRow {
-            id: snapshot_id,
-            created_at: Some(created_key),
-            label,
-            root_path,
-            state_handle,
-            entry_count,
-        });
-    }
-
-    rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
-    rows.reverse();
-    rows.truncate(WORKSPACE_SNAPSHOT_LIMIT);
-    rows
-}
-
-fn collect_workspace_entries(
-    data: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    snapshot_id: Option<Id>,
-) -> Vec<WorkspaceEntryRow> {
-    let Some(snapshot_id) = snapshot_id else {
-        return Vec::new();
-    };
-
-    let snapshot_root =
-        load_optional_string_attr(data, ws, snapshot_id, playground_workspace::root_path);
-    let root_prefix = snapshot_root
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != ".")
-        .map(|value| value.trim_end_matches('/').to_string());
-
-    let entry_ids: Vec<Id> = find!(
-        (entry_id: Id),
-        pattern!(data, [{
-            snapshot_id @
-            playground_workspace::entry: ?entry_id,
-        }])
-    )
-    .into_iter()
-    .map(|(id,)| id)
-    .collect();
-
-    let mut paths: HashMap<Id, Value<Handle<Blake3, LongString>>> = HashMap::new();
-    for (entry_id, handle) in find!(
-        (entry_id: Id, handle: Value<Handle<Blake3, LongString>>),
-        pattern!(data, [{ ?entry_id @ playground_workspace::path: ?handle }])
-    ) {
-        paths.insert(entry_id, handle);
-    }
-
-    let mut kinds: HashMap<Id, Id> = HashMap::new();
-    for (entry_id, kind) in find!(
-        (entry_id: Id, kind: Id),
-        pattern!(data, [{ ?entry_id @ metadata::tag: ?kind }])
-    ) {
-        kinds.insert(entry_id, kind);
-    }
-
-    let mut link_targets: HashMap<Id, Value<Handle<Blake3, LongString>>> = HashMap::new();
-    for (entry_id, handle) in find!(
-        (entry_id: Id, handle: Value<Handle<Blake3, LongString>>),
-        pattern!(data, [{ ?entry_id @ playground_workspace::link_target: ?handle }])
-    ) {
-        link_targets.insert(entry_id, handle);
-    }
-
-    let mut rows = Vec::new();
-    for entry_id in entry_ids {
-        let path = paths
-            .get(&entry_id)
-            .copied()
-            .and_then(|handle| load_text(ws, handle))
-            .unwrap_or_else(|| "<missing>".to_string());
-        let display_path = if let Some(prefix) = root_prefix.as_ref() {
-            format!("{}/{}", prefix, path)
-        } else {
-            path
-        };
-
-        let kind = match kinds.get(&entry_id).copied() {
-            Some(id) if id == playground_workspace::kind_file => WorkspaceEntryKind::File,
-            Some(id) if id == playground_workspace::kind_dir => WorkspaceEntryKind::Dir,
-            Some(id) if id == playground_workspace::kind_symlink => WorkspaceEntryKind::Symlink,
-            Some(_) | None => WorkspaceEntryKind::Unknown,
-        };
-
-        let link_target = link_targets
-            .get(&entry_id)
-            .copied()
-            .and_then(|handle| load_text(ws, handle));
-
-        rows.push(WorkspaceEntryRow {
-            kind,
-            path: display_path,
-            link_target,
-        });
-    }
-
-    rows.sort_by(|a, b| a.path.cmp(&b.path));
-    rows
-}
-
-fn count_workspace_entries(data: &TribleSet, snapshot_id: Id) -> usize {
-    find!(
-        (entry_id: Id),
-        pattern!(data, [{
-            snapshot_id @
-            playground_workspace::entry: ?entry_id,
-        }])
-    )
-    .into_iter()
-    .count()
-}
-
 fn load_optional_string_attr(
     data: &TribleSet,
     ws: &mut Workspace<Pile>,
@@ -2876,23 +2635,6 @@ fn load_optional_string_attr(
     .into_iter()
     .next()
     .and_then(|(handle,)| load_text(ws, handle))
-}
-
-fn load_optional_archive_handle_attr(
-    data: &TribleSet,
-    entity_id: Id,
-    attr: Attribute<Handle<Blake3, SimpleArchive>>,
-) -> Option<Value<Handle<Blake3, SimpleArchive>>> {
-    find!(
-        (handle: Value<Handle<Blake3, SimpleArchive>>),
-        pattern!(data, [{
-            entity_id @
-            attr: ?handle,
-        }])
-    )
-    .into_iter()
-    .next()
-    .map(|(handle,)| handle)
 }
 
 fn sort_reasoning_summaries(rows: HashMap<Id, ReasoningSummaryRow>) -> Vec<ReasoningSummaryRow> {
@@ -5966,210 +5708,6 @@ fn render_relations(ui: &mut egui::Ui, people: &[RelationRow]) {
         }
         ui.add_space(8.0);
     }
-}
-
-fn render_workspace(
-    ui: &mut egui::Ui,
-    state: &mut DashboardState,
-    now_key: i128,
-    snapshots: &[WorkspaceSnapshotRow],
-    entries: &[WorkspaceEntryRow],
-) {
-    if snapshots.is_empty() {
-        ui.label("No workspace snapshots.");
-        return;
-    }
-
-    ui.label("Snapshots:");
-    if ui
-        .selectable_label(
-            state.workspace_selected_snapshot.is_none(),
-            "Follow latest snapshot",
-        )
-        .clicked()
-    {
-        state.workspace_selected_snapshot = None;
-        ui.ctx().request_repaint();
-    }
-
-    for row in snapshots {
-        let age = format_age(now_key, row.created_at);
-        let label = row.label.as_deref().unwrap_or("-");
-        let root = row.root_path.as_deref().unwrap_or(".");
-        let state_hash = row
-            .state_handle
-            .map(archive_handle_prefix)
-            .unwrap_or_else(|| "-".to_string());
-        let text = format!(
-            "{age}  {}  {label}  {root}  state:{state_hash}  ({})",
-            id_prefix(row.id),
-            row.entry_count
-        );
-        if ui
-            .selectable_label(state.workspace_selected_snapshot == Some(row.id), text)
-            .clicked()
-        {
-            state.workspace_selected_snapshot = Some(row.id);
-            ui.ctx().request_repaint();
-        }
-    }
-
-    let latest_id = snapshots.first().map(|row| row.id);
-    let effective_id = state.workspace_selected_snapshot.or(latest_id);
-    ui.add_space(8.0);
-
-    match effective_id {
-        None => {
-            ui.label("No snapshot selected.");
-        }
-        Some(snapshot_id) => {
-            let selected_row = snapshots.iter().find(|row| row.id == snapshot_id);
-            if let Some(row) = selected_row {
-                let age = format_age(now_key, row.created_at);
-                let label = row.label.as_deref().unwrap_or("-");
-                let root = row.root_path.as_deref().unwrap_or(".");
-                let state_hash = row
-                    .state_handle
-                    .map(archive_handle_prefix)
-                    .unwrap_or_else(|| "-".to_string());
-                ui.label(format!(
-                    "Entries for {age} {}  {label}  {root}  state:{state_hash}:",
-                    id_prefix(row.id),
-                ));
-            } else {
-                ui.label(format!("Entries for {}:", id_prefix(snapshot_id)));
-                ui.small("Selected snapshot is not in the list (older than limit).");
-            }
-
-            let tree = build_workspace_tree(entries);
-            render_workspace_tree(ui, "", &tree, true);
-        }
-    }
-}
-
-fn workspace_kind_tag(kind: WorkspaceEntryKind) -> &'static str {
-    match kind {
-        WorkspaceEntryKind::File => "F",
-        WorkspaceEntryKind::Dir => "D",
-        WorkspaceEntryKind::Symlink => "L",
-        WorkspaceEntryKind::Unknown => "?",
-    }
-}
-
-#[derive(Default)]
-struct WorkspaceTreeNode {
-    dirs: std::collections::BTreeMap<String, WorkspaceTreeNode>,
-    files: Vec<WorkspaceTreeLeaf>,
-}
-
-#[derive(Clone)]
-struct WorkspaceTreeLeaf {
-    name: String,
-    kind: WorkspaceEntryKind,
-    link_target: Option<String>,
-}
-
-impl WorkspaceTreeNode {
-    fn sort_recursive(&mut self) {
-        self.files.sort_by(|a, b| a.name.cmp(&b.name));
-        for child in self.dirs.values_mut() {
-            child.sort_recursive();
-        }
-    }
-}
-
-fn build_workspace_tree(entries: &[WorkspaceEntryRow]) -> WorkspaceTreeNode {
-    let mut root = WorkspaceTreeNode::default();
-
-    for entry in entries {
-        let parts: Vec<&str> = entry
-            .path
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        let mut node = &mut root;
-        for dir in &parts[..parts.len().saturating_sub(1)] {
-            node = node.dirs.entry((*dir).to_string()).or_default();
-        }
-
-        let name = parts[parts.len() - 1].to_string();
-        match entry.kind {
-            WorkspaceEntryKind::Dir => {
-                node.dirs.entry(name).or_default();
-            }
-            kind => {
-                node.files.push(WorkspaceTreeLeaf {
-                    name,
-                    kind,
-                    link_target: entry.link_target.clone(),
-                });
-            }
-        }
-    }
-
-    root.sort_recursive();
-    root
-}
-
-fn render_workspace_tree(
-    ui: &mut egui::Ui,
-    base_path: &str,
-    node: &WorkspaceTreeNode,
-    open_one_root: bool,
-) {
-    let default_open_root = open_one_root && base_path.is_empty() && node.dirs.len() == 1;
-    for (name, child) in &node.dirs {
-        render_workspace_dir(ui, base_path, name, child, default_open_root);
-    }
-
-    for file in &node.files {
-        let kind = workspace_kind_tag(file.kind);
-        if let Some(target) = file.link_target.as_deref() {
-            ui.monospace(format!(
-                "{kind} {} -> {}",
-                file.name,
-                truncate_single_line(target, 80)
-            ));
-        } else {
-            ui.monospace(format!("{kind} {}", file.name));
-        }
-    }
-}
-
-fn render_workspace_dir(
-    ui: &mut egui::Ui,
-    base_path: &str,
-    name: &str,
-    child: &WorkspaceTreeNode,
-    default_open: bool,
-) {
-    let mut display = name.to_string();
-    let mut full_path = if base_path.is_empty() {
-        name.to_string()
-    } else {
-        format!("{base_path}/{name}")
-    };
-
-    let mut node = child;
-    while node.files.is_empty() && node.dirs.len() == 1 {
-        let (next_name, next_node) = node.dirs.iter().next().expect("len == 1");
-        display.push('/');
-        display.push_str(next_name);
-        full_path.push('/');
-        full_path.push_str(next_name);
-        node = next_node;
-    }
-
-    egui::CollapsingHeader::new(egui::RichText::new(format!("D {display}")).monospace())
-        .id_salt(format!("workspace_dir::{full_path}"))
-        .default_open(default_open)
-        .show(ui, |ui| {
-            render_workspace_tree(ui, &full_path, node, false);
-        });
 }
 
 fn parse_response_json(raw: &str) -> Option<JsonValue> {

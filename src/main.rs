@@ -32,7 +32,6 @@ mod repo_ops;
 mod repo_util;
 mod schema;
 mod time_util;
-mod workspace_snapshot;
 
 use chat_prompt::{ChatMessage, ChatRole};
 use config::Config;
