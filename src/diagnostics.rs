@@ -4020,11 +4020,7 @@ fn render_blob_chip(
     blob: &crate::blob_refs::BlobRef,
     text_color: Option<egui::Color32>,
 ) {
-    let mut label = format!("blob:{}", short_digest(blob.digest_hex.as_str()));
-    if let Some(mime) = blob.mime.as_deref() {
-        label.push(' ');
-        label.push_str(mime);
-    }
+    let label = format!("files:{}", short_digest(blob.digest_hex.as_str()));
     let fill = colorhash::ral_categorical(blob.digest_hex.as_bytes());
     let chip_text = text_color.unwrap_or_else(|| colorhash::text_color_on(fill));
     egui::Frame::NONE

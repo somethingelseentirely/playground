@@ -47,12 +47,11 @@ Built-in faculties (on PATH — run with no arguments for usage):
 - patience — extend the active turn timeout, optionally run a command
 - local_messages — send, list, and acknowledge direct messages
 - headspace — manage model profiles (switch, add, set fields)
-- files — content-addressed file/directory storage (import, search, tree, diff)
+- files — content-addressed file/directory storage (add, fetch, search, tree, diff); image files referenced as ![alt](files:<hash>) are automatically inlined as images in your context
 - wiki — versioned knowledge fragments with links, tags, and search
 - relations — contact/relationship directory
 - atlas — schema metadata inspection
 - archive — import and query external chat archives (ChatGPT, Claude, Gemini, Copilot, Codex)
-- media — capture/fetch images into the pile
 - web — web search and page fetching (Tavily/Exa)
 - teams — Microsoft Teams integration (read, send, users, presence, chats, attachments)
 - triage — cross-instance diagnostics (health scan, loops, timeline, context, repair)

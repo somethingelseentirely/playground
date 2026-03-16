@@ -650,7 +650,7 @@ fn build_openai_input_content(
                 match resolve_blob_image(
                     ws,
                     &blob_ref.digest_hex,
-                    blob_ref.mime.as_deref(),
+                    None,
                 ) {
                     Ok((mime, b64)) => {
                         let data_url = format!("data:{mime};base64,{b64}");
@@ -941,7 +941,7 @@ fn build_anthropic_input_content(
                 match resolve_blob_image(
                     ws,
                     &blob_ref.digest_hex,
-                    blob_ref.mime.as_deref(),
+                    None,
                 ) {
                     Ok((mime, b64)) => {
                         content.push(serde_json::json!({
@@ -1524,7 +1524,7 @@ mod tests {
         with_test_workspace(|ws| {
             let digest_hex = put_test_png(ws);
             let prompt = format!(
-                "inspect this image ![sample](blob:blake3:{digest_hex}?mime=image%2Fpng&name=sample.png)"
+                "inspect this image ![sample](files:{digest_hex})"
             );
             let content = build_openai_input_content(ws, "gpt-4.1", prompt.as_str());
             assert!(
@@ -1540,7 +1540,7 @@ mod tests {
     fn blob_marker_falls_back_to_text_for_non_vision_models() {
         with_test_workspace(|ws| {
             let digest_hex = put_test_png(ws);
-            let prompt = format!("![sample](blob:blake3:{digest_hex}?mime=image%2Fpng)");
+            let prompt = format!("![sample](files:{digest_hex})");
             let content = build_openai_input_content(ws, "gpt-oss-120b", prompt.as_str());
             assert_eq!(content.len(), 1);
             assert_eq!(
@@ -1649,7 +1649,7 @@ mod tests {
         with_test_workspace(|ws| {
             let digest_hex = put_test_png(ws);
             let prompt = format!(
-                "inspect ![img](blob:blake3:{digest_hex}?mime=image%2Fpng&name=test.png)"
+                "inspect ![img](files:{digest_hex})"
             );
             let content =
                 super::build_anthropic_input_content(ws, "claude-sonnet-4-6", prompt.as_str());
